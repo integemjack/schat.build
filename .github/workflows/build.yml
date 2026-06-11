@@ -163,6 +163,10 @@ jobs:
           repository: Ireoo/Secret-Chat
           ref: ${{ env.SRC_REF }}
           token: ${{ secrets.SRC_REPO_TOKEN }}
+      - name: Seed placeholder config.yaml
+        # 源仓库只提交 config.yaml.example（真实 config.yaml 含推送密钥，不入库）；
+        # Dockerfile COPY config.yaml，故构建上下文里要有一份占位。真实配置在部署时用 volume/env 覆盖。
+        run: cp nodeServer/config.yaml.example nodeServer/config.yaml
       - uses: docker/setup-buildx-action@v3
       - uses: docker/login-action@v3
         with:
@@ -170,6 +174,10 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
       - uses: docker/build-push-action@v6
+        env:
+          # 不要上传 build-push-action 的 .dockerbuild 记录工件——它会成为 release 任务
+          # download-artifact 的一个额外（失败时为 0 字节）工件，拖垮整个 Release。
+          DOCKER_BUILD_RECORD_UPLOAD: "false"
         with:
           context: nodeServer
           push: true
@@ -183,6 +191,7 @@ jobs:
     if: always()
     runs-on: ubuntu-latest
     steps:
+      # docker 任务已禁用 .dockerbuild 记录工件上传，这里只剩各端真实产物
       - uses: actions/download-artifact@v4
         with:
           path: dist
