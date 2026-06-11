@@ -1,0 +1,209 @@
+name: Build All
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Ireoo/Secret-Chat 的分支或标签"
+        required: false
+        default: "v9.1"
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+  packages: write
+
+env:
+  SRC_REPO: Ireoo/Secret-Chat
+  SRC_REF: ${{ github.event.inputs.ref || 'v9.1' }}
+
+jobs:
+  ios:
+    name: iOS (unsigned IPA)
+    runs-on: macos-26
+    timeout-minutes: 90
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          repository: Ireoo/Secret-Chat
+          ref: ${{ env.SRC_REF }}
+          token: ${{ secrets.SRC_REPO_TOKEN }}
+      - name: Select newest Xcode
+        run: |
+          XCODE=$(ls -d /Applications/Xcode*.app | sort -V | tail -1)
+          echo "Using $XCODE"
+          sudo xcode-select -s "$XCODE/Contents/Developer"
+          xcodebuild -version
+      - name: Resolve SPM packages
+        run: xcodebuild -resolvePackageDependencies -project "Secret Chat.xcodeproj" -scheme "Secret Chat"
+      - name: Archive (unsigned)
+        run: |
+          set -o pipefail
+          xcodebuild -project "Secret Chat.xcodeproj" -scheme "Secret Chat" -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -archivePath build/SecretChat.xcarchive \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY= \
+            archive
+      - name: Package unsigned IPA
+        run: |
+          mkdir -p build/Payload
+          cp -R "build/SecretChat.xcarchive/Products/Applications/"*.app build/Payload/
+          (cd build && zip -qry SecretChat-ios-unsigned.ipa Payload)
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ios
+          path: build/SecretChat-ios-unsigned.ipa
+
+  android:
+    name: Android (APK)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          repository: Ireoo/Secret-Chat
+          ref: ${{ env.SRC_REF }}
+          token: ${{ secrets.SRC_REPO_TOKEN }}
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+      - name: Accept Android SDK licenses
+        run: yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+      - name: Build APKs
+        working-directory: android
+        run: |
+          chmod +x gradlew
+          ./gradlew assembleDebug assembleRelease --no-daemon --stacktrace
+      - name: Collect APKs
+        run: |
+          mkdir -p out
+          cp android/app/build/outputs/apk/debug/*.apk out/SecretChat-android-debug.apk
+          cp android/app/build/outputs/apk/release/*.apk out/SecretChat-android-release-unsigned.apk || true
+      - uses: actions/upload-artifact@v4
+        with:
+          name: android
+          path: out/*.apk
+
+  desktop:
+    name: Desktop (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    env:
+      CSC_IDENTITY_AUTO_DISCOVERY: "false"
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          repository: Ireoo/Secret-Chat
+          ref: ${{ env.SRC_REF }}
+          token: ${{ secrets.SRC_REPO_TOKEN }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Install deps (runs electron-rebuild)
+        working-directory: desktop
+        run: npm install
+      - name: Build
+        working-directory: desktop
+        run: npm run build -- --publish never
+      - name: Collect installers
+        shell: bash
+        run: |
+          mkdir -p out
+          find desktop/dist-electron -maxdepth 1 -type f \
+            \( -name "*.dmg" -o -name "*.exe" -o -name "*.AppImage" -o -name "*.deb" -o -name "*.zip" \) \
+            -exec cp {} out/ \;
+          ls -la out
+      - uses: actions/upload-artifact@v4
+        with:
+          name: desktop-${{ runner.os }}
+          path: out/*
+
+  server:
+    name: Go server (single binary)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          repository: Ireoo/Secret-Chat
+          ref: ${{ env.SRC_REF }}
+          token: ${{ secrets.SRC_REPO_TOKEN }}
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+          cache-dependency-path: server/go.sum
+      - name: Build
+        working-directory: server
+        run: |
+          mkdir -p ../out
+          CGO_ENABLED=1 go build -trimpath -ldflags "-s -w" -o ../out/schat-server-linux-amd64 .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: server
+          path: out/*
+
+  docker:
+    name: nodeServer Docker → GHCR
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          repository: Ireoo/Secret-Chat
+          ref: ${{ env.SRC_REF }}
+          token: ${{ secrets.SRC_REPO_TOKEN }}
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@v6
+        with:
+          context: nodeServer
+          push: true
+          tags: |
+            ghcr.io/ireoo/schat-server:latest
+            ghcr.io/ireoo/schat-server:${{ env.SRC_REF }}-b${{ github.run_number }}
+
+  release:
+    name: Publish Release
+    needs: [ios, android, desktop, server, docker]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: List artifacts
+        run: ls -laR dist || true
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.SRC_REF }}-b${{ github.run_number }}
+          name: "Secret Chat ${{ env.SRC_REF }} build ${{ github.run_number }}"
+          body: |
+            自动构建自 `${{ env.SRC_REPO }}` @ `${{ env.SRC_REF }}`（run #${{ github.run_number }}）。
+
+            | 产物 | 说明 |
+            |---|---|
+            | `SecretChat-ios-unsigned.ipa` | 未签名 IPA，安装前需自行重签 |
+            | `SecretChat-android-debug.apk` | debug 签名，可直接安装 |
+            | `SecretChat-android-release-unsigned.apk` | 未签名 release |
+            | `*.dmg` / `*.exe` / `*.AppImage` | 桌面端 macOS / Windows / Linux |
+            | `schat-server-linux-amd64` | Go 服务器单二进制 |
+            | Docker | `ghcr.io/ireoo/schat-server:latest`（nodeServer，生产服务器） |
+
+            某端构建失败时该产物缺席，详见 Actions 运行日志。
+          files: dist/**
