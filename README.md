@@ -10,7 +10,7 @@
 | Android | ubuntu | debug APK（可装）+ 未签名 release APK |
 | Desktop | macos / ubuntu / windows 矩阵 | dmg / nsis exe / AppImage |
 | Go server | ubuntu | `schat-server-linux-amd64` 单二进制 |
-| Docker | ubuntu | `ghcr.io/ireoo/schat-server`（nodeServer 生产服务器镜像） |
+| Docker | ubuntu | `ghcr.io/integemjack/schat-server`（nodeServer 生产服务器镜像） |
 
 ## 触发
 

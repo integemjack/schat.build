@@ -174,8 +174,8 @@ jobs:
           context: nodeServer
           push: true
           tags: |
-            ghcr.io/ireoo/schat-server:latest
-            ghcr.io/ireoo/schat-server:${{ env.SRC_REF }}-b${{ github.run_number }}
+            ghcr.io/integemjack/schat-server:latest
+            ghcr.io/integemjack/schat-server:${{ env.SRC_REF }}-b${{ github.run_number }}
 
   release:
     name: Publish Release
@@ -203,7 +203,7 @@ jobs:
             | `SecretChat-android-release-unsigned.apk` | 未签名 release |
             | `*.dmg` / `*.exe` / `*.AppImage` | 桌面端 macOS / Windows / Linux |
             | `schat-server-linux-amd64` | Go 服务器单二进制 |
-            | Docker | `ghcr.io/ireoo/schat-server:latest`（nodeServer，生产服务器） |
+            | Docker | `ghcr.io/integemjack/schat-server:latest`（nodeServer，生产服务器） |
 
             某端构建失败时该产物缺席，详见 Actions 运行日志。
           files: dist/**
