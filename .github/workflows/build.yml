@@ -6,7 +6,7 @@ on:
       ref:
         description: "Ireoo/Secret-Chat 的分支或标签"
         required: false
-        default: "v9.1"
+        default: "v9.4"
   push:
     branches: [main]
 
@@ -16,7 +16,7 @@ permissions:
 
 env:
   SRC_REPO: Ireoo/Secret-Chat
-  SRC_REF: ${{ github.event.inputs.ref || 'v9.1' }}
+  SRC_REF: ${{ github.event.inputs.ref || 'v9.4' }}
 
 jobs:
   ios:
@@ -185,9 +185,46 @@ jobs:
             ghcr.io/integemjack/schat-server:latest
             ghcr.io/integemjack/schat-server:${{ env.SRC_REF }}-b${{ github.run_number }}
 
+  m5core2:
+    name: M5Stack Core2 (firmware)
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          repository: Ireoo/Secret-Chat
+          ref: ${{ env.SRC_REF }}
+          token: ${{ secrets.SRC_REPO_TOKEN }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install PlatformIO
+        run: pip install --upgrade platformio
+      - name: Cache PlatformIO
+        uses: actions/cache@v4
+        with:
+          path: ~/.platformio
+          key: pio-m5core2-${{ hashFiles('m5core2/platformio.ini') }}
+      - name: Build firmware (base env)
+        working-directory: m5core2
+        # 普通 env(m5stack-core2):预编译核,纯 pio run,产 OTA-able firmware.bin。
+        # 唤醒词/深度 light sleep 的 -ww 版需 model 分区(OTA 刷不了分区,必须 USB 首刷)+
+        # custom_sdkconfig IDF 重编,是本地 ./build_pm.sh ww 烧录件,刻意不进 CI。
+        run: pio run -e m5stack-core2
+      - name: Collect firmware
+        run: |
+          mkdir -p out
+          cp m5core2/.pio/build/m5stack-core2/firmware.bin out/SecretChat-m5core2-firmware.bin
+          ls -la out
+      - uses: actions/upload-artifact@v4
+        with:
+          name: m5core2
+          path: out/*
+
   release:
     name: Publish Release
-    needs: [ios, android, desktop, server, docker]
+    needs: [ios, android, desktop, server, docker, m5core2]
     if: always()
     runs-on: ubuntu-latest
     steps:
@@ -213,6 +250,7 @@ jobs:
             | `*.dmg` / `*.exe` / `*.AppImage` | 桌面端 macOS / Windows / Linux |
             | `schat-server-linux-amd64` | Go 服务器单二进制 |
             | Docker | `ghcr.io/integemjack/schat-server:latest`（nodeServer，生产服务器） |
+            | `SecretChat-m5core2-firmware.bin` | M5Stack Core2 基础固件（OTA 用；唤醒词/深度续航版需本地 `m5core2/build_pm.sh ww` USB 烧录） |
 
             某端构建失败时该产物缺席，详见 Actions 运行日志。
           files: dist/**
