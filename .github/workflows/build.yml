@@ -6,7 +6,7 @@ on:
       ref:
         description: "Ireoo/Secret-Chat 的分支或标签"
         required: false
-        default: "v9.4"
+        default: "main"
   push:
     branches: [main]
 
@@ -16,46 +16,10 @@ permissions:
 
 env:
   SRC_REPO: Ireoo/Secret-Chat
-  SRC_REF: ${{ github.event.inputs.ref || 'v9.4' }}
+  SRC_REF: ${{ github.event.inputs.ref || 'main' }}
 
 jobs:
-  ios:
-    name: iOS (unsigned IPA)
-    runs-on: macos-26
-    timeout-minutes: 90
-    steps:
-      - name: Checkout source
-        uses: actions/checkout@v4
-        with:
-          repository: Ireoo/Secret-Chat
-          ref: ${{ env.SRC_REF }}
-          token: ${{ secrets.SRC_REPO_TOKEN }}
-      - name: Select newest Xcode
-        run: |
-          XCODE=$(ls -d /Applications/Xcode*.app | sort -V | tail -1)
-          echo "Using $XCODE"
-          sudo xcode-select -s "$XCODE/Contents/Developer"
-          xcodebuild -version
-      - name: Resolve SPM packages
-        run: xcodebuild -resolvePackageDependencies -project "Secret Chat.xcodeproj" -scheme "Secret Chat"
-      - name: Archive (unsigned)
-        run: |
-          set -o pipefail
-          xcodebuild -project "Secret Chat.xcodeproj" -scheme "Secret Chat" -configuration Release \
-            -destination 'generic/platform=iOS' \
-            -archivePath build/SecretChat.xcarchive \
-            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY= \
-            archive
-      - name: Package unsigned IPA
-        run: |
-          mkdir -p build/Payload
-          cp -R "build/SecretChat.xcarchive/Products/Applications/"*.app build/Payload/
-          (cd build && zip -qry SecretChat-ios-unsigned.ipa Payload)
-      - uses: actions/upload-artifact@v4
-        with:
-          name: ios
-          path: build/SecretChat-ios-unsigned.ipa
-
+  # iOS 不在 CI 构建——本地 archive 后直传 TestFlight（见项目根 CLAUDE.md / 记忆）。
   android:
     name: Android (APK)
     runs-on: ubuntu-latest
@@ -224,7 +188,7 @@ jobs:
 
   release:
     name: Publish Release
-    needs: [ios, android, desktop, server, docker, m5core2]
+    needs: [android, desktop, server, docker, m5core2]
     if: always()
     runs-on: ubuntu-latest
     steps:
@@ -244,7 +208,6 @@ jobs:
 
             | 产物 | 说明 |
             |---|---|
-            | `SecretChat-ios-unsigned.ipa` | 未签名 IPA，安装前需自行重签 |
             | `SecretChat-android-debug.apk` | debug 签名，可直接安装 |
             | `SecretChat-android-release-unsigned.apk` | 未签名 release |
             | `*.dmg` / `*.exe` / `*.AppImage` | 桌面端 macOS / Windows / Linux |
