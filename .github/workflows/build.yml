@@ -37,8 +37,15 @@ jobs:
           java-version: "21"
       - name: Accept Android SDK licenses
         run: yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+      - name: Decode release keystore
+        run: echo "${{ secrets.ANDROID_KEYSTORE_BASE64 }}" | base64 -d > "$RUNNER_TEMP/release.jks"
       - name: Build APKs
         working-directory: android
+        env:
+          ANDROID_KEYSTORE_FILE: ${{ runner.temp }}/release.jks
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
         run: |
           chmod +x gradlew
           ./gradlew assembleDebug assembleRelease --no-daemon --stacktrace
@@ -46,7 +53,7 @@ jobs:
         run: |
           mkdir -p out
           cp android/app/build/outputs/apk/debug/*.apk out/SecretChat-android-debug.apk
-          cp android/app/build/outputs/apk/release/*.apk out/SecretChat-android-release-unsigned.apk || true
+          cp android/app/build/outputs/apk/release/*.apk out/SecretChat-android-release.apk || true
       - uses: actions/upload-artifact@v4
         with:
           name: android
@@ -209,7 +216,7 @@ jobs:
             | 产物 | 说明 |
             |---|---|
             | `SecretChat-android-debug.apk` | debug 签名，可直接安装 |
-            | `SecretChat-android-release-unsigned.apk` | 未签名 release |
+            | `SecretChat-android-release.apk` | 正式签名 release(应用内自更新用) |
             | `*.dmg` / `*.exe` / `*.AppImage` | 桌面端 macOS / Windows / Linux |
             | `schat-server-linux-amd64` | Go 服务器单二进制 |
             | Docker | `ghcr.io/integemjack/schat-server:latest`（nodeServer，生产服务器） |
