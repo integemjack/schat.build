@@ -52,8 +52,9 @@ jobs:
       - name: Collect APKs
         run: |
           mkdir -p out
+          VER=$(grep -oE 'versionName = "[^"]+"' android/app/build.gradle.kts | head -1 | sed -E 's/.*"([^"]+)".*/\1/')
           cp android/app/build/outputs/apk/debug/*.apk out/SecretChat-android-debug.apk
-          cp android/app/build/outputs/apk/release/*.apk out/SecretChat-android-release.apk || true
+          cp android/app/build/outputs/apk/release/*.apk "out/SecretChat-android-release-${VER}.apk" || true
       - uses: actions/upload-artifact@v4
         with:
           name: android
@@ -216,7 +217,7 @@ jobs:
             | 产物 | 说明 |
             |---|---|
             | `SecretChat-android-debug.apk` | debug 签名，可直接安装 |
-            | `SecretChat-android-release.apk` | 正式签名 release(应用内自更新用) |
+            | `SecretChat-android-release-<版本>.apk` | 正式签名 release(应用内自更新用) |
             | `*.dmg` / `*.exe` / `*.AppImage` | 桌面端 macOS / Windows / Linux |
             | `schat-server-linux-amd64` | Go 服务器单二进制 |
             | Docker | `ghcr.io/integemjack/schat-server:latest`（nodeServer，生产服务器） |
