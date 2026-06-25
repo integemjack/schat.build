@@ -200,6 +200,33 @@ jobs:
     if: always()
     runs-on: ubuntu-latest
     steps:
+      - name: Checkout source (changelog 用)
+        uses: actions/checkout@v4
+        with:
+          repository: Ireoo/Secret-Chat
+          ref: ${{ env.SRC_REF }}
+          token: ${{ secrets.SRC_REPO_TOKEN }}
+          fetch-depth: 0
+      - name: Build changelog (自上个 release 到本次的提交)
+        id: cl
+        run: |
+          SRC_SHA=$(git rev-parse HEAD)
+          PREV=$(curl -s -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" "https://api.github.com/repos/${{ github.repository }}/releases?per_page=20" | grep -oE 'src-sha:[0-9a-f]{7,40}' | head -1 | sed 's/src-sha://')
+          if [ -n "$PREV" ] && git cat-file -e "${PREV}^{commit}" 2>/dev/null; then
+            LOG=$(git log "${PREV}..HEAD" --no-merges --pretty='- %s' | head -80)
+          else
+            LOG=$(git log -n 30 --no-merges --pretty='- %s')
+          fi
+          [ -z "$LOG" ] && LOG="- (无新提交)"
+          {
+            echo "body<<__CL__"
+            echo "## 更新内容(自上个版本)"
+            echo ""
+            echo "$LOG"
+            echo ""
+            echo "<sub>build #${{ github.run_number }} · src-sha:${SRC_SHA}</sub>"
+            echo "__CL__"
+          } >> "$GITHUB_OUTPUT"
       # docker 任务已禁用 .dockerbuild 记录工件上传，这里只剩各端真实产物
       - uses: actions/download-artifact@v4
         with:
@@ -211,17 +238,5 @@ jobs:
         with:
           tag_name: ${{ env.SRC_REF }}-b${{ github.run_number }}
           name: "Secret Chat ${{ env.SRC_REF }} build ${{ github.run_number }}"
-          body: |
-            自动构建自 `${{ env.SRC_REPO }}` @ `${{ env.SRC_REF }}`（run #${{ github.run_number }}）。
-
-            | 产物 | 说明 |
-            |---|---|
-            | `SecretChat-android-debug.apk` | debug 签名，可直接安装 |
-            | `SecretChat-android-release-<版本>.apk` | 正式签名 release(应用内自更新用) |
-            | `*.dmg` / `*.exe` / `*.AppImage` | 桌面端 macOS / Windows / Linux |
-            | `schat-server-linux-amd64` | Go 服务器单二进制 |
-            | Docker | `ghcr.io/integemjack/schat-server:latest`（nodeServer，生产服务器） |
-            | `SecretChat-m5core2-firmware.bin` | M5Stack Core2 基础固件（OTA 用；唤醒词/深度续航版需本地 `m5core2/build_pm.sh ww` USB 烧录） |
-
-            某端构建失败时该产物缺席，详见 Actions 运行日志。
+          body: ${{ steps.cl.outputs.body }}
           files: dist/**
