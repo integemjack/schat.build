@@ -1,0 +1,197 @@
+name: Native Desktop
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Ireoo/Secret-Chat 的分支或标签（原生桌面端在 v9.9）"
+        required: false
+        default: "v9.9"
+
+# dispatch-only：原生桌面端的编译/测试验证按需触发（需源仓已 push 对应 ref）。
+permissions:
+  contents: write
+
+env:
+  SRC_REPO: Ireoo/Secret-Chat
+  SRC_REF: ${{ github.event.inputs.ref || 'v9.9' }}
+
+jobs:
+  macos:
+    name: macOS SwiftUI (.app zip)
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          repository: Ireoo/Secret-Chat
+          ref: ${{ env.SRC_REF }}
+          token: ${{ secrets.SRC_REPO_TOKEN }}
+
+      - name: Build release binary
+        working-directory: desktop-native/macos
+        run: swift build -c release
+
+      - name: Run E2E golden-vector tests
+        working-directory: desktop-native/macos
+        run: swift test
+
+      - name: Package .app
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION=$(grep -E 'marketingVersion = "[^"]+"' desktop-native/macos/Sources/SecretChatMac/Models/ChatModels.swift | sed -E 's/.*"([^"]+)".*/\1/')
+          BUILD=$(grep -E 'buildNumber = [0-9]+' desktop-native/macos/Sources/SecretChatMac/Models/ChatModels.swift | sed -E 's/.*= ([0-9]+).*/\1/')
+          APP="out/Secret Chat Native.app"
+          mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+          cp desktop-native/macos/.build/release/SecretChatMac "$APP/Contents/MacOS/SecretChatMac"
+          chmod +x "$APP/Contents/MacOS/SecretChatMac"
+          cat > "$APP/Contents/Info.plist" <<PLIST
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>CFBundleDevelopmentRegion</key><string>zh_CN</string>
+            <key>CFBundleDisplayName</key><string>Secret Chat Native</string>
+            <key>CFBundleExecutable</key><string>SecretChatMac</string>
+            <key>CFBundleIdentifier</key><string>com.secretchat.native.mac</string>
+            <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
+            <key>CFBundleName</key><string>Secret Chat Native</string>
+            <key>CFBundlePackageType</key><string>APPL</string>
+            <key>CFBundleShortVersionString</key><string>${VERSION}</string>
+            <key>CFBundleVersion</key><string>${BUILD}</string>
+            <key>LSMinimumSystemVersion</key><string>14.0</string>
+            <key>NSHighResolutionCapable</key><true/>
+          </dict>
+          </plist>
+          PLIST
+          codesign --force --deep --sign - "$APP"
+          ditto -c -k --keepParent "$APP" "out/SecretChat-native-macos-${VERSION}.app.zip"
+          rm -rf "$APP"
+          ls -la out
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: native-macos
+          path: out/*
+
+  windows:
+    name: Windows WinUI 3 (zip)
+    runs-on: windows-latest
+    timeout-minutes: 40
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          repository: Ireoo/Secret-Chat
+          ref: ${{ env.SRC_REF }}
+          token: ${{ secrets.SRC_REPO_TOKEN }}
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "8.0.x"
+
+      - name: Restore
+        working-directory: desktop-native/windows/SecretChat.Windows
+        run: dotnet restore
+
+      - name: Run E2E golden-vector tests
+        working-directory: desktop-native/windows
+        run: dotnet test SecretChat.Windows.Tests/SecretChat.Windows.Tests.csproj -c Release
+
+      - name: Publish unpackaged app
+        working-directory: desktop-native/windows/SecretChat.Windows
+        run: dotnet publish -c Release -r win-x64 --self-contained true -p:WindowsPackageType=None -p:PublishSingleFile=false -o publish
+
+      - name: Package zip
+        shell: pwsh
+        run: |
+          $version = [xml](Get-Content desktop-native/windows/SecretChat.Windows/SecretChat.Windows.csproj)
+          $displayVersion = $version.Project.PropertyGroup.ApplicationDisplayVersion
+          New-Item -ItemType Directory -Force out | Out-Null
+          Compress-Archive -Path desktop-native/windows/SecretChat.Windows/publish/* -DestinationPath "out/SecretChat-native-windows-$displayVersion-win-x64.zip" -Force
+          Get-ChildItem out
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: native-windows
+          path: out/*
+
+  linux:
+    name: Linux GTK4 (tar.gz)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          repository: Ireoo/Secret-Chat
+          ref: ${{ env.SRC_REF }}
+          token: ${{ secrets.SRC_REPO_TOKEN }}
+
+      - name: Install GTK dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential \
+            pkg-config \
+            libssl-dev \
+            libgtk-4-dev \
+            libadwaita-1-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Build release binary
+        working-directory: desktop-native/linux
+        run: cargo build --release
+
+      - name: Run E2E golden-vector tests
+        working-directory: desktop-native/linux
+        run: cargo test --release
+
+      - name: Package tarball
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION=$(grep -E '^version = "[^"]+"' desktop-native/linux/Cargo.toml | head -1 | sed -E 's/.*"([^"]+)".*/\1/')
+          PKG="SecretChat-native-linux-${VERSION}-x86_64"
+          mkdir -p "out/${PKG}/bin" "out/${PKG}/share/applications"
+          cp desktop-native/linux/target/release/secret-chat-linux "out/${PKG}/bin/secret-chat-linux"
+          cat > "out/${PKG}/share/applications/com.secretchat.NativeLinux.desktop" <<DESKTOP
+          [Desktop Entry]
+          Type=Application
+          Name=Secret Chat Native
+          Exec=secret-chat-linux
+          Categories=Network;Chat;InstantMessaging;
+          DESKTOP
+          tar -C out -czf "out/${PKG}.tar.gz" "${PKG}"
+          rm -rf "out/${PKG}"
+          ls -la out
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: native-linux
+          path: out/*
+
+  release:
+    name: Publish Native Desktop Release
+    needs: [macos, windows, linux]
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: List artifacts
+        run: ls -laR dist
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: native-desktop-${{ env.SRC_REF }}-b${{ github.run_number }}
+          name: "Secret Chat Native Desktop ${{ env.SRC_REF }} build ${{ github.run_number }}"
+          body: |
+            Native desktop packaging verification for macOS SwiftUI, Windows WinUI 3, and Linux GTK4.
+
+            Source ref: `${{ env.SRC_REF }}`
+          files: dist/**
