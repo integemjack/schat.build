@@ -9,15 +9,17 @@
 | iOS | macos-26（Liquid Glass / 部署目标 26.2 需 Xcode 26） | 未签名 IPA |
 | Android | ubuntu | debug APK（可装）+ 未签名 release APK |
 | Desktop | macos / ubuntu / windows 矩阵 | dmg / nsis exe / AppImage |
+| Native Desktop | macos / ubuntu / windows 矩阵 | SwiftUI `.app.zip` / WinUI zip / GTK4 tar.gz |
 | Go server | ubuntu | `schat-server-linux-amd64` 单二进制 |
 | Docker | ubuntu | `ghcr.io/integemjack/schat-server`（nodeServer 生产服务器镜像） |
 
 ## 触发
 
-- 手动：Actions → **Build All** → Run workflow，可填源分支（默认 `v9.1`）
+- 手动：Actions → **Build All** 或 **Native Desktop** → Run workflow，可填源分支
 - 自动：push 到本仓库 `main`（即修改 workflow 本身）
 
-Release 标签格式：`<源分支>-b<run 编号>`，如 `v9.1-b3`。
+`Build All` Release 标签格式：`<源分支>-b<run 编号>`，如 `v9.1-b3`。
+`Native Desktop` Release 标签格式：`native-desktop-<源分支>-b<run 编号>`。
 
 ## 必需 Secret
 
