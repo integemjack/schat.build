@@ -104,6 +104,19 @@ jobs:
         working-directory: desktop-native/windows/SecretChat.Windows
         run: dotnet publish -c Release -r win-x64 --self-contained true -p:WindowsPackageType=None -p:PublishSingleFile=false -o publish
 
+      - name: Diagnose generated bindings (on failure)
+        if: failure()
+        shell: pwsh
+        working-directory: desktop-native/windows/SecretChat.Windows
+        run: |
+          $g = Get-ChildItem -Recurse obj -Filter MainWindow.g.cs -ErrorAction SilentlyContinue | Select-Object -First 1
+          if ($null -eq $g) { Write-Host "no MainWindow.g.cs found"; exit 0 }
+          Write-Host "=== $($g.FullName) lines 6790-7090 ==="
+          $lines = Get-Content $g.FullName
+          for ($i = 6789; $i -lt [Math]::Min(7090, $lines.Count); $i++) {
+            "{0,5}: {1}" -f ($i+1), $lines[$i]
+          }
+
       - name: Package zip
         shell: pwsh
         run: |
