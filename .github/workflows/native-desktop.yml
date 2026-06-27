@@ -17,10 +17,12 @@ env:
   SRC_REF: ${{ github.event.inputs.ref || 'v9.9' }}
 
 jobs:
+  # macOS: a single universal (arm64 + x86_64) .app — one artifact runs on both
+  # Apple Silicon and Intel Macs.
   macos:
-    name: macOS SwiftUI (.app zip)
+    name: macOS SwiftUI (universal .app)
     runs-on: macos-latest
-    timeout-minutes: 30
+    timeout-minutes: 40
     steps:
       - name: Checkout source
         uses: actions/checkout@v4
@@ -29,23 +31,25 @@ jobs:
           ref: ${{ env.SRC_REF }}
           token: ${{ secrets.SRC_REPO_TOKEN }}
 
-      - name: Build release binary
+      - name: Build universal release binary
         working-directory: desktop-native/macos
-        run: swift build -c release
+        run: swift build -c release --arch arm64 --arch x86_64
 
       - name: Run E2E golden-vector tests
         working-directory: desktop-native/macos
         run: swift test
 
-      - name: Package .app
+      - name: Package universal .app
         shell: bash
         run: |
           set -euo pipefail
           VERSION=$(grep -E 'marketingVersion = "[^"]+"' desktop-native/macos/Sources/SecretChatMac/Models/ChatModels.swift | sed -E 's/.*"([^"]+)".*/\1/')
           BUILD=$(grep -E 'buildNumber = [0-9]+' desktop-native/macos/Sources/SecretChatMac/Models/ChatModels.swift | sed -E 's/.*= ([0-9]+).*/\1/')
+          BIN=desktop-native/macos/.build/apple/Products/Release/SecretChatMac
+          lipo -archs "$BIN"
           APP="out/Secret Chat Native.app"
           mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
-          cp desktop-native/macos/.build/release/SecretChatMac "$APP/Contents/MacOS/SecretChatMac"
+          cp "$BIN" "$APP/Contents/MacOS/SecretChatMac"
           chmod +x "$APP/Contents/MacOS/SecretChatMac"
           cat > "$APP/Contents/Info.plist" <<PLIST
           <?xml version="1.0" encoding="UTF-8"?>
@@ -67,7 +71,7 @@ jobs:
           </plist>
           PLIST
           codesign --force --deep --sign - "$APP"
-          ditto -c -k --keepParent "$APP" "out/SecretChat-native-macos-${VERSION}.app.zip"
+          ditto -c -k --keepParent "$APP" "out/SecretChat-native-macos-${VERSION}-universal.app.zip"
           rm -rf "$APP"
           ls -la out
 
@@ -76,10 +80,20 @@ jobs:
           name: native-macos
           path: out/*
 
+  # Windows: all three CPU architectures (x64, x86, arm64). Built with VS MSBuild
+  # (the WinUI PRI task is not in the bare dotnet SDK). x86/arm64 are cross-published
+  # from the x64 runner.
   windows:
-    name: Windows WinUI 3 (zip)
+    name: Windows WinUI 3 (${{ matrix.rid }})
     runs-on: windows-latest
-    timeout-minutes: 40
+    timeout-minutes: 50
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { rid: win-x64, platform: x64 }
+          - { rid: win-x86, platform: x86 }
+          - { rid: win-arm64, platform: arm64 }
     steps:
       - name: Checkout source
         uses: actions/checkout@v4
@@ -92,22 +106,20 @@ jobs:
         with:
           dotnet-version: "8.0.x"
 
-      # WinUI3 PRI/MSIX MSBuild tasks (Microsoft.Build.Packaging.Pri.Tasks) ship with
-      # Visual Studio's MSBuild, NOT the bare dotnet SDK — so dotnet publish fails with
-      # MSB4062. Build the WinUI app with VS MSBuild instead.
+      # WinUI3 PRI/MSIX MSBuild tasks ship with Visual Studio's MSBuild, not the bare
+      # dotnet SDK. Build the WinUI app with VS MSBuild.
       - uses: microsoft/setup-msbuild@v2
 
       - name: Run E2E golden-vector tests
         working-directory: desktop-native/windows
         run: dotnet test SecretChat.Windows.Tests/SecretChat.Windows.Tests.csproj -c Release
 
-      # Use the `-restore` SWITCH (not `-t:Restore,Publish`): a target-list restore is
-      # evaluated before NuGet brings in the WindowsAppSDK markup-compiler targets, so
-      # the *.g.cs (InitializeComponent / x:Name fields / App Main) never generate. The
-      # switch does a separate restore phase then re-evaluates for Publish.
+      # Use the `-restore` SWITCH so NuGet brings in the WinUI markup-compiler targets
+      # before Publish (a target-list restore evaluates the project too early and the
+      # *.g.cs never generate).
       - name: Publish unpackaged app (VS MSBuild)
         working-directory: desktop-native/windows/SecretChat.Windows
-        run: msbuild SecretChat.Windows.csproj -restore -t:Publish -p:Configuration=Release -p:Platform=x64 -p:RuntimeIdentifier=win-x64 -p:SelfContained=true -p:WindowsPackageType=None -p:PublishDir=publish\
+        run: msbuild SecretChat.Windows.csproj -restore -t:Publish -p:Configuration=Release -p:Platform=${{ matrix.platform }} -p:RuntimeIdentifier=${{ matrix.rid }} -p:SelfContained=true -p:WindowsPackageType=None -p:PublishDir=publish\
 
       - name: Diagnose generated bindings (on failure)
         if: failure()
@@ -128,18 +140,26 @@ jobs:
           $version = [xml](Get-Content desktop-native/windows/SecretChat.Windows/SecretChat.Windows.csproj)
           $displayVersion = $version.Project.PropertyGroup.ApplicationDisplayVersion
           New-Item -ItemType Directory -Force out | Out-Null
-          Compress-Archive -Path desktop-native/windows/SecretChat.Windows/publish/* -DestinationPath "out/SecretChat-native-windows-$displayVersion-win-x64.zip" -Force
+          Compress-Archive -Path desktop-native/windows/SecretChat.Windows/publish/* -DestinationPath "out/SecretChat-native-windows-$displayVersion-${{ matrix.rid }}.zip" -Force
           Get-ChildItem out
 
       - uses: actions/upload-artifact@v4
         with:
-          name: native-windows
+          name: native-windows-${{ matrix.rid }}
           path: out/*
 
+  # Linux: x86_64 + aarch64, each built natively on its own runner (cross-compiling a
+  # GTK4 app is impractical; GitHub provides arm64 Linux runners).
   linux:
-    name: Linux GTK4 (tar.gz)
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
+    name: Linux GTK4 (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { runner: ubuntu-latest, arch: x86_64 }
+          - { runner: ubuntu-24.04-arm, arch: aarch64 }
     steps:
       - name: Checkout source
         uses: actions/checkout@v4
@@ -152,11 +172,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            build-essential \
-            pkg-config \
-            libssl-dev \
-            libgtk-4-dev \
-            libadwaita-1-dev
+            build-essential pkg-config libssl-dev libgtk-4-dev libadwaita-1-dev
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -173,7 +189,7 @@ jobs:
         run: |
           set -euo pipefail
           VERSION=$(grep -E '^version = "[^"]+"' desktop-native/linux/Cargo.toml | head -1 | sed -E 's/.*"([^"]+)".*/\1/')
-          PKG="SecretChat-native-linux-${VERSION}-x86_64"
+          PKG="SecretChat-native-linux-${VERSION}-${{ matrix.arch }}"
           mkdir -p "out/${PKG}/bin" "out/${PKG}/share/applications"
           cp desktop-native/linux/target/release/secret-chat-linux "out/${PKG}/bin/secret-chat-linux"
           cat > "out/${PKG}/share/applications/com.secretchat.NativeLinux.desktop" <<DESKTOP
@@ -189,7 +205,7 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: native-linux
+          name: native-linux-${{ matrix.arch }}
           path: out/*
 
   release:
@@ -209,7 +225,14 @@ jobs:
           tag_name: native-desktop-${{ env.SRC_REF }}-b${{ github.run_number }}
           name: "Secret Chat Native Desktop ${{ env.SRC_REF }} build ${{ github.run_number }}"
           body: |
-            Native desktop packaging verification for macOS SwiftUI, Windows WinUI 3, and Linux GTK4.
+            Native desktop packaging for all CPU architectures.
+
+            - macOS: universal (arm64 + x86_64) .app
+            - Windows: win-x64 / win-x86 / win-arm64 (self-contained)
+            - Linux: x86_64 / aarch64 (GTK4)
+
+            Each platform's build runs the E2E golden-vector tests
+            (swift test / dotnet test / cargo test) — byte-exact crypto across all.
 
             Source ref: `${{ env.SRC_REF }}`
           files: dist/**
