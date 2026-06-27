@@ -92,17 +92,18 @@ jobs:
         with:
           dotnet-version: "8.0.x"
 
-      - name: Restore
-        working-directory: desktop-native/windows/SecretChat.Windows
-        run: dotnet restore
+      # WinUI3 PRI/MSIX MSBuild tasks (Microsoft.Build.Packaging.Pri.Tasks) ship with
+      # Visual Studio's MSBuild, NOT the bare dotnet SDK — so dotnet publish fails with
+      # MSB4062. Build the WinUI app with VS MSBuild instead.
+      - uses: microsoft/setup-msbuild@v2
 
       - name: Run E2E golden-vector tests
         working-directory: desktop-native/windows
         run: dotnet test SecretChat.Windows.Tests/SecretChat.Windows.Tests.csproj -c Release
 
-      - name: Publish unpackaged app
+      - name: Publish unpackaged app (VS MSBuild)
         working-directory: desktop-native/windows/SecretChat.Windows
-        run: dotnet publish -c Release -r win-x64 --self-contained true -p:WindowsPackageType=None -p:PublishSingleFile=false -o publish
+        run: msbuild SecretChat.Windows.csproj -t:Restore,Publish -p:Configuration=Release -p:Platform=x64 -p:RuntimeIdentifier=win-x64 -p:SelfContained=true -p:WindowsPackageType=None -p:PublishDir=publish\
 
       - name: Diagnose generated bindings (on failure)
         if: failure()
