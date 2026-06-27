@@ -101,9 +101,13 @@ jobs:
         working-directory: desktop-native/windows
         run: dotnet test SecretChat.Windows.Tests/SecretChat.Windows.Tests.csproj -c Release
 
+      # Use the `-restore` SWITCH (not `-t:Restore,Publish`): a target-list restore is
+      # evaluated before NuGet brings in the WindowsAppSDK markup-compiler targets, so
+      # the *.g.cs (InitializeComponent / x:Name fields / App Main) never generate. The
+      # switch does a separate restore phase then re-evaluates for Publish.
       - name: Publish unpackaged app (VS MSBuild)
         working-directory: desktop-native/windows/SecretChat.Windows
-        run: msbuild SecretChat.Windows.csproj -t:Restore,Publish -p:Configuration=Release -p:Platform=x64 -p:RuntimeIdentifier=win-x64 -p:SelfContained=true -p:WindowsPackageType=None -p:PublishDir=publish\
+        run: msbuild SecretChat.Windows.csproj -restore -t:Publish -p:Configuration=Release -p:Platform=x64 -p:RuntimeIdentifier=win-x64 -p:SelfContained=true -p:WindowsPackageType=None -p:PublishDir=publish\
 
       - name: Diagnose generated bindings (on failure)
         if: failure()
