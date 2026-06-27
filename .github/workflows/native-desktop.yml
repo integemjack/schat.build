@@ -208,9 +208,71 @@ jobs:
           name: native-linux-${{ matrix.arch }}
           path: out/*
 
+  # Raspberry Pi / 32-bit ARM SBCs (armhf / armv7). No armhf GitHub runner exists, so
+  # build in an arm32v7 Debian trixie container under QEMU emulation. trixie (not
+  # bookworm) because the app needs GTK 4.12 + libadwaita 1.5 (FileDialog/AlertDialog);
+  # Pi OS bookworm's GTK 4.8 is too old — run this build on a GTK ≥4.12 distro.
+  # (64-bit Raspberry Pi is already covered by the aarch64 leg above.)
+  linux-armhf:
+    name: Linux GTK4 (armhf · 32-bit ARM / Raspberry Pi)
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          repository: Ireoo/Secret-Chat
+          ref: ${{ env.SRC_REF }}
+          token: ${{ secrets.SRC_REPO_TOKEN }}
+
+      - uses: docker/setup-qemu-action@v3
+
+      - name: Build + test armhf in Debian trixie (QEMU)
+        run: |
+          docker run --rm --platform linux/arm/v7 \
+            -v "$PWD:/src" -w /src/desktop-native/linux \
+            arm32v7/debian:trixie bash -lc '
+              set -e
+              export DEBIAN_FRONTEND=noninteractive
+              apt-get update
+              apt-get install -y --no-install-recommends \
+                build-essential pkg-config libssl-dev libgtk-4-dev libadwaita-1-dev \
+                curl ca-certificates
+              curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+              . "$HOME/.cargo/env"
+              cargo build --release
+              cargo test --release
+            '
+
+      - name: Package tarball
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION=$(grep -E '^version = "[^"]+"' desktop-native/linux/Cargo.toml | head -1 | sed -E 's/.*"([^"]+)".*/\1/')
+          PKG="SecretChat-native-linux-${VERSION}-armhf"
+          mkdir -p "out/${PKG}/bin" "out/${PKG}/share/applications"
+          sudo cp desktop-native/linux/target/release/secret-chat-linux "out/${PKG}/bin/secret-chat-linux"
+          sudo chmod +x "out/${PKG}/bin/secret-chat-linux"
+          file "out/${PKG}/bin/secret-chat-linux"
+          cat > "out/${PKG}/share/applications/com.secretchat.NativeLinux.desktop" <<DESKTOP
+          [Desktop Entry]
+          Type=Application
+          Name=Secret Chat Native
+          Exec=secret-chat-linux
+          Categories=Network;Chat;InstantMessaging;
+          DESKTOP
+          tar -C out -czf "out/${PKG}.tar.gz" "${PKG}"
+          rm -rf "out/${PKG}"
+          ls -la out
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: native-linux-armhf
+          path: out/*
+
   release:
     name: Publish Native Desktop Release
-    needs: [macos, windows, linux]
+    needs: [macos, windows, linux, linux-armhf]
     if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     steps:
@@ -229,7 +291,7 @@ jobs:
 
             - macOS: universal (arm64 + x86_64) .app
             - Windows: win-x64 / win-x86 / win-arm64 (self-contained)
-            - Linux: x86_64 / aarch64 (GTK4)
+            - Linux: x86_64 / aarch64 / armhf (GTK4; armhf for 32-bit ARM / Raspberry Pi, built on Debian trixie — needs GTK ≥4.12 at runtime)
 
             Each platform's build runs the E2E golden-vector tests
             (swift test / dotnet test / cargo test) — byte-exact crypto across all.
