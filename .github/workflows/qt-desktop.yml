@@ -20,6 +20,9 @@ on:
         required: false
         # 开发分支是版本分支(v9.12 …);`main` 缺 desktop/desktop-qt。切版本时同步这里。
         default: "v9.12"
+  # 临时:push 到 main 也跑,便于调试 Windows/Linux 打包(验证稳定后可删,回到纯 dispatch)。
+  push:
+    branches: [main]
 
 permissions:
   contents: write
