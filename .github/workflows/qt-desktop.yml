@@ -67,17 +67,18 @@ jobs:
             -DCMAKE_PREFIX_PATH="$(brew --prefix qt)"
           cmake --build build -j"$(sysctl -n hw.ncpu)"
 
-      - name: Package self-contained .app (macdeployqt)
+      - name: Package .dmg (macdeployqt -dmg)
         shell: bash
         working-directory: desktop/desktop-qt
         run: |
           set -euo pipefail
           VER=$(grep -E 'kVersion = "[^"]+"' core/include/schat/Version.h | sed -E 's/.*"([^"]+)".*/\1/')
           APP="build/app-qt/secretchat-qt.app"
-          "$(brew --prefix qt)/bin/macdeployqt" "$APP" -qmldir=app-qt/qml
           codesign --force --deep --sign - "$APP" || true
+          # -dmg deploys the Qt frameworks/plugins/QML into the bundle AND wraps it in a .dmg.
+          "$(brew --prefix qt)/bin/macdeployqt" "$APP" -qmldir=app-qt/qml -dmg
           mkdir -p out
-          ditto -c -k --keepParent "$APP" "out/SecretChat-qt-macos-${VER}-${{ matrix.arch }}.app.zip"
+          mv build/app-qt/secretchat-qt.dmg "out/SecretChat-qt-macos-${VER}-${{ matrix.arch }}.dmg"
           ls -la out
 
       - uses: actions/upload-artifact@v4
@@ -85,13 +86,17 @@ jobs:
           name: qt-macos-${{ matrix.arch }}
           path: desktop/desktop-qt/out/*
 
-  # ── Windows: x64 via MinGW (matches the vendored MinGW deps the build expects). aqt provides
-  # a MinGW-built Qt6 + the MinGW toolchain; fetch_deps.sh compiles opus/openh264 + pulls the
-  # prebuilt MinGW libsodium. ─────────────────────────────────────────────────────────────────
+  # ── Windows: x64 via MSYS2/MINGW64. pacman provides gcc + Qt6 + OpenSSL + opus/libsodium/
+  # openh264/libsrtp (all with pkg-config), so libdatachannel's DTLS finds OpenSSL and the core
+  # links the codecs via pkg-config (the CMake MSYS2 branch). windeployqt bundles the Qt DLLs;
+  # NSIS builds a self-contained installer .exe. ──────────────────────────────────────────────
   windows:
-    name: Windows Qt (x64, MinGW)
+    name: Windows Qt (x64, MSYS2 → installer)
     runs-on: windows-latest
-    timeout-minutes: 70
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: msys2 {0}
     steps:
       - name: Checkout source
         uses: actions/checkout@v4
@@ -100,42 +105,65 @@ jobs:
           ref: ${{ env.SRC_REF }}
           token: ${{ secrets.SRC_REPO_TOKEN }}
 
-      - name: Install Qt6 (MinGW) + toolchain
-        uses: jurplel/install-qt-action@v4
+      - uses: msys2/setup-msys2@v2
         with:
-          version: "6.8.*"
-          host: windows
-          target: desktop
-          arch: win64_mingw
-          modules: qtmultimedia
-          tools: tools_mingw1310
-          add-tools-to-path: true
+          msystem: MINGW64
+          update: true
+          install: >-
+            git curl
+            mingw-w64-x86_64-gcc mingw-w64-x86_64-cmake mingw-w64-x86_64-ninja
+            mingw-w64-x86_64-pkgconf mingw-w64-x86_64-qt6-base mingw-w64-x86_64-qt6-declarative
+            mingw-w64-x86_64-qt6-multimedia mingw-w64-x86_64-qt6-websockets
+            mingw-w64-x86_64-opus mingw-w64-x86_64-libsodium mingw-w64-x86_64-openh264
+            mingw-w64-x86_64-openssl mingw-w64-x86_64-libsrtp mingw-w64-x86_64-nsis
 
-      - name: Fetch third-party deps (builds opus/openh264 via MinGW)
+      - name: Fetch third-party deps (libdatachannel source + single headers)
         working-directory: desktop/desktop-qt
-        shell: bash
         run: bash third_party/fetch_deps.sh
 
       - name: Configure + build (Release)
         working-directory: desktop/desktop-qt
-        shell: bash
         run: |
-          cmake -S . -B build -G "MinGW Makefiles" -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_PREFIX_PATH="$QT_ROOT_DIR"
-          cmake --build build -j
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+          cmake --build build -j"$(nproc)"
 
-      - name: Package self-contained folder (windeployqt)
-        shell: bash
+      - name: Package installer (windeployqt + NSIS)
         working-directory: desktop/desktop-qt
         run: |
-          set -euo pipefail
+          set -e
           VER=$(grep -E 'kVersion = "[^"]+"' core/include/schat/Version.h | sed -E 's/.*"([^"]+)".*/\1/')
-          DEST="SecretChat-qt-windows-${VER}-x64"
-          mkdir -p "pkg/$DEST" out
-          cp build/app-qt/secretchat-qt.exe "pkg/$DEST/"
-          "$QT_ROOT_DIR/bin/windeployqt.exe" --qmldir app-qt/qml --release --no-translations "pkg/$DEST/secretchat-qt.exe"
-          # $DEST is expanded by bash before powershell runs (Compress-Archive is the built-in zipper).
-          powershell -Command "Compress-Archive -Path 'pkg/$DEST/*' -DestinationPath 'out/$DEST.zip' -Force"
+          STAGE="pkg/SecretChat"
+          mkdir -p "$STAGE" out
+          cp build/app-qt/secretchat-qt.exe "$STAGE/"
+          windeployqt --qmldir app-qt/qml --release --no-translations --compiler-runtime "$STAGE/secretchat-qt.exe"
+          # Minimal NSIS installer: install to Program Files, Start-menu + desktop shortcut, uninstaller.
+          cat > installer.nsi <<'NSI'
+          !include "MUI2.nsh"
+          Name "Secret Chat"
+          OutFile "SecretChat-Setup.exe"
+          InstallDir "$PROGRAMFILES64\Secret Chat"
+          RequestExecutionLevel admin
+          !insertmacro MUI_PAGE_DIRECTORY
+          !insertmacro MUI_PAGE_INSTFILES
+          !insertmacro MUI_UNPAGE_CONFIRM
+          !insertmacro MUI_UNPAGE_INSTFILES
+          !insertmacro MUI_LANGUAGE "SimpChinese"
+          !insertmacro MUI_LANGUAGE "English"
+          Section "Install"
+            SetOutPath "$INSTDIR"
+            File /r "pkg\SecretChat\*.*"
+            CreateShortcut "$SMPROGRAMS\Secret Chat.lnk" "$INSTDIR\secretchat-qt.exe"
+            CreateShortcut "$DESKTOP\Secret Chat.lnk" "$INSTDIR\secretchat-qt.exe"
+            WriteUninstaller "$INSTDIR\uninstall.exe"
+          SectionEnd
+          Section "Uninstall"
+            Delete "$SMPROGRAMS\Secret Chat.lnk"
+            Delete "$DESKTOP\Secret Chat.lnk"
+            RMDir /r "$INSTDIR"
+          SectionEnd
+          NSI
+          makensis installer.nsi
+          mv SecretChat-Setup.exe "out/SecretChat-qt-windows-${VER}-x64-setup.exe"
           ls -la out
 
       - uses: actions/upload-artifact@v4
@@ -143,9 +171,10 @@ jobs:
           name: qt-windows-x64
           path: desktop/desktop-qt/out/*
 
-  # ── Linux: x86_64 + aarch64 on native runners. Qt6 + codec deps come from apt; the CMake
-  # Linux branch links them via pkg-config. Packaged as a tarball (needs Qt6 runtime installed;
-  # a self-contained AppImage is a possible follow-up). ───────────────────────────────────────
+  # ── Linux: x86_64 + aarch64 + armhf, built + packaged in Debian trixie containers (trixie
+  # ships Qt 6.8 + libsodium ≥1.0.19 + codecs). Produces a .deb (all arches) and, on x86_64, a
+  # self-contained AppImage — via scripts/ci-linux-pkg.sh in the source repo. x86_64/aarch64
+  # run natively on matching runners; armhf runs under QEMU. ───────────────────────────────────
   linux:
     name: Linux Qt (${{ matrix.arch }})
     runs-on: ${{ matrix.runner }}
@@ -168,56 +197,12 @@ jobs:
       # QEMU is only needed for armhf on the x86 runner; harmless for the native x86_64/aarch64.
       - uses: docker/setup-qemu-action@v3
 
-      - name: Build in Debian trixie (${{ matrix.arch }})
-        # Debian trixie ships Qt 6.8 + libsodium ≥1.0.19 + the codecs via apt, so it satisfies
-        # both loadFromModule (Qt ≥6.5) and the E2E HKDF API — unlike the Ubuntu runners' apt.
+      - name: Build + package (.deb + AppImage) in Debian trixie (${{ matrix.arch }})
         run: |
           docker run --rm --platform ${{ matrix.platform }} \
-            -e SCHAT_GH_MIRROR -e SCHAT_RAW_MIRROR \
+            -e SCHAT_GH_MIRROR -e SCHAT_RAW_MIRROR -e ARCH=${{ matrix.arch }} \
             -v "$PWD:/src" -w /src/desktop/desktop-qt \
-            ${{ matrix.image }} bash -lc '
-              set -e
-              export DEBIAN_FRONTEND=noninteractive
-              apt-get update
-              apt-get install -y --no-install-recommends \
-                cmake ninja-build pkg-config g++ git curl ca-certificates \
-                qt6-base-dev qt6-declarative-dev qt6-multimedia-dev qt6-websockets-dev \
-                qml6-module-qtquick qml6-module-qtquick-controls \
-                qml6-module-qtquick-layouts qml6-module-qtquick-window \
-                qml6-module-qtquick-dialogs qml6-module-qtquick-shapes \
-                libopus-dev libopenh264-dev libsodium-dev libssl-dev zlib1g-dev libsrtp2-dev
-              bash third_party/fetch_deps.sh
-              cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
-              cmake --build build -j"$(nproc)"
-            '
-
-      - name: Package tarball
-        shell: bash
-        working-directory: desktop/desktop-qt
-        run: |
-          set -euo pipefail
-          VER=$(grep -E 'kVersion = "[^"]+"' core/include/schat/Version.h | sed -E 's/.*"([^"]+)".*/\1/')
-          PKG="SecretChat-qt-linux-${VER}-${{ matrix.arch }}"
-          mkdir -p "out/${PKG}/bin" "out/${PKG}/share/applications"
-          sudo cp build/app-qt/secretchat-qt "out/${PKG}/bin/secretchat-qt"   # container writes as root
-          sudo chmod +x "out/${PKG}/bin/secretchat-qt"
-          file "out/${PKG}/bin/secretchat-qt" || true
-          cat > "out/${PKG}/share/applications/com.secretchat.Qt.desktop" <<DESKTOP
-          [Desktop Entry]
-          Type=Application
-          Name=Secret Chat
-          Exec=secretchat-qt
-          Categories=Network;Chat;InstantMessaging;
-          DESKTOP
-          cat > "out/${PKG}/README.txt" <<TXT
-          Secret Chat (Qt desktop) ${VER} — ${{ matrix.arch }}
-          Built on Debian trixie (Qt 6.8). Runtime needs Qt6 (>=6.5) + QML modules, e.g.:
-            apt install qt6-base qt6-declarative qml6-module-qtquick-dialogs libopus0 libopenh264-7 libsodium23
-          Run: ./bin/secretchat-qt
-          TXT
-          tar -C out -czf "out/${PKG}.tar.gz" "${PKG}"
-          sudo rm -rf "out/${PKG}"
-          ls -la out
+            ${{ matrix.image }} bash scripts/ci-linux-pkg.sh
 
       - uses: actions/upload-artifact@v4
         with:
@@ -243,9 +228,9 @@ jobs:
           body: |
             Qt6/QML desktop packaging (replaces the deleted Electron client), all platforms + arches:
 
-            - macOS: arm64 (Apple Silicon) + x86_64 (Intel) — self-contained .app (macdeployqt)
-            - Windows: x64 (MinGW) — self-contained folder (windeployqt)
-            - Linux: x86_64 + aarch64 + armhf — tarball (needs Qt6 runtime; armhf built on Debian trixie under QEMU)
+            - macOS: arm64 (Apple Silicon) + x86_64 (Intel) — **.dmg** (macdeployqt-bundled)
+            - Windows: x64 — **installer .exe** (MSYS2 build + windeployqt + NSIS)
+            - Linux: x86_64 + aarch64 + armhf — **.deb** (all arches) + **AppImage** (x86_64, self-contained); built on Debian trixie
 
             Source ref: `${{ env.SRC_REF }}`
           files: dist/**

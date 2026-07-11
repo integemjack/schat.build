@@ -66,17 +66,13 @@ jobs:
           name: android
           path: out/*.apk
 
-  # Qt6/QML desktop (desktop/desktop-qt) — replaces the deleted Electron client. This "Build
-  # All" leg is a quick per-OS check (macOS native arch + Windows x64). The full multi-arch
-  # release, including all Linux arches (via Debian trixie), is qt-desktop.yml.
+  # Qt6/QML desktop (desktop/desktop-qt) — replaces the deleted Electron client. "Build All"
+  # only does the macOS .dmg as a quick check; the full multi-platform release (Windows
+  # installer via MSYS2, Linux .deb + AppImage via Debian trixie) is qt-desktop.yml.
   desktop:
-    name: Qt Desktop (${{ matrix.os }})
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [macos-latest, windows-latest]
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 70
+    name: Qt Desktop (macOS .dmg)
+    runs-on: macos-latest
+    timeout-minutes: 60
     steps:
       - name: Checkout source
         uses: actions/checkout@v4
@@ -85,64 +81,34 @@ jobs:
           ref: ${{ env.SRC_REF }}
           token: ${{ secrets.SRC_REPO_TOKEN }}
 
-      - name: Install Qt6 + codec deps (macOS)
-        if: runner.os == 'macOS'
+      - name: Install Qt6 + codec deps (Homebrew)
         run: brew install qt cmake ninja pkg-config opus openh264 libsodium openssl@3
-
-      - name: Install Qt6 (MinGW) (Windows)
-        if: runner.os == 'Windows'
-        uses: jurplel/install-qt-action@v4
-        with:
-          version: "6.8.*"
-          arch: win64_mingw
-          modules: qtmultimedia
-          tools: tools_mingw1310
-          add-tools-to-path: true
 
       - name: Fetch third-party deps
         working-directory: desktop/desktop-qt
-        shell: bash
         run: bash third_party/fetch_deps.sh
 
       - name: Configure + build (Release)
         working-directory: desktop/desktop-qt
-        shell: bash
         run: |
-          if [ "$RUNNER_OS" = "macOS" ]; then
-            cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_PREFIX_PATH="$(brew --prefix qt)"
-          elif [ "$RUNNER_OS" = "Windows" ]; then
-            cmake -S . -B build -G "MinGW Makefiles" -DCMAKE_BUILD_TYPE=Release -DCMAKE_PREFIX_PATH="$QT_ROOT_DIR"
-          else
-            cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
-          fi
-          cmake --build build -j
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_PREFIX_PATH="$(brew --prefix qt)"
+          cmake --build build -j"$(sysctl -n hw.ncpu)"
 
-      - name: Package
+      - name: Package .dmg
         working-directory: desktop/desktop-qt
-        shell: bash
         run: |
           set -euo pipefail
           VER=$(grep -E 'kVersion = "[^"]+"' core/include/schat/Version.h | sed -E 's/.*"([^"]+)".*/\1/')
+          APP="build/app-qt/secretchat-qt.app"
+          codesign --force --deep --sign - "$APP" || true
+          "$(brew --prefix qt)/bin/macdeployqt" "$APP" -qmldir=app-qt/qml -dmg
           mkdir -p out
-          if [ "$RUNNER_OS" = "macOS" ]; then
-            APP="build/app-qt/secretchat-qt.app"
-            "$(brew --prefix qt)/bin/macdeployqt" "$APP" -qmldir=app-qt/qml
-            ditto -c -k --keepParent "$APP" "out/SecretChat-qt-macos-${VER}.app.zip"
-          elif [ "$RUNNER_OS" = "Windows" ]; then
-            DEST="SecretChat-qt-windows-${VER}-x64"; mkdir -p "pkg/$DEST"
-            cp build/app-qt/secretchat-qt.exe "pkg/$DEST/"
-            "$QT_ROOT_DIR/bin/windeployqt.exe" --qmldir app-qt/qml --release --no-translations "pkg/$DEST/secretchat-qt.exe"
-            powershell -Command "Compress-Archive -Path 'pkg/$DEST/*' -DestinationPath 'out/$DEST.zip' -Force"
-          else
-            PKG="SecretChat-qt-linux-${VER}-x86_64"; mkdir -p "out/$PKG/bin"
-            cp build/app-qt/secretchat-qt "out/$PKG/bin/"; chmod +x "out/$PKG/bin/secretchat-qt"
-            tar -C out -czf "out/$PKG.tar.gz" "$PKG"; rm -rf "out/$PKG"
-          fi
+          mv build/app-qt/secretchat-qt.dmg "out/SecretChat-qt-macos-${VER}.dmg"
           ls -la out
 
       - uses: actions/upload-artifact@v4
         with:
-          name: desktop-${{ runner.os }}
+          name: desktop-macos
           path: desktop/desktop-qt/out/*
 
   server:
