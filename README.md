@@ -23,7 +23,7 @@
 > 说明：桌面端由 Qt6/QML(`desktop/desktop-qt`)构建,取代已删除的 Electron 客户端。
 > macOS 用 Homebrew 的 Qt、Windows 用 aqt 的 MinGW Qt、Linux 用发行版 apt 的 Qt6 + pkg-config
 > 链系统的 opus/openh264/libsodium。macOS 已本地构建验证;Windows/Linux 由本工作流首次验证。
-> 旧的 `native-desktop.yml`(SwiftUI/WinUI3/GTK4 的 `desktop-native/` 线)引用已删路径,已废弃。
+> 旧的 `native-desktop.yml`(SwiftUI/WinUI3/GTK4 的 `desktop-native/` 线)引用已删路径,已移除。
 
 ## 必需 Secret
 

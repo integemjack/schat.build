@@ -151,7 +151,7 @@ jobs:
           path: desktop/desktop-qt/out/*
 
   server:
-    name: Go server (single binary)
+    name: chatserver (single binary, linux amd64+arm64)
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -164,19 +164,22 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version: "1.24"
-          cache-dependency-path: server/go.sum
+          cache-dependency-path: chatserver/go.sum
       - name: Build
-        working-directory: server
+        # chatserver is pure Go (pgx + modernc SQLite), so CGO_ENABLED=0 gives static
+        # binaries and easy cross-compile to arm64.
+        working-directory: chatserver
         run: |
           mkdir -p ../out
-          CGO_ENABLED=1 go build -trimpath -ldflags "-s -w" -o ../out/schat-server-linux-amd64 .
+          CGO_ENABLED=0 GOARCH=amd64 go build -trimpath -ldflags "-s -w" -o ../out/schat-chatserver-linux-amd64 .
+          CGO_ENABLED=0 GOARCH=arm64 go build -trimpath -ldflags "-s -w" -o ../out/schat-chatserver-linux-arm64 .
       - uses: actions/upload-artifact@v4
         with:
           name: server
           path: out/*
 
   docker:
-    name: nodeServer Docker → GHCR
+    name: chatserver Docker → GHCR
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -186,10 +189,9 @@ jobs:
           repository: Ireoo/Secret-Chat
           ref: ${{ env.SRC_REF }}
           token: ${{ secrets.SRC_REPO_TOKEN }}
-      - name: Seed placeholder config.yaml
-        # 源仓库只提交 config.yaml.example（真实 config.yaml 含推送密钥，不入库）；
-        # Dockerfile COPY config.yaml，故构建上下文里要有一份占位。真实配置在部署时用 volume/env 覆盖。
-        run: cp nodeServer/config.yaml.example nodeServer/config.yaml
+      # chatserver's multi-stage Dockerfile compiles Go in-container and does NOT COPY
+      # config.yaml into the image (config is mounted at runtime via CHATSERVER_CONFIG), so
+      # no placeholder seeding is needed (unlike the deleted nodeServer).
       - uses: docker/setup-buildx-action@v3
       - uses: docker/login-action@v3
         with:
@@ -202,7 +204,7 @@ jobs:
           # download-artifact 的一个额外（失败时为 0 字节）工件，拖垮整个 Release。
           DOCKER_BUILD_RECORD_UPLOAD: "false"
         with:
-          context: nodeServer
+          context: chatserver
           push: true
           tags: |
             ghcr.io/integemjack/schat-server:latest
@@ -228,9 +230,9 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.platformio
-          key: pio-m5core2-${{ hashFiles('m5core2/platformio.ini') }}
+          key: pio-m5core2-${{ hashFiles('ESP32/m5core2/platformio.ini') }}
       - name: Build firmware (base env)
-        working-directory: m5core2
+        working-directory: ESP32/m5core2
         # 普通 env(m5stack-core2):预编译核,纯 pio run,产 OTA-able firmware.bin。
         # 唤醒词/深度 light sleep 的 -ww 版需 model 分区(OTA 刷不了分区,必须 USB 首刷)+
         # custom_sdkconfig IDF 重编,是本地 ./build_pm.sh ww 烧录件,刻意不进 CI。
@@ -238,7 +240,7 @@ jobs:
       - name: Collect firmware
         run: |
           mkdir -p out
-          cp m5core2/.pio/build/m5stack-core2/firmware.bin out/SecretChat-m5core2-firmware.bin
+          cp ESP32/m5core2/.pio/build/m5stack-core2/firmware.bin out/SecretChat-m5core2-firmware.bin
           ls -la out
       - uses: actions/upload-artifact@v4
         with:
