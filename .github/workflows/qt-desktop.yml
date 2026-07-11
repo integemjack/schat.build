@@ -18,14 +18,19 @@ on:
       ref:
         description: "Ireoo/Secret-Chat 的分支或标签"
         required: false
-        default: "main"
+        # 开发分支是版本分支(v9.12 …);`main` 缺 desktop/desktop-qt。切版本时同步这里。
+        default: "v9.12"
 
 permissions:
   contents: write
 
 env:
   SRC_REPO: Ireoo/Secret-Chat
-  SRC_REF: ${{ github.event.inputs.ref || 'main' }}
+  SRC_REF: ${{ github.event.inputs.ref || 'v9.12' }}
+  # GitHub-hosted runners reach github.com directly — skip the gh-proxy.com mirror (China-only)
+  # that third_party/fetch_deps.sh defaults to.
+  SCHAT_GH_MIRROR: https://github.com
+  SCHAT_RAW_MIRROR: https://raw.githubusercontent.com
 
 jobs:
   # ── macOS: arm64 (macos-14) + x86_64 (macos-13). Homebrew provides Qt6 + the codec deps for

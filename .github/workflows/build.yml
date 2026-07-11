@@ -6,7 +6,9 @@ on:
       ref:
         description: "Ireoo/Secret-Chat 的分支或标签"
         required: false
-        default: "main"
+        # 源仓库的开发分支是版本分支(v9.12 / v9.13 …),`main` 是旧结构、缺 desktop/desktop-qt
+        # 与 chatserver。每次版本分支切换时这里(及 qt-desktop.yml)要同步,或把 main 合到最新。
+        default: "v9.12"
   push:
     branches: [main]
 
@@ -16,7 +18,11 @@ permissions:
 
 env:
   SRC_REPO: Ireoo/Secret-Chat
-  SRC_REF: ${{ github.event.inputs.ref || 'main' }}
+  SRC_REF: ${{ github.event.inputs.ref || 'v9.12' }}
+  # GitHub-hosted runners reach github.com directly — skip the gh-proxy.com mirror (China-only)
+  # that third_party/fetch_deps.sh defaults to (it's slow/blocked from the runners).
+  SCHAT_GH_MIRROR: https://github.com
+  SCHAT_RAW_MIRROR: https://raw.githubusercontent.com
 
 jobs:
   # iOS 不在 CI 构建——本地 archive 后直传 TestFlight（见项目根 CLAUDE.md / 记忆）。
