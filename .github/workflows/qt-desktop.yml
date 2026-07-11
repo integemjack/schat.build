@@ -27,6 +27,11 @@ on:
 permissions:
   contents: write
 
+# Supersede an in-flight run on a new push (iteration-friendly; these are heavy multi-arch builds).
+concurrency:
+  group: qt-desktop-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   SRC_REPO: Ireoo/Secret-Chat
   SRC_REF: ${{ github.event.inputs.ref || 'v9.12' }}
