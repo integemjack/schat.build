@@ -60,16 +60,17 @@ jobs:
           name: android
           path: out/*.apk
 
+  # Qt6/QML desktop (desktop/desktop-qt) — replaces the deleted Electron client. This "Build
+  # All" leg builds one native-arch package per OS as a quick check; the full multi-arch
+  # release (macOS arm64+x86_64, Windows x64, Linux x86_64+aarch64+armhf) is qt-desktop.yml.
   desktop:
-    name: Desktop (${{ matrix.os }})
+    name: Qt Desktop (${{ matrix.os }})
     strategy:
       fail-fast: false
       matrix:
         os: [macos-latest, ubuntu-latest, windows-latest]
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 60
-    env:
-      CSC_IDENTITY_AUTO_DISCOVERY: "false"
+    timeout-minutes: 70
     steps:
       - name: Checkout source
         uses: actions/checkout@v4
@@ -77,27 +78,77 @@ jobs:
           repository: Ireoo/Secret-Chat
           ref: ${{ env.SRC_REF }}
           token: ${{ secrets.SRC_REPO_TOKEN }}
-      - uses: actions/setup-node@v4
+
+      - name: Install Qt6 + codec deps (macOS)
+        if: runner.os == 'macOS'
+        run: brew install qt cmake ninja pkg-config opus openh264 libsodium openssl@3
+
+      - name: Install Qt6 + codec deps (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build pkg-config g++ git curl ca-certificates \
+            qt6-base-dev qt6-declarative-dev qt6-multimedia-dev \
+            qml6-module-qtquick qml6-module-qtquick-controls qml6-module-qtquick-layouts \
+            qml6-module-qtquick-window qml6-module-qtquick-dialogs qml6-module-qtquick-shapes \
+            libopus-dev libopenh264-dev libsodium-dev libssl-dev zlib1g-dev libsrtp2-dev
+
+      - name: Install Qt6 (MinGW) (Windows)
+        if: runner.os == 'Windows'
+        uses: jurplel/install-qt-action@v4
         with:
-          node-version: "22"
-      - name: Install deps (runs electron-rebuild)
-        working-directory: desktop
-        run: npm install
-      - name: Build
-        working-directory: desktop
-        run: npm run build -- --publish never
-      - name: Collect installers
+          version: "6.8.*"
+          arch: win64_mingw
+          modules: qtmultimedia
+          tools: tools_mingw1310
+          add-tools-to-path: true
+
+      - name: Fetch third-party deps
+        working-directory: desktop/desktop-qt
+        shell: bash
+        run: bash third_party/fetch_deps.sh
+
+      - name: Configure + build (Release)
+        working-directory: desktop/desktop-qt
         shell: bash
         run: |
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_PREFIX_PATH="$(brew --prefix qt)"
+          elif [ "$RUNNER_OS" = "Windows" ]; then
+            cmake -S . -B build -G "MinGW Makefiles" -DCMAKE_BUILD_TYPE=Release -DCMAKE_PREFIX_PATH="$QT_ROOT_DIR"
+          else
+            cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+          fi
+          cmake --build build -j
+
+      - name: Package
+        working-directory: desktop/desktop-qt
+        shell: bash
+        run: |
+          set -euo pipefail
+          VER=$(grep -E 'kVersion = "[^"]+"' core/include/schat/Version.h | sed -E 's/.*"([^"]+)".*/\1/')
           mkdir -p out
-          find desktop/dist-electron -maxdepth 1 -type f \
-            \( -name "*.dmg" -o -name "*.exe" -o -name "*.AppImage" -o -name "*.deb" -o -name "*.zip" \) \
-            -exec cp {} out/ \;
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            APP="build/app-qt/secretchat-qt.app"
+            "$(brew --prefix qt)/bin/macdeployqt" "$APP" -qmldir=app-qt/qml
+            ditto -c -k --keepParent "$APP" "out/SecretChat-qt-macos-${VER}.app.zip"
+          elif [ "$RUNNER_OS" = "Windows" ]; then
+            DEST="SecretChat-qt-windows-${VER}-x64"; mkdir -p "pkg/$DEST"
+            cp build/app-qt/secretchat-qt.exe "pkg/$DEST/"
+            "$QT_ROOT_DIR/bin/windeployqt.exe" --qmldir app-qt/qml --release --no-translations "pkg/$DEST/secretchat-qt.exe"
+            powershell -Command "Compress-Archive -Path 'pkg/$DEST/*' -DestinationPath 'out/$DEST.zip' -Force"
+          else
+            PKG="SecretChat-qt-linux-${VER}-x86_64"; mkdir -p "out/$PKG/bin"
+            cp build/app-qt/secretchat-qt "out/$PKG/bin/"; chmod +x "out/$PKG/bin/secretchat-qt"
+            tar -C out -czf "out/$PKG.tar.gz" "$PKG"; rm -rf "out/$PKG"
+          fi
           ls -la out
+
       - uses: actions/upload-artifact@v4
         with:
           name: desktop-${{ runner.os }}
-          path: out/*
+          path: desktop/desktop-qt/out/*
 
   server:
     name: Go server (single binary)

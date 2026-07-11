@@ -1,0 +1,305 @@
+name: Qt Desktop
+
+# Packages the Qt6/QML desktop (desktop/desktop-qt) — the replacement for the deleted Electron
+# client — for all 3 desktop OSes and both CPU families (x86_64 + arm64), plus 32-bit ARM on
+# Linux (armhf, for Raspberry Pi / SBCs).
+#
+#   macOS   : arm64 (Apple Silicon) + x86_64 (Intel) — self-contained .app via macdeployqt
+#   Windows : x64 (MinGW)                            — self-contained folder via windeployqt
+#             (arm64 needs an MSVC port of the vendored MinGW deps — not covered yet)
+#   Linux   : x86_64 + aarch64 (native runners) + armhf (32-bit ARM via QEMU) — tarball
+#
+# The macOS leg is build-verified locally; the Windows/Linux legs are structurally correct but
+# are first proven by this workflow (the ports weren't previously built in CI).
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Ireoo/Secret-Chat 的分支或标签"
+        required: false
+        default: "main"
+
+permissions:
+  contents: write
+
+env:
+  SRC_REPO: Ireoo/Secret-Chat
+  SRC_REF: ${{ github.event.inputs.ref || 'main' }}
+
+jobs:
+  # ── macOS: arm64 (macos-14) + x86_64 (macos-13). Homebrew provides Qt6 + the codec deps for
+  # the runner's native arch; the build follows that arch. ───────────────────────────────────
+  macos:
+    name: macOS Qt (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { runner: macos-14, arch: arm64 }
+          - { runner: macos-13, arch: x86_64 }
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          repository: Ireoo/Secret-Chat
+          ref: ${{ env.SRC_REF }}
+          token: ${{ secrets.SRC_REPO_TOKEN }}
+
+      - name: Install Qt6 + codec deps (Homebrew)
+        run: brew install qt cmake ninja pkg-config opus openh264 libsodium openssl@3
+
+      - name: Fetch third-party deps (libdatachannel source + single headers)
+        working-directory: desktop/desktop-qt
+        run: bash third_party/fetch_deps.sh
+
+      - name: Configure + build (Release)
+        working-directory: desktop/desktop-qt
+        run: |
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_PREFIX_PATH="$(brew --prefix qt)"
+          cmake --build build -j"$(sysctl -n hw.ncpu)"
+
+      - name: Package self-contained .app (macdeployqt)
+        shell: bash
+        working-directory: desktop/desktop-qt
+        run: |
+          set -euo pipefail
+          VER=$(grep -E 'kVersion = "[^"]+"' core/include/schat/Version.h | sed -E 's/.*"([^"]+)".*/\1/')
+          APP="build/app-qt/secretchat-qt.app"
+          "$(brew --prefix qt)/bin/macdeployqt" "$APP" -qmldir=app-qt/qml
+          codesign --force --deep --sign - "$APP" || true
+          mkdir -p out
+          ditto -c -k --keepParent "$APP" "out/SecretChat-qt-macos-${VER}-${{ matrix.arch }}.app.zip"
+          ls -la out
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: qt-macos-${{ matrix.arch }}
+          path: desktop/desktop-qt/out/*
+
+  # ── Windows: x64 via MinGW (matches the vendored MinGW deps the build expects). aqt provides
+  # a MinGW-built Qt6 + the MinGW toolchain; fetch_deps.sh compiles opus/openh264 + pulls the
+  # prebuilt MinGW libsodium. ─────────────────────────────────────────────────────────────────
+  windows:
+    name: Windows Qt (x64, MinGW)
+    runs-on: windows-latest
+    timeout-minutes: 70
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          repository: Ireoo/Secret-Chat
+          ref: ${{ env.SRC_REF }}
+          token: ${{ secrets.SRC_REPO_TOKEN }}
+
+      - name: Install Qt6 (MinGW) + toolchain
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: "6.8.*"
+          host: windows
+          target: desktop
+          arch: win64_mingw
+          modules: qtmultimedia
+          tools: tools_mingw1310
+          add-tools-to-path: true
+
+      - name: Fetch third-party deps (builds opus/openh264 via MinGW)
+        working-directory: desktop/desktop-qt
+        shell: bash
+        run: bash third_party/fetch_deps.sh
+
+      - name: Configure + build (Release)
+        working-directory: desktop/desktop-qt
+        shell: bash
+        run: |
+          cmake -S . -B build -G "MinGW Makefiles" -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_PREFIX_PATH="$QT_ROOT_DIR"
+          cmake --build build -j
+
+      - name: Package self-contained folder (windeployqt)
+        shell: bash
+        working-directory: desktop/desktop-qt
+        run: |
+          set -euo pipefail
+          VER=$(grep -E 'kVersion = "[^"]+"' core/include/schat/Version.h | sed -E 's/.*"([^"]+)".*/\1/')
+          DEST="SecretChat-qt-windows-${VER}-x64"
+          mkdir -p "pkg/$DEST" out
+          cp build/app-qt/secretchat-qt.exe "pkg/$DEST/"
+          "$QT_ROOT_DIR/bin/windeployqt.exe" --qmldir app-qt/qml --release --no-translations "pkg/$DEST/secretchat-qt.exe"
+          # $DEST is expanded by bash before powershell runs (Compress-Archive is the built-in zipper).
+          powershell -Command "Compress-Archive -Path 'pkg/$DEST/*' -DestinationPath 'out/$DEST.zip' -Force"
+          ls -la out
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: qt-windows-x64
+          path: desktop/desktop-qt/out/*
+
+  # ── Linux: x86_64 + aarch64 on native runners. Qt6 + codec deps come from apt; the CMake
+  # Linux branch links them via pkg-config. Packaged as a tarball (needs Qt6 runtime installed;
+  # a self-contained AppImage is a possible follow-up). ───────────────────────────────────────
+  linux:
+    name: Linux Qt (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { runner: ubuntu-22.04, arch: x86_64 }
+          - { runner: ubuntu-24.04-arm, arch: aarch64 }
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          repository: Ireoo/Secret-Chat
+          ref: ${{ env.SRC_REF }}
+          token: ${{ secrets.SRC_REPO_TOKEN }}
+
+      - name: Install Qt6 + codec deps (apt)
+        run: |
+          sudo apt-get update
+          sudo add-apt-repository -y universe || true
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build pkg-config g++ git curl ca-certificates \
+            qt6-base-dev qt6-declarative-dev qt6-multimedia-dev \
+            qml6-module-qtquick qml6-module-qtquick-controls \
+            qml6-module-qtquick-layouts qml6-module-qtquick-window \
+            qml6-module-qtquick-dialogs qml6-module-qtquick-shapes \
+            libopus-dev libopenh264-dev libsodium-dev libssl-dev zlib1g-dev libsrtp2-dev
+
+      - name: Fetch third-party deps (libdatachannel source + single headers)
+        working-directory: desktop/desktop-qt
+        run: bash third_party/fetch_deps.sh
+
+      - name: Configure + build (Release)
+        working-directory: desktop/desktop-qt
+        run: |
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+          cmake --build build -j"$(nproc)"
+
+      - name: Package tarball
+        shell: bash
+        working-directory: desktop/desktop-qt
+        run: |
+          set -euo pipefail
+          VER=$(grep -E 'kVersion = "[^"]+"' core/include/schat/Version.h | sed -E 's/.*"([^"]+)".*/\1/')
+          PKG="SecretChat-qt-linux-${VER}-${{ matrix.arch }}"
+          mkdir -p "out/${PKG}/bin" "out/${PKG}/share/applications"
+          cp build/app-qt/secretchat-qt "out/${PKG}/bin/secretchat-qt"
+          chmod +x "out/${PKG}/bin/secretchat-qt"
+          cat > "out/${PKG}/share/applications/com.secretchat.Qt.desktop" <<DESKTOP
+          [Desktop Entry]
+          Type=Application
+          Name=Secret Chat
+          Exec=secretchat-qt
+          Categories=Network;Chat;InstantMessaging;
+          DESKTOP
+          cat > "out/${PKG}/README.txt" <<TXT
+          Secret Chat (Qt desktop) ${VER} — ${{ matrix.arch }}
+          Runtime needs Qt6 (>=6.5) + QML modules installed, e.g. on Debian/Ubuntu:
+            apt install qt6-base qt6-declarative qml6-module-qtquick-dialogs libopus0 libopenh264-7 libsodium23
+          Run: ./bin/secretchat-qt
+          TXT
+          tar -C out -czf "out/${PKG}.tar.gz" "${PKG}"
+          rm -rf "out/${PKG}"
+          ls -la out
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: qt-linux-${{ matrix.arch }}
+          path: desktop/desktop-qt/out/*
+
+  # ── Linux armhf (32-bit ARM / Raspberry Pi): no armhf GitHub runner, so build in a Debian
+  # trixie arm32v7 container under QEMU. trixie has Qt 6.4+ (bookworm's Qt is too old for some
+  # QML modules). 64-bit ARM is covered by the aarch64 leg above. ─────────────────────────────
+  linux-armhf:
+    name: Linux Qt (armhf · 32-bit ARM)
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          repository: Ireoo/Secret-Chat
+          ref: ${{ env.SRC_REF }}
+          token: ${{ secrets.SRC_REPO_TOKEN }}
+
+      - uses: docker/setup-qemu-action@v3
+
+      - name: Build armhf in Debian trixie (QEMU)
+        run: |
+          docker run --rm --platform linux/arm/v7 \
+            -v "$PWD:/src" -w /src/desktop/desktop-qt \
+            arm32v7/debian:trixie bash -lc '
+              set -e
+              export DEBIAN_FRONTEND=noninteractive
+              apt-get update
+              apt-get install -y --no-install-recommends \
+                cmake ninja-build pkg-config g++ git curl ca-certificates \
+                qt6-base-dev qt6-declarative-dev qt6-multimedia-dev \
+                qml6-module-qtquick qml6-module-qtquick-controls \
+                qml6-module-qtquick-layouts qml6-module-qtquick-window \
+                qml6-module-qtquick-dialogs qml6-module-qtquick-shapes \
+                libopus-dev libopenh264-dev libsodium-dev libssl-dev zlib1g-dev libsrtp2-dev
+              bash third_party/fetch_deps.sh
+              cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+              cmake --build build -j"$(nproc)"
+            '
+
+      - name: Package tarball
+        shell: bash
+        working-directory: desktop/desktop-qt
+        run: |
+          set -euo pipefail
+          VER=$(grep -E 'kVersion = "[^"]+"' core/include/schat/Version.h | sed -E 's/.*"([^"]+)".*/\1/')
+          PKG="SecretChat-qt-linux-${VER}-armhf"
+          mkdir -p "out/${PKG}/bin" "out/${PKG}/share/applications"
+          sudo cp build/app-qt/secretchat-qt "out/${PKG}/bin/secretchat-qt"
+          sudo chmod +x "out/${PKG}/bin/secretchat-qt"
+          file "out/${PKG}/bin/secretchat-qt" || true
+          cat > "out/${PKG}/share/applications/com.secretchat.Qt.desktop" <<DESKTOP
+          [Desktop Entry]
+          Type=Application
+          Name=Secret Chat
+          Exec=secretchat-qt
+          Categories=Network;Chat;InstantMessaging;
+          DESKTOP
+          tar -C out -czf "out/${PKG}.tar.gz" "${PKG}"
+          sudo rm -rf "out/${PKG}"
+          ls -la out
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: qt-linux-armhf
+          path: desktop/desktop-qt/out/*
+
+  release:
+    name: Publish Qt Desktop Release
+    needs: [macos, windows, linux, linux-armhf]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: List artifacts
+        run: ls -laR dist || true
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: qt-desktop-${{ env.SRC_REF }}-b${{ github.run_number }}
+          name: "Secret Chat Qt Desktop ${{ env.SRC_REF }} build ${{ github.run_number }}"
+          body: |
+            Qt6/QML desktop packaging (replaces the deleted Electron client), all platforms + arches:
+
+            - macOS: arm64 (Apple Silicon) + x86_64 (Intel) — self-contained .app (macdeployqt)
+            - Windows: x64 (MinGW) — self-contained folder (windeployqt)
+            - Linux: x86_64 + aarch64 + armhf — tarball (needs Qt6 runtime; armhf built on Debian trixie under QEMU)
+
+            Source ref: `${{ env.SRC_REF }}`
+          files: dist/**

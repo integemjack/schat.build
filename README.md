@@ -8,18 +8,22 @@
 |---|---|---|
 | iOS | macos-26（Liquid Glass / 部署目标 26.2 需 Xcode 26） | 未签名 IPA |
 | Android | ubuntu | debug APK（可装）+ 未签名 release APK |
-| Desktop | macos / ubuntu / windows 矩阵 | dmg / nsis exe / AppImage |
-| Native Desktop | macos / ubuntu / windows 矩阵 | SwiftUI `.app.zip` / WinUI zip / GTK4 tar.gz |
+| Qt Desktop（`build.yml` 内单架构 / `qt-desktop.yml` 全架构） | macos / ubuntu / windows | Qt6/QML 桌面端(取代已删的 Electron):macOS arm64+x86_64 自包含 `.app.zip`(macdeployqt)、Windows x64 自包含 zip(windeployqt)、Linux x86_64+aarch64+armhf tar.gz |
 | Go server | ubuntu | `schat-server-linux-amd64` 单二进制 |
 | Docker | ubuntu | `ghcr.io/integemjack/schat-server`（nodeServer 生产服务器镜像） |
 
 ## 触发
 
-- 手动：Actions → **Build All** 或 **Native Desktop** → Run workflow，可填源分支
+- 手动：Actions → **Build All**（含单架构 Qt 桌面端）或 **Qt Desktop**（全平台全架构桌面端打包）→ Run workflow，可填源分支
 - 自动：push 到本仓库 `main`（即修改 workflow 本身）
 
 `Build All` Release 标签格式：`<源分支>-b<run 编号>`，如 `v9.1-b3`。
-`Native Desktop` Release 标签格式：`native-desktop-<源分支>-b<run 编号>`。
+`Qt Desktop` Release 标签格式：`qt-desktop-<源分支>-b<run 编号>`。
+
+> 说明：桌面端由 Qt6/QML(`desktop/desktop-qt`)构建,取代已删除的 Electron 客户端。
+> macOS 用 Homebrew 的 Qt、Windows 用 aqt 的 MinGW Qt、Linux 用发行版 apt 的 Qt6 + pkg-config
+> 链系统的 opus/openh264/libsodium。macOS 已本地构建验证;Windows/Linux 由本工作流首次验证。
+> 旧的 `native-desktop.yml`(SwiftUI/WinUI3/GTK4 的 `desktop-native/` 线)引用已删路径,已废弃。
 
 ## 必需 Secret
 
