@@ -175,7 +175,15 @@ jobs:
             qml6-module-qtquick qml6-module-qtquick-controls \
             qml6-module-qtquick-layouts qml6-module-qtquick-window \
             qml6-module-qtquick-dialogs qml6-module-qtquick-shapes \
-            libopus-dev libopenh264-dev libsodium-dev libssl-dev zlib1g-dev libsrtp2-dev
+            libopus-dev libopenh264-dev libssl-dev zlib1g-dev libsrtp2-dev
+
+      - name: Build libsodium 1.0.20 from source
+        # Ubuntu apt libsodium is 1.0.18 — too old for the E2E HKDF API (added in 1.0.19).
+        run: |
+          curl -fsSL https://download.libsodium.org/libsodium/releases/libsodium-1.0.20-stable.tar.gz -o /tmp/sodium.tar.gz
+          mkdir -p /tmp/sodium && tar -C /tmp/sodium --strip-components=1 -xzf /tmp/sodium.tar.gz
+          ( cd /tmp/sodium && ./configure --prefix=/usr/local --disable-dependency-tracking && make -j"$(nproc)" && sudo make install )
+          sudo ldconfig
 
       - name: Fetch third-party deps (libdatachannel source + single headers)
         working-directory: desktop/desktop-qt

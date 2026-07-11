@@ -98,7 +98,18 @@ jobs:
             qt6-base-dev qt6-declarative-dev qt6-multimedia-dev qt6-websockets-dev \
             qml6-module-qtquick qml6-module-qtquick-controls qml6-module-qtquick-layouts \
             qml6-module-qtquick-window qml6-module-qtquick-dialogs qml6-module-qtquick-shapes \
-            libopus-dev libopenh264-dev libsodium-dev libssl-dev zlib1g-dev libsrtp2-dev
+            libopus-dev libopenh264-dev libssl-dev zlib1g-dev libsrtp2-dev
+
+      - name: Build libsodium 1.0.20 from source (Linux)
+        # Ubuntu apt libsodium is 1.0.18 — too old for the E2E HKDF API
+        # (crypto_kdf_hkdf_sha256_*, added in 1.0.19). Build ≥1.0.20 into /usr/local so
+        # pkg-config (core/CMakeLists) picks it up ahead of any system copy.
+        if: runner.os == 'Linux'
+        run: |
+          curl -fsSL https://download.libsodium.org/libsodium/releases/libsodium-1.0.20-stable.tar.gz -o /tmp/sodium.tar.gz
+          mkdir -p /tmp/sodium && tar -C /tmp/sodium --strip-components=1 -xzf /tmp/sodium.tar.gz
+          ( cd /tmp/sodium && ./configure --prefix=/usr/local --disable-dependency-tracking && make -j"$(nproc)" && sudo make install )
+          sudo ldconfig
 
       - name: Install Qt6 (MinGW) (Windows)
         if: runner.os == 'Windows'
