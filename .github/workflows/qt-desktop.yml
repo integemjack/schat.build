@@ -149,13 +149,14 @@ jobs:
   linux:
     name: Linux Qt (${{ matrix.arch }})
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 60
+    timeout-minutes: 180
     strategy:
       fail-fast: false
       matrix:
         include:
-          - { runner: ubuntu-22.04, arch: x86_64 }
-          - { runner: ubuntu-24.04-arm, arch: aarch64 }
+          - { runner: ubuntu-latest,    arch: x86_64,  image: "debian:trixie",         platform: linux/amd64 }
+          - { runner: ubuntu-24.04-arm, arch: aarch64, image: "arm64v8/debian:trixie", platform: linux/arm64 }
+          - { runner: ubuntu-latest,    arch: armhf,   image: "arm32v7/debian:trixie", platform: linux/arm/v7 }
     steps:
       - name: Checkout source
         uses: actions/checkout@v4
@@ -164,91 +165,17 @@ jobs:
           ref: ${{ env.SRC_REF }}
           token: ${{ secrets.SRC_REPO_TOKEN }}
 
-      - name: Install Qt6 + codec deps (apt)
-        run: |
-          sudo apt-get update
-          sudo add-apt-repository -y universe || true
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            cmake ninja-build pkg-config g++ git curl ca-certificates \
-            qt6-base-dev qt6-declarative-dev qt6-multimedia-dev qt6-websockets-dev \
-            qml6-module-qtquick qml6-module-qtquick-controls \
-            qml6-module-qtquick-layouts qml6-module-qtquick-window \
-            qml6-module-qtquick-dialogs qml6-module-qtquick-shapes \
-            libopus-dev libopenh264-dev libssl-dev zlib1g-dev libsrtp2-dev
-
-      - name: Build libsodium 1.0.20 from source
-        # Ubuntu apt libsodium is 1.0.18 — too old for the E2E HKDF API (added in 1.0.19).
-        run: |
-          curl -fsSL https://download.libsodium.org/libsodium/releases/libsodium-1.0.20-stable.tar.gz -o /tmp/sodium.tar.gz
-          mkdir -p /tmp/sodium && tar -C /tmp/sodium --strip-components=1 -xzf /tmp/sodium.tar.gz
-          ( cd /tmp/sodium && ./configure --prefix=/usr/local --disable-dependency-tracking && make -j"$(nproc)" && sudo make install )
-          sudo ldconfig
-
-      - name: Fetch third-party deps (libdatachannel source + single headers)
-        working-directory: desktop/desktop-qt
-        run: bash third_party/fetch_deps.sh
-
-      - name: Configure + build (Release)
-        working-directory: desktop/desktop-qt
-        run: |
-          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
-          cmake --build build -j"$(nproc)"
-
-      - name: Package tarball
-        shell: bash
-        working-directory: desktop/desktop-qt
-        run: |
-          set -euo pipefail
-          VER=$(grep -E 'kVersion = "[^"]+"' core/include/schat/Version.h | sed -E 's/.*"([^"]+)".*/\1/')
-          PKG="SecretChat-qt-linux-${VER}-${{ matrix.arch }}"
-          mkdir -p "out/${PKG}/bin" "out/${PKG}/share/applications"
-          cp build/app-qt/secretchat-qt "out/${PKG}/bin/secretchat-qt"
-          chmod +x "out/${PKG}/bin/secretchat-qt"
-          cat > "out/${PKG}/share/applications/com.secretchat.Qt.desktop" <<DESKTOP
-          [Desktop Entry]
-          Type=Application
-          Name=Secret Chat
-          Exec=secretchat-qt
-          Categories=Network;Chat;InstantMessaging;
-          DESKTOP
-          cat > "out/${PKG}/README.txt" <<TXT
-          Secret Chat (Qt desktop) ${VER} — ${{ matrix.arch }}
-          Runtime needs Qt6 (>=6.5) + QML modules installed, e.g. on Debian/Ubuntu:
-            apt install qt6-base qt6-declarative qml6-module-qtquick-dialogs libopus0 libopenh264-7 libsodium23
-          Run: ./bin/secretchat-qt
-          TXT
-          tar -C out -czf "out/${PKG}.tar.gz" "${PKG}"
-          rm -rf "out/${PKG}"
-          ls -la out
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: qt-linux-${{ matrix.arch }}
-          path: desktop/desktop-qt/out/*
-
-  # ── Linux armhf (32-bit ARM / Raspberry Pi): no armhf GitHub runner, so build in a Debian
-  # trixie arm32v7 container under QEMU. trixie has Qt 6.4+ (bookworm's Qt is too old for some
-  # QML modules). 64-bit ARM is covered by the aarch64 leg above. ─────────────────────────────
-  linux-armhf:
-    name: Linux Qt (armhf · 32-bit ARM)
-    runs-on: ubuntu-latest
-    timeout-minutes: 150
-    steps:
-      - name: Checkout source
-        uses: actions/checkout@v4
-        with:
-          repository: Ireoo/Secret-Chat
-          ref: ${{ env.SRC_REF }}
-          token: ${{ secrets.SRC_REPO_TOKEN }}
-
+      # QEMU is only needed for armhf on the x86 runner; harmless for the native x86_64/aarch64.
       - uses: docker/setup-qemu-action@v3
 
-      - name: Build armhf in Debian trixie (QEMU)
+      - name: Build in Debian trixie (${{ matrix.arch }})
+        # Debian trixie ships Qt 6.8 + libsodium ≥1.0.19 + the codecs via apt, so it satisfies
+        # both loadFromModule (Qt ≥6.5) and the E2E HKDF API — unlike the Ubuntu runners' apt.
         run: |
-          docker run --rm --platform linux/arm/v7 \
+          docker run --rm --platform ${{ matrix.platform }} \
+            -e SCHAT_GH_MIRROR -e SCHAT_RAW_MIRROR \
             -v "$PWD:/src" -w /src/desktop/desktop-qt \
-            arm32v7/debian:trixie bash -lc '
+            ${{ matrix.image }} bash -lc '
               set -e
               export DEBIAN_FRONTEND=noninteractive
               apt-get update
@@ -270,9 +197,9 @@ jobs:
         run: |
           set -euo pipefail
           VER=$(grep -E 'kVersion = "[^"]+"' core/include/schat/Version.h | sed -E 's/.*"([^"]+)".*/\1/')
-          PKG="SecretChat-qt-linux-${VER}-armhf"
+          PKG="SecretChat-qt-linux-${VER}-${{ matrix.arch }}"
           mkdir -p "out/${PKG}/bin" "out/${PKG}/share/applications"
-          sudo cp build/app-qt/secretchat-qt "out/${PKG}/bin/secretchat-qt"
+          sudo cp build/app-qt/secretchat-qt "out/${PKG}/bin/secretchat-qt"   # container writes as root
           sudo chmod +x "out/${PKG}/bin/secretchat-qt"
           file "out/${PKG}/bin/secretchat-qt" || true
           cat > "out/${PKG}/share/applications/com.secretchat.Qt.desktop" <<DESKTOP
@@ -282,18 +209,24 @@ jobs:
           Exec=secretchat-qt
           Categories=Network;Chat;InstantMessaging;
           DESKTOP
+          cat > "out/${PKG}/README.txt" <<TXT
+          Secret Chat (Qt desktop) ${VER} — ${{ matrix.arch }}
+          Built on Debian trixie (Qt 6.8). Runtime needs Qt6 (>=6.5) + QML modules, e.g.:
+            apt install qt6-base qt6-declarative qml6-module-qtquick-dialogs libopus0 libopenh264-7 libsodium23
+          Run: ./bin/secretchat-qt
+          TXT
           tar -C out -czf "out/${PKG}.tar.gz" "${PKG}"
           sudo rm -rf "out/${PKG}"
           ls -la out
 
       - uses: actions/upload-artifact@v4
         with:
-          name: qt-linux-armhf
+          name: qt-linux-${{ matrix.arch }}
           path: desktop/desktop-qt/out/*
 
   release:
     name: Publish Qt Desktop Release
-    needs: [macos, windows, linux, linux-armhf]
+    needs: [macos, windows, linux]
     if: always()
     runs-on: ubuntu-latest
     steps:
