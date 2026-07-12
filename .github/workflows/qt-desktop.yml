@@ -80,17 +80,20 @@ jobs:
           cmake --build b -j"$J"; cmake --install b
           echo "::endgroup::"
 
-          echo "::group::openh264 2.4.1 (Makefile per-arch in SEPARATE trees + lipo)"
-          # Each arch is built in its own copied tree — openh264's `make clean` doesn't fully
-          # purge object files, so a shared tree leaks arm64 .o into the x86_64 archive and lipo
-          # rejects the mixed-arch result. Separate trees = zero cross-contamination.
+          echo "::group::openh264 2.4.1 (Makefile per-arch, arch-pinned compiler + lipo)"
+          # openh264's darwin Makefile compiles the C/C++ with `-m64` (NOT `-arch x86_64`) for its
+          # x86_64 target. On an Intel host `-m64` == x86_64, but on THIS Apple-Silicon runner
+          # `-m64` just means "64-bit" → arm64 objects, while the x86 .asm files nasm-assemble as
+          # real x86_64 → a mixed archive lipo rejects. Pin CC/CXX to `clang -arch <A>` so an
+          # explicit -arch overrides the Makefile's trailing -m64 and every object is one arch.
           cd "$SRC"; curl -fsSL "$DL/cisco/openh264/archive/refs/tags/v2.4.1.tar.gz" -o oh.tgz
           tar xf oh.tgz
           for A in arm64 x86_64; do
             rm -rf "oh-$A"; cp -R openh264-2.4.1 "oh-$A"
-            make -C "oh-$A" -j"$J" OS=darwin ARCH="$A" libraries
+            make -C "oh-$A" -j"$J" OS=darwin ARCH="$A" \
+              CC="clang -arch $A" CXX="clang++ -arch $A" libraries
             cp "oh-$A/libopenh264.a" "/tmp/oh-$A.a"
-            lipo -info "/tmp/oh-$A.a"
+            lipo -info "/tmp/oh-$A.a"   # must report a single arch, else the mix is back
           done
           lipo -create /tmp/oh-arm64.a /tmp/oh-x86_64.a -output "$UNI/lib/libopenh264.a"
           mkdir -p "$UNI/include/wels"; cp -f openh264-2.4.1/codec/api/wels/*.h "$UNI/include/wels/"
