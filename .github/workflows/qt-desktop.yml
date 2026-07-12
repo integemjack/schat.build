@@ -21,6 +21,16 @@ on:
         required: false
         # 开发分支是版本分支(v9.12 …);`main` 缺 desktop/desktop-qt。切版本时同步这里。
         default: "v9.12"
+  # Reusable: build.yml's "Build All" calls this (uses:) so the MAIN release bundles the Qt
+  # desktop packages — one combined release, single source of truth. This workflow has NO
+  # release job of its own; the caller publishes. Standalone workflow_dispatch above still runs
+  # the full multi-arch build for desktop-only test builds (uploads artifacts, no release).
+  workflow_call:
+    inputs:
+      ref:
+        type: string
+        required: false
+        default: "v9.12"
 
 permissions:
   contents: write
@@ -32,7 +42,8 @@ concurrency:
 
 env:
   SRC_REPO: Ireoo/Secret-Chat
-  SRC_REF: ${{ github.event.inputs.ref || 'v9.12' }}
+  # `inputs` context is populated for BOTH workflow_dispatch and workflow_call.
+  SRC_REF: ${{ inputs.ref || 'v9.12' }}
   # GitHub-hosted runners reach github.com directly — skip the gh-proxy.com mirror (China-only)
   # that third_party/fetch_deps.sh defaults to.
   SCHAT_GH_MIRROR: https://github.com
@@ -321,28 +332,7 @@ jobs:
           name: qt-linux-${{ matrix.arch }}
           path: desktop/desktop-qt/out/*
 
-  release:
-    name: Publish Qt Desktop Release
-    needs: [macos, windows, linux]
-    if: always()
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/download-artifact@v4
-        with:
-          path: dist
-          merge-multiple: true
-      - name: List artifacts
-        run: ls -laR dist || true
-      - uses: softprops/action-gh-release@v2
-        with:
-          tag_name: qt-desktop-${{ env.SRC_REF }}-b${{ github.run_number }}
-          name: "Secret Chat Qt Desktop ${{ env.SRC_REF }} build ${{ github.run_number }}"
-          body: |
-            Qt6/QML desktop packaging (replaces the deleted Electron client), all platforms + arches:
-
-            - macOS: **Universal2 .dmg** (single arm64 + x86_64 fat build; runs on Apple Silicon and Intel)
-            - Windows: x64 — **installer .exe** (MSYS2 build + windeployqt + NSIS)
-            - Linux: x86_64 + aarch64 + armhf — **.deb** (all arches) + **AppImage** (x86_64, self-contained); built on Debian trixie
-
-            Source ref: `${{ env.SRC_REF }}`
-          files: dist/**
+  # NOTE: no release job here on purpose — the three build jobs above only upload artifacts.
+  # build.yml ("Build All") calls this workflow and its own release job bundles the Qt desktop
+  # artifacts into the single combined release. A standalone workflow_dispatch just produces the
+  # artifacts (downloadable from the run) for desktop-only test builds.

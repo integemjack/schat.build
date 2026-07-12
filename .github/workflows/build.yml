@@ -66,50 +66,21 @@ jobs:
           name: android
           path: out/*.apk
 
-  # Qt6/QML desktop (desktop/desktop-qt) — replaces the deleted Electron client. "Build All"
-  # only does the macOS .dmg as a quick check; the full multi-platform release (Windows
-  # installer via MSYS2, Linux .deb + AppImage via Debian trixie) is qt-desktop.yml.
+  # Qt6/QML desktop (desktop/desktop-qt) — replaces the deleted Electron client. The full
+  # multi-platform packaging (macOS Universal2 .dmg, Windows NSIS installer via MSYS2, Linux
+  # .deb + AppImage via Debian trixie) lives in the REUSABLE qt-desktop.yml and is called here
+  # so the combined release below bundles every desktop artifact (qt-macos-universal /
+  # qt-windows-x64 / qt-linux-{x86_64,aarch64,armhf}). Standalone `qt-desktop.yml` dispatch
+  # still runs the same build for desktop-only test artifacts.
   desktop:
-    name: Qt Desktop (macOS .dmg)
-    runs-on: macos-latest
-    timeout-minutes: 60
-    steps:
-      - name: Checkout source
-        uses: actions/checkout@v4
-        with:
-          repository: Ireoo/Secret-Chat
-          ref: ${{ env.SRC_REF }}
-          token: ${{ secrets.SRC_REPO_TOKEN }}
-
-      - name: Install Qt6 + codec deps (Homebrew)
-        run: brew install qt cmake ninja pkg-config opus openh264 libsodium openssl@3
-
-      - name: Fetch third-party deps
-        working-directory: desktop/desktop-qt
-        run: bash third_party/fetch_deps.sh
-
-      - name: Configure + build (Release)
-        working-directory: desktop/desktop-qt
-        run: |
-          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_PREFIX_PATH="$(brew --prefix qt)"
-          cmake --build build -j"$(sysctl -n hw.ncpu)"
-
-      - name: Package .dmg
-        working-directory: desktop/desktop-qt
-        run: |
-          set -euo pipefail
-          VER=$(grep -E 'kVersion = "[^"]+"' core/include/schat/Version.h | sed -E 's/.*"([^"]+)".*/\1/')
-          APP="build/app-qt/secretchat-qt.app"
-          codesign --force --deep --sign - "$APP" || true
-          "$(brew --prefix qt)/bin/macdeployqt" "$APP" -qmldir=app-qt/qml -dmg
-          mkdir -p out
-          mv build/app-qt/secretchat-qt.dmg "out/SecretChat-qt-macos-${VER}.dmg"
-          ls -la out
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: desktop-macos
-          path: desktop/desktop-qt/out/*
+    name: Qt Desktop
+    uses: ./.github/workflows/qt-desktop.yml
+    permissions:
+      contents: write
+    with:
+      # env context isn't available in a reusable call's `with:` — inline the ref default.
+      ref: ${{ github.event.inputs.ref || 'v9.12' }}
+    secrets: inherit
 
   server:
     name: chatserver (single binary, linux amd64+arm64)
