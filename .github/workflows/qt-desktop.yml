@@ -124,18 +124,32 @@ jobs:
           cp -Rf /tmp/sodium-arm64/include/* "$UNI/include/"
           echo "::endgroup::"
 
-          echo "::group::openssl 3.3.2 (Configure per-arch + lipo — libdatachannel DTLS backend)"
+          echo "::group::openssl 3.3.2 (Configure per-arch + lipo — STATIC for libdatachannel DTLS, SHARED for Qt TLS)"
+          # Build BOTH static (.a, linked into libdatachannel for DTLS) and shared (.dylib). Qt's
+          # openssl TLS backend dlopens libssl/libcrypto at RUNTIME — macdeployqt does NOT bundle
+          # OpenSSL, so without the dylibs the backend fails ("Failed to load libssl/libcrypto")
+          # and EVERY https/wss call dies at http=0 before login. We bundle the universal dylibs.
           cd "$SRC"; curl -fsSL "$DL/openssl/openssl/releases/download/openssl-3.3.2/openssl-3.3.2.tar.gz" -o ssl.tgz
           tar xf ssl.tgz
           for A in arm64 x86_64; do
             T=$([ "$A" = arm64 ] && echo darwin64-arm64-cc || echo darwin64-x86_64-cc)
             rm -rf "ssl-$A"; cp -R openssl-3.3.2 "ssl-$A"; cd "ssl-$A"
-            ./Configure "$T" no-shared no-tests no-apps --prefix="/tmp/ssl-$A" -mmacosx-version-min=12.0
+            ./Configure "$T" no-tests no-apps --prefix="/tmp/ssl-$A" -mmacosx-version-min=12.0
             make -j"$J"; make install_sw
             cd "$SRC"
           done
           lipo -create /tmp/ssl-arm64/lib/libssl.a    /tmp/ssl-x86_64/lib/libssl.a    -output "$UNI/lib/libssl.a"
           lipo -create /tmp/ssl-arm64/lib/libcrypto.a /tmp/ssl-x86_64/lib/libcrypto.a -output "$UNI/lib/libcrypto.a"
+          # Shared dylibs for Qt: fix each thin dylib's install names FIRST (their build-tree
+          # /tmp paths won't exist on a user's Mac), then lipo the fixed thin libs universal.
+          # @loader_path for the inter-dylib ref → resolves next to itself (Frameworks/) always.
+          for A in arm64 x86_64; do
+            install_name_tool -id @rpath/libcrypto.3.dylib /tmp/ssl-$A/lib/libcrypto.3.dylib
+            install_name_tool -id @rpath/libssl.3.dylib    /tmp/ssl-$A/lib/libssl.3.dylib
+            install_name_tool -change /tmp/ssl-$A/lib/libcrypto.3.dylib @loader_path/libcrypto.3.dylib /tmp/ssl-$A/lib/libssl.3.dylib
+          done
+          lipo -create /tmp/ssl-arm64/lib/libcrypto.3.dylib /tmp/ssl-x86_64/lib/libcrypto.3.dylib -output "$UNI/lib/libcrypto.3.dylib"
+          lipo -create /tmp/ssl-arm64/lib/libssl.3.dylib    /tmp/ssl-x86_64/lib/libssl.3.dylib    -output "$UNI/lib/libssl.3.dylib"
           cp -Rf /tmp/ssl-arm64/include/* "$UNI/include/"
           mkdir -p "$UNI/lib/pkgconfig"; cp -f /tmp/ssl-arm64/lib/pkgconfig/*.pc "$UNI/lib/pkgconfig/" 2>/dev/null || true
           echo "::endgroup::"
@@ -186,6 +200,12 @@ jobs:
           # Deploy Qt frameworks/plugins/QML FIRST (this rewrites Mach-O install names via
           # install_name_tool). NOTE: no -dmg here on purpose.
           "$QT_ROOT_DIR/bin/macdeployqt" "$APP" -qmldir=app-qt/qml
+          # Bundle the universal OpenSSL dylibs so Qt's openssl TLS backend can dlopen them at
+          # runtime (macdeployqt doesn't bundle OpenSSL; without these every https/wss dies at
+          # http=0). Frameworks/ is on the backend's dlopen search path; install names were
+          # already fixed to @rpath / @loader_path in the deps step.
+          cp /tmp/uni/lib/libssl.3.dylib /tmp/uni/lib/libcrypto.3.dylib "$APP/Contents/Frameworks/"
+          lipo -info "$APP/Contents/Frameworks/libssl.3.dylib" "$APP/Contents/Frameworks/libcrypto.3.dylib"
           # Sign AFTER macdeployqt. Signing BEFORE it (the old order) leaves an invalid signature —
           # install_name_tool's rewrites break the seal — and Apple Silicon SIGKILLs the app on
           # launch with "Code Signature Invalid". Deep-sign the fully-assembled bundle instead.
@@ -277,6 +297,14 @@ jobs:
             done
             printf '[Paths]\nPrefix = .\n' > "$STAGE/qt.conf"
           fi
+          # Qt's openssl TLS backend needs the actual OpenSSL DLLs at runtime — windeployqt bundles
+          # the backend plugin (tls/qopensslbackend.dll) but NOT libssl/libcrypto themselves, so
+          # without these every https/wss dies before login (same class of bug as macOS). Copy the
+          # MSYS2 openssl-3 DLLs into the install dir next to the exe.
+          for d in libssl-3-x64 libcrypto-3-x64 libssl-3 libcrypto-3; do
+            [ -f "/mingw64/bin/$d.dll" ] && cp "/mingw64/bin/$d.dll" "$STAGE/" || true
+          done
+          ls "$STAGE"/libssl* "$STAGE"/libcrypto* 2>/dev/null || echo "WARN: no openssl DLLs staged"
           # Minimal NSIS installer: install to Program Files, Start-menu + desktop shortcut, uninstaller.
           cat > installer.nsi <<'NSI'
           !include "MUI2.nsh"
