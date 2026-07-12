@@ -271,21 +271,19 @@ jobs:
           # Notarize + staple the signed dmg (only with a real signature + notary creds; Apple
           # rejects ad-hoc submissions). Uses an App Store Connect API key (.p8).
           if [ -n "${SIGN_IDENTITY:-}" ] && [ "$SIGN_IDENTITY" != "-" ] && [ -n "${NOTARY_KEY:-}" ]; then
+            # REQUIRED (policy: a release must NEVER contain an un-notarized dmg). If notarytool
+            # times out / Apple rejects, this step FAILS → the artifact upload is skipped → no macOS
+            # dmg in the release (rather than an un-notarized one). During an Apple notary outage
+            # this leg fails until Apple recovers — re-run then.
             echo "$NOTARY_KEY" | base64 --decode > "$RUNNER_TEMP/nkey.p8"
-            # Best-effort: Apple's notary service occasionally backs up for 30+ min. Don't fail the
-            # whole build on that — the dmg is already Developer ID SIGNED (+ hardened runtime), which
-            # is what matters; staple only if notarization returns in time. Re-run later (when Apple
-            # is healthy) to produce the stapled/notarized dmg.
-            if xcrun notarytool submit "$DMG" \
-                 --key "$RUNNER_TEMP/nkey.p8" --key-id "$NOTARY_KEY_ID" --issuer "$NOTARY_ISSUER" \
-                 --wait --timeout 30m; then
-              xcrun stapler staple "$DMG" && xcrun stapler validate "$DMG" && echo "notarized + stapled OK"
-            else
-              echo "::warning::notarization did not finish in time (Apple notary slow/down). dmg is Developer ID signed but NOT stapled — re-run to notarize."
-            fi
+            xcrun notarytool submit "$DMG" \
+              --key "$RUNNER_TEMP/nkey.p8" --key-id "$NOTARY_KEY_ID" --issuer "$NOTARY_ISSUER" \
+              --wait --timeout 45m
+            xcrun stapler staple "$DMG"
+            xcrun stapler validate "$DMG" && echo "notarized + stapled OK"
             rm -f "$RUNNER_TEMP/nkey.p8"
           else
-            echo "notary creds not set (or ad-hoc signature) — skipping notarization"
+            echo "notary creds not set (or ad-hoc signature) — skipping notarization (fork build)"
           fi
           ls -la out
 
