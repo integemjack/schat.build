@@ -121,7 +121,7 @@ jobs:
             git curl
             mingw-w64-x86_64-gcc mingw-w64-x86_64-cmake mingw-w64-x86_64-ninja
             mingw-w64-x86_64-pkgconf mingw-w64-x86_64-qt6-base mingw-w64-x86_64-qt6-declarative
-            mingw-w64-x86_64-qt6-multimedia mingw-w64-x86_64-qt6-websockets
+            mingw-w64-x86_64-qt6-multimedia mingw-w64-x86_64-qt6-websockets mingw-w64-x86_64-qt6-tools
             mingw-w64-x86_64-opus mingw-w64-x86_64-libsodium mingw-w64-x86_64-openh264
             mingw-w64-x86_64-openssl mingw-w64-x86_64-libsrtp mingw-w64-x86_64-nsis
 
@@ -143,7 +143,7 @@ jobs:
           STAGE="pkg/SecretChat"
           mkdir -p "$STAGE" out
           cp build/app-qt/secretchat-qt.exe "$STAGE/"
-          windeployqt --qmldir app-qt/qml --release --no-translations --compiler-runtime "$STAGE/secretchat-qt.exe"
+          windeployqt --qmldir "$PWD/app-qt/qml" --release --no-translations "$STAGE/secretchat-qt.exe"
           # Minimal NSIS installer: install to Program Files, Start-menu + desktop shortcut, uninstaller.
           cat > installer.nsi <<'NSI'
           !include "MUI2.nsh"
