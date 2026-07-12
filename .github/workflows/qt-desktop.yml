@@ -19,8 +19,8 @@ on:
       ref:
         description: "Ireoo/Secret-Chat 的分支或标签"
         required: false
-        # 开发分支是版本分支(v9.12 …);`main` 缺 desktop/desktop-qt。切版本时同步这里。
-        default: "v9.12"
+        # 打包只用 `main`(版本分支开发完成后合并进 main);要临时打某版本分支就显式传 ref 覆盖。
+        default: "main"
   # Reusable: build.yml's "Build All" calls this (uses:) so the MAIN release bundles the Qt
   # desktop packages — one combined release, single source of truth. This workflow has NO
   # release job of its own; the caller publishes. Standalone workflow_dispatch above still runs
@@ -30,7 +30,7 @@ on:
       ref:
         type: string
         required: false
-        default: "v9.12"
+        default: "main"
 
 permissions:
   contents: write
@@ -43,7 +43,7 @@ concurrency:
 env:
   SRC_REPO: Ireoo/Secret-Chat
   # `inputs` context is populated for BOTH workflow_dispatch and workflow_call.
-  SRC_REF: ${{ inputs.ref || 'v9.12' }}
+  SRC_REF: ${{ inputs.ref || 'main' }}
   # GitHub-hosted runners reach github.com directly — skip the gh-proxy.com mirror (China-only)
   # that third_party/fetch_deps.sh defaults to.
   SCHAT_GH_MIRROR: https://github.com
