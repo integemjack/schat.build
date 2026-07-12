@@ -59,8 +59,8 @@ jobs:
         run: |
           mkdir -p out
           VER=$(grep -oE 'versionName = "[^"]+"' android/app/build.gradle.kts | head -1 | sed -E 's/.*"([^"]+)".*/\1/')
-          cp android/app/build/outputs/apk/debug/*.apk out/SecretChat-android-debug.apk
-          cp android/app/build/outputs/apk/release/*.apk "out/SecretChat-android-release-${VER}.apk" || true
+          cp android/app/build/outputs/apk/debug/*.apk out/SChat-android-debug.apk
+          cp android/app/build/outputs/apk/release/*.apk "out/SChat-android-release-${VER}.apk" || true
       - uses: actions/upload-artifact@v4
         with:
           name: android
@@ -103,8 +103,8 @@ jobs:
         working-directory: chatserver
         run: |
           mkdir -p ../out
-          CGO_ENABLED=0 GOARCH=amd64 go build -trimpath -ldflags "-s -w" -o ../out/schat-chatserver-linux-amd64 .
-          CGO_ENABLED=0 GOARCH=arm64 go build -trimpath -ldflags "-s -w" -o ../out/schat-chatserver-linux-arm64 .
+          CGO_ENABLED=0 GOARCH=amd64 go build -trimpath -ldflags "-s -w" -o ../out/SChat-server-linux-amd64 .
+          CGO_ENABLED=0 GOARCH=arm64 go build -trimpath -ldflags "-s -w" -o ../out/SChat-server-linux-arm64 .
       - uses: actions/upload-artifact@v4
         with:
           name: server
@@ -172,7 +172,7 @@ jobs:
       - name: Collect firmware
         run: |
           mkdir -p out
-          cp ESP32/m5core2/.pio/build/m5stack-core2/firmware.bin out/SecretChat-m5core2-firmware.bin
+          cp ESP32/m5core2/.pio/build/m5stack-core2/firmware.bin out/SChat-m5core2-firmware.bin
           ls -la out
       - uses: actions/upload-artifact@v4
         with:
@@ -222,6 +222,6 @@ jobs:
       - uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ env.SRC_REF }}-b${{ github.run_number }}
-          name: "Secret Chat ${{ env.SRC_REF }} build ${{ github.run_number }}"
+          name: "SChat ${{ env.SRC_REF }} build ${{ github.run_number }}"
           body: ${{ steps.cl.outputs.body }}
           files: dist/**

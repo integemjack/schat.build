@@ -239,6 +239,10 @@ jobs:
           # already fixed to @rpath / @loader_path in the deps step.
           cp /tmp/uni/lib/libssl.3.dylib /tmp/uni/lib/libcrypto.3.dylib "$APP/Contents/Frameworks/"
           lipo -info "$APP/Contents/Frameworks/libssl.3.dylib" "$APP/Contents/Frameworks/libcrypto.3.dylib"
+          # Product name = SChat: rename the bundle (Finder/Dock show "SChat"). The inner binary
+          # stays secretchat-qt; CFBundleName is "SChat" (set in CMake). Rename BEFORE signing so the
+          # final-named bundle is what gets signed/notarized.
+          mv "$APP" "$(dirname "$APP")/SChat.app"; APP="$(dirname "$APP")/SChat.app"
           # Sign AFTER macdeployqt. Signing BEFORE it (the old order) leaves an invalid signature —
           # install_name_tool's rewrites break the seal — and Apple Silicon SIGKILLs the app on
           # launch with "Code Signature Invalid". Deep-sign the fully-assembled bundle instead.
@@ -253,12 +257,12 @@ jobs:
           # Build the .dmg from the SIGNED bundle. Do NOT use `macdeployqt -dmg` here — it would
           # re-deploy (install_name_tool again) and re-break the signature. hdiutil just packs it.
           mkdir -p out
-          DMG="out/SecretChat-qt-macos-${VER}-universal.dmg"
+          DMG="out/SChat-macos-${VER}-universal.dmg"
           # hdiutil create can transiently fail with "Resource busy" on CI (Spotlight indexing the
           # srcfolder / a lingering mount). Detach any stale volume and retry a few times.
           for attempt in 1 2 3 4; do
-            hdiutil detach "/Volumes/Secret Chat" -force >/dev/null 2>&1 || true
-            if hdiutil create -volname "Secret Chat" -srcfolder "$APP" -ov -format UDZO "$DMG"; then
+            hdiutil detach "/Volumes/SChat" -force >/dev/null 2>&1 || true
+            if hdiutil create -volname "SChat" -srcfolder "$APP" -ov -format UDZO "$DMG"; then
               break
             fi
             echo "hdiutil create failed (attempt $attempt/4) — retrying in 8s"; sleep 8
@@ -337,7 +341,7 @@ jobs:
         run: |
           set -e
           VER=$(grep -E 'kVersion = "[^"]+"' core/include/schat/Version.h | sed -E 's/.*"([^"]+)".*/\1/')
-          STAGE="pkg/SecretChat"
+          STAGE="pkg/SChat"
           mkdir -p "$STAGE" out
           cp build/app-qt/secretchat-qt.exe "$STAGE/"
           QTBIN="$(qmake6 -query QT_INSTALL_BINS)"; QMLSRC="$(qmake6 -query QT_INSTALL_QML)"
@@ -375,9 +379,9 @@ jobs:
           # Minimal NSIS installer: install to Program Files, Start-menu + desktop shortcut, uninstaller.
           cat > installer.nsi <<'NSI'
           !include "MUI2.nsh"
-          Name "Secret Chat"
-          OutFile "SecretChat-Setup.exe"
-          InstallDir "$PROGRAMFILES64\Secret Chat"
+          Name "SChat"
+          OutFile "SChat-Setup.exe"
+          InstallDir "$PROGRAMFILES64\SChat"
           RequestExecutionLevel admin
           !insertmacro MUI_PAGE_DIRECTORY
           !insertmacro MUI_PAGE_INSTFILES
@@ -387,19 +391,19 @@ jobs:
           !insertmacro MUI_LANGUAGE "English"
           Section "Install"
             SetOutPath "$INSTDIR"
-            File /r "pkg\SecretChat\*.*"
-            CreateShortcut "$SMPROGRAMS\Secret Chat.lnk" "$INSTDIR\secretchat-qt.exe"
-            CreateShortcut "$DESKTOP\Secret Chat.lnk" "$INSTDIR\secretchat-qt.exe"
+            File /r "pkg\SChat\*.*"
+            CreateShortcut "$SMPROGRAMS\SChat.lnk" "$INSTDIR\secretchat-qt.exe"
+            CreateShortcut "$DESKTOP\SChat.lnk" "$INSTDIR\secretchat-qt.exe"
             WriteUninstaller "$INSTDIR\uninstall.exe"
           SectionEnd
           Section "Uninstall"
-            Delete "$SMPROGRAMS\Secret Chat.lnk"
-            Delete "$DESKTOP\Secret Chat.lnk"
+            Delete "$SMPROGRAMS\SChat.lnk"
+            Delete "$DESKTOP\SChat.lnk"
             RMDir /r "$INSTDIR"
           SectionEnd
           NSI
           makensis installer.nsi
-          mv SecretChat-Setup.exe "out/SecretChat-qt-windows-${VER}-x64-setup.exe"
+          mv SChat-Setup.exe "out/SChat-windows-${VER}-x64-setup.exe"
           ls -la out
 
       - uses: actions/upload-artifact@v4
