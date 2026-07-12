@@ -214,8 +214,17 @@ jobs:
           # Build the .dmg from the SIGNED bundle. Do NOT use `macdeployqt -dmg` here — it would
           # re-deploy (install_name_tool again) and re-break the signature. hdiutil just packs it.
           mkdir -p out
-          hdiutil create -volname "Secret Chat" -srcfolder "$APP" -ov -format UDZO \
-            "out/SecretChat-qt-macos-${VER}-universal.dmg"
+          DMG="out/SecretChat-qt-macos-${VER}-universal.dmg"
+          # hdiutil create can transiently fail with "Resource busy" on CI (Spotlight indexing the
+          # srcfolder / a lingering mount). Detach any stale volume and retry a few times.
+          for attempt in 1 2 3 4; do
+            hdiutil detach "/Volumes/Secret Chat" -force >/dev/null 2>&1 || true
+            if hdiutil create -volname "Secret Chat" -srcfolder "$APP" -ov -format UDZO "$DMG"; then
+              break
+            fi
+            echo "hdiutil create failed (attempt $attempt/4) — retrying in 8s"; sleep 8
+          done
+          [ -f "$DMG" ] || { echo "ERROR: dmg was not created"; exit 1; }
           ls -la out
 
       - uses: actions/upload-artifact@v4
