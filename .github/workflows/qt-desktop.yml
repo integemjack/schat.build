@@ -4,13 +4,13 @@ name: Qt Desktop
 # client — for all 3 desktop OSes and both CPU families (x86_64 + arm64), plus 32-bit ARM on
 # Linux (armhf, for Raspberry Pi / SBCs).
 #
-#   macOS   : arm64 (Apple Silicon) + x86_64 (Intel) — self-contained .app via macdeployqt
-#   Windows : x64 (MinGW)                            — self-contained folder via windeployqt
+#   macOS   : arm64 (Apple Silicon) + x86_64 (Intel) — .dmg via macdeployqt
+#   Windows : x64 (MSYS2/MINGW64)                    — NSIS installer via windeployqt + makensis
 #             (arm64 needs an MSVC port of the vendored MinGW deps — not covered yet)
-#   Linux   : x86_64 + aarch64 (native runners) + armhf (32-bit ARM via QEMU) — tarball
+#   Linux   : x86_64 + aarch64 + armhf (Debian trixie containers) — .deb (all arches)
+#             + a self-contained AppImage on x86_64 (linuxdeploy + plugin-qt)
 #
-# The macOS leg is build-verified locally; the Windows/Linux legs are structurally correct but
-# are first proven by this workflow (the ports weren't previously built in CI).
+# The macOS leg is build-verified locally; the Windows/Linux legs are proven by this workflow.
 
 on:
   workflow_dispatch:
@@ -20,9 +20,6 @@ on:
         required: false
         # 开发分支是版本分支(v9.12 …);`main` 缺 desktop/desktop-qt。切版本时同步这里。
         default: "v9.12"
-  # 临时:push 到 main 也跑,便于调试 Windows/Linux 打包(验证稳定后可删,回到纯 dispatch)。
-  push:
-    branches: [main]
 
 permissions:
   contents: write
