@@ -150,7 +150,14 @@ jobs:
           host: mac
           target: desktop
           arch: clang_64
-          modules: "qtmultimedia qtwebsockets qtimageformats"
+          # qt5compat = the Qt6 port of Qt5's GraphicalEffects (Main.qml imports
+          # Qt5Compat.GraphicalEffects for the blur effects). It's a RUNTIME QML module — the
+          # build/link never needs it, so omitting it built green but the app died on launch with
+          # `module "Qt5Compat.GraphicalEffects" is not installed`. qtshadertools is required too:
+          # the GraphicalEffects *private* plugin links QtShaderTools.framework, so without it the
+          # app dies one step later on `Cannot load ...graphicaleffectsprivateplugin: QtShaderTools
+          # not loaded`. macdeployqt bundles both once aqt installs them.
+          modules: "qtmultimedia qtwebsockets qtimageformats qt5compat qtshadertools"
 
       - name: Fetch third-party deps (libdatachannel source + single headers)
         working-directory: desktop/desktop-qt
@@ -176,11 +183,19 @@ jobs:
           APP="build/app-qt/secretchat-qt.app"
           echo "=== app binary archs (must be arm64 + x86_64) ==="
           lipo -info "$APP/Contents/MacOS/secretchat-qt" || true
-          codesign --force --deep --sign - "$APP" || true
-          # -dmg deploys the (universal) Qt frameworks/plugins/QML into the bundle AND wraps a .dmg.
-          "$QT_ROOT_DIR/bin/macdeployqt" "$APP" -qmldir=app-qt/qml -dmg
+          # Deploy Qt frameworks/plugins/QML FIRST (this rewrites Mach-O install names via
+          # install_name_tool). NOTE: no -dmg here on purpose.
+          "$QT_ROOT_DIR/bin/macdeployqt" "$APP" -qmldir=app-qt/qml
+          # Sign AFTER macdeployqt. Signing BEFORE it (the old order) leaves an invalid signature —
+          # install_name_tool's rewrites break the seal — and Apple Silicon SIGKILLs the app on
+          # launch with "Code Signature Invalid". Deep-sign the fully-assembled bundle instead.
+          codesign --force --deep --sign - "$APP"
+          codesign -v "$APP" && echo "codesign verify OK"
+          # Build the .dmg from the SIGNED bundle. Do NOT use `macdeployqt -dmg` here — it would
+          # re-deploy (install_name_tool again) and re-break the signature. hdiutil just packs it.
           mkdir -p out
-          mv build/app-qt/secretchat-qt.dmg "out/SecretChat-qt-macos-${VER}-universal.dmg"
+          hdiutil create -volname "Secret Chat" -srcfolder "$APP" -ov -format UDZO \
+            "out/SecretChat-qt-macos-${VER}-universal.dmg"
           ls -la out
 
       - uses: actions/upload-artifact@v4
@@ -216,6 +231,7 @@ jobs:
             mingw-w64-x86_64-gcc mingw-w64-x86_64-cmake mingw-w64-x86_64-ninja
             mingw-w64-x86_64-pkgconf mingw-w64-x86_64-qt6-base mingw-w64-x86_64-qt6-declarative
             mingw-w64-x86_64-qt6-multimedia mingw-w64-x86_64-qt6-websockets mingw-w64-x86_64-qt6-tools
+            mingw-w64-x86_64-qt6-5compat mingw-w64-x86_64-qt6-shadertools
             mingw-w64-x86_64-opus mingw-w64-x86_64-libsodium mingw-w64-x86_64-openh264
             mingw-w64-x86_64-openssl mingw-w64-x86_64-libsrtp mingw-w64-x86_64-nsis
 
@@ -246,15 +262,17 @@ jobs:
             echo "windeployqt --qmldir failed → deploy core DLLs + copy QML modules manually"
             windeployqt --release --no-translations "$STAGE/secretchat-qt.exe" || true
             mkdir -p "$STAGE/qml"
-            for m in Qt QtCore QtQml QtQuick QtQuick.Controls QtQuick.Layouts QtQuick.Window \
-                     QtQuick.Dialogs QtQuick.Shapes QtQuick.Templates QtQuick.Effects \
-                     QtQuick.NativeStyle QtQuick.Controls.Basic QtMultimedia; do
+            # Top-level module dirs are copied recursively, so their submodules (QtQuick/Controls,
+            # Qt5Compat/GraphicalEffects, …) come along. Qt5Compat = the blur effects Main.qml imports.
+            for m in Qt QtCore QtQml QtQuick QtMultimedia Qt5Compat; do
               [ -d "$QMLSRC/$m" ] && cp -r "$QMLSRC/$m" "$STAGE/qml/" || true
             done
+            # Qt6ShaderTools = linked by the Qt5Compat GraphicalEffects private plugin; without it
+            # the app dies on launch with "Cannot load ...graphicaleffectsprivateplugin".
             for d in Qt6QuickControls2 Qt6QuickControls2Impl Qt6QuickControls2Basic \
                      Qt6QuickTemplates2 Qt6QuickLayouts Qt6QuickDialogs2 Qt6QuickDialogs2QuickImpl \
                      Qt6QuickDialogs2Utils Qt6QmlModels Qt6QuickShapes Qt6LabsQmlModels \
-                     Qt6QuickEffects Qt6QmlWorkerScript; do
+                     Qt6QuickEffects Qt6QmlWorkerScript Qt6ShaderTools; do
               [ -f "$QTBIN/$d.dll" ] && cp "$QTBIN/$d.dll" "$STAGE/" || true
             done
             printf '[Paths]\nPrefix = .\n' > "$STAGE/qt.conf"
