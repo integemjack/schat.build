@@ -188,9 +188,42 @@ jobs:
             -DOPENSSL_ROOT_DIR=/tmp/uni -DOPENSSL_USE_STATIC_LIBS=TRUE
           cmake --build build -j"$(sysctl -n hw.ncpu)"
 
+      # Import the Developer ID cert into a throwaway keychain (only if the secret is set —
+      # otherwise the package step falls back to ad-hoc signing so forks still build).
+      - name: Import Developer ID signing cert
+        id: signcert
+        shell: bash
+        env:
+          CERT_P12: ${{ secrets.MACOS_CERT_P12 }}
+          CERT_PW: ${{ secrets.MACOS_CERT_PW }}
+        run: |
+          set -euo pipefail
+          if [ -z "${CERT_P12:-}" ]; then
+            echo "MACOS_CERT_P12 not set — ad-hoc signing"; echo "identity=-" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          KC="$RUNNER_TEMP/sign.keychain-db"; KPW="$(openssl rand -base64 18)"
+          security create-keychain -p "$KPW" "$KC"
+          security set-keychain-settings -lut 21600 "$KC"
+          security unlock-keychain -p "$KPW" "$KC"
+          echo "$CERT_P12" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security import "$RUNNER_TEMP/cert.p12" -k "$KC" -P "${CERT_PW:-}" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$KPW" "$KC" >/dev/null
+          # Make the temp keychain searchable alongside the defaults so codesign finds the identity.
+          security list-keychains -d user -s "$KC" $(security list-keychains -d user | sed 's/"//g')
+          IDENTITY=$(security find-identity -v -p codesigning "$KC" | grep -m1 "Developer ID Application" | sed -E 's/.*"(.*)".*/\1/')
+          rm -f "$RUNNER_TEMP/cert.p12"
+          [ -n "$IDENTITY" ] || { echo "no Developer ID identity in the imported cert"; exit 1; }
+          echo "identity=$IDENTITY" >> "$GITHUB_OUTPUT"
+          echo "imported identity: $IDENTITY"
+
       - name: Package .dmg (macdeployqt -dmg)
         shell: bash
         working-directory: desktop/desktop-qt
+        env:
+          SIGN_IDENTITY: ${{ steps.signcert.outputs.identity }}
+          NOTARY_KEY: ${{ secrets.MACOS_NOTARY_KEY }}
+          NOTARY_KEY_ID: ${{ secrets.MACOS_NOTARY_KEY_ID }}
+          NOTARY_ISSUER: ${{ secrets.MACOS_NOTARY_ISSUER }}
         run: |
           set -euo pipefail
           VER=$(grep -E 'kVersion = "[^"]+"' core/include/schat/Version.h | sed -E 's/.*"([^"]+)".*/\1/')
@@ -209,7 +242,13 @@ jobs:
           # Sign AFTER macdeployqt. Signing BEFORE it (the old order) leaves an invalid signature —
           # install_name_tool's rewrites break the seal — and Apple Silicon SIGKILLs the app on
           # launch with "Code Signature Invalid". Deep-sign the fully-assembled bundle instead.
-          codesign --force --deep --sign - "$APP"
+          if [ -n "${SIGN_IDENTITY:-}" ] && [ "$SIGN_IDENTITY" != "-" ]; then
+            # Real Developer ID + hardened runtime + secure timestamp (required for notarization).
+            codesign --force --deep --options runtime --timestamp --sign "$SIGN_IDENTITY" "$APP"
+            echo "signed with: $SIGN_IDENTITY"
+          else
+            codesign --force --deep --sign - "$APP"   # ad-hoc fallback (no cert secret)
+          fi
           codesign -v "$APP" && echo "codesign verify OK"
           # Build the .dmg from the SIGNED bundle. Do NOT use `macdeployqt -dmg` here — it would
           # re-deploy (install_name_tool again) and re-break the signature. hdiutil just packs it.
@@ -225,6 +264,19 @@ jobs:
             echo "hdiutil create failed (attempt $attempt/4) — retrying in 8s"; sleep 8
           done
           [ -f "$DMG" ] || { echo "ERROR: dmg was not created"; exit 1; }
+          # Notarize + staple the signed dmg (only with a real signature + notary creds; Apple
+          # rejects ad-hoc submissions). Uses an App Store Connect API key (.p8).
+          if [ -n "${SIGN_IDENTITY:-}" ] && [ "$SIGN_IDENTITY" != "-" ] && [ -n "${NOTARY_KEY:-}" ]; then
+            echo "$NOTARY_KEY" | base64 --decode > "$RUNNER_TEMP/nkey.p8"
+            xcrun notarytool submit "$DMG" \
+              --key "$RUNNER_TEMP/nkey.p8" --key-id "$NOTARY_KEY_ID" --issuer "$NOTARY_ISSUER" \
+              --wait --timeout 30m
+            xcrun stapler staple "$DMG"
+            xcrun stapler validate "$DMG" && echo "notarized + stapled OK"
+            rm -f "$RUNNER_TEMP/nkey.p8"
+          else
+            echo "notary creds not set (or ad-hoc signature) — skipping notarization"
+          fi
           ls -la out
 
       - uses: actions/upload-artifact@v4
