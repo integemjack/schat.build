@@ -80,24 +80,31 @@ jobs:
           cmake --build b -j"$J"; cmake --install b
           echo "::endgroup::"
 
-          echo "::group::openh264 2.4.1 (Makefile per-arch + lipo)"
+          echo "::group::openh264 2.4.1 (Makefile per-arch in SEPARATE trees + lipo)"
+          # Each arch is built in its own copied tree — openh264's `make clean` doesn't fully
+          # purge object files, so a shared tree leaks arm64 .o into the x86_64 archive and lipo
+          # rejects the mixed-arch result. Separate trees = zero cross-contamination.
           cd "$SRC"; curl -fsSL "$DL/cisco/openh264/archive/refs/tags/v2.4.1.tar.gz" -o oh.tgz
-          tar xf oh.tgz && cd openh264-2.4.1
-          make -j"$J" OS=darwin ARCH=arm64  libraries; mv libopenh264.a /tmp/oh-arm64.a;  make clean >/dev/null
-          make -j"$J" OS=darwin ARCH=x86_64 libraries; mv libopenh264.a /tmp/oh-x86_64.a
+          tar xf oh.tgz
+          for A in arm64 x86_64; do
+            rm -rf "oh-$A"; cp -R openh264-2.4.1 "oh-$A"
+            make -C "oh-$A" -j"$J" OS=darwin ARCH="$A" libraries
+            cp "oh-$A/libopenh264.a" "/tmp/oh-$A.a"
+            lipo -info "/tmp/oh-$A.a"
+          done
           lipo -create /tmp/oh-arm64.a /tmp/oh-x86_64.a -output "$UNI/lib/libopenh264.a"
-          mkdir -p "$UNI/include/wels"; cp -f codec/api/wels/*.h "$UNI/include/wels/"
+          mkdir -p "$UNI/include/wels"; cp -f openh264-2.4.1/codec/api/wels/*.h "$UNI/include/wels/"
           echo "::endgroup::"
 
-          echo "::group::libsodium 1.0.20 (configure per-arch + lipo)"
+          echo "::group::libsodium 1.0.20 (configure per-arch in SEPARATE trees + lipo)"
           cd "$SRC"; curl -fsSL https://download.libsodium.org/libsodium/releases/libsodium-1.0.20-stable.tar.gz -o sodium.tgz
-          mkdir -p sodium && tar -C sodium --strip-components=1 -xf sodium.tgz && cd sodium
+          mkdir -p sodium-src && tar -C sodium-src --strip-components=1 -xf sodium.tgz
           for A in arm64 x86_64; do
             H=$([ "$A" = arm64 ] && echo aarch64-apple-darwin || echo x86_64-apple-darwin)
-            make distclean >/dev/null 2>&1 || true
-            ./configure --enable-static --disable-shared --prefix="/tmp/sodium-$A" --host="$H" \
-              CC="clang -arch $A" CFLAGS="-arch $A -mmacosx-version-min=12.0 -O2"
-            make -j"$J"; make install
+            rm -rf "sodium-$A"; cp -R sodium-src "sodium-$A"
+            ( cd "sodium-$A" && ./configure --enable-static --disable-shared --prefix="/tmp/sodium-$A" --host="$H" \
+                CC="clang -arch $A" CFLAGS="-arch $A -mmacosx-version-min=12.0 -O2" \
+              && make -j"$J" && make install )
           done
           lipo -create /tmp/sodium-arm64/lib/libsodium.a /tmp/sodium-x86_64/lib/libsodium.a -output "$UNI/lib/libsodium.a"
           cp -Rf /tmp/sodium-arm64/include/* "$UNI/include/"
