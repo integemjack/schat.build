@@ -4,7 +4,8 @@ name: Qt Desktop
 # client — for all 3 desktop OSes and both CPU families (x86_64 + arm64), plus 32-bit ARM on
 # Linux (armhf, for Raspberry Pi / SBCs).
 #
-#   macOS   : arm64 (Apple Silicon) + x86_64 (Intel) — .dmg via macdeployqt
+#   macOS   : Universal2 (arm64 + x86_64 in one fat .app) — .dmg via macdeployqt, built on a
+#             single Apple-Silicon runner (GitHub retired the Intel macos-13 runner)
 #   Windows : x64 (MSYS2/MINGW64)                    — NSIS installer via windeployqt + makensis
 #             (arm64 needs an MSVC port of the vendored MinGW deps — not covered yet)
 #   Linux   : x86_64 + aarch64 + armhf (Debian trixie containers) — .deb (all arches)
@@ -38,18 +39,18 @@ env:
   SCHAT_RAW_MIRROR: https://raw.githubusercontent.com
 
 jobs:
-  # ── macOS: arm64 (macos-14) + x86_64 (macos-13). Homebrew provides Qt6 + the codec deps for
-  # the runner's native arch; the build follows that arch. ───────────────────────────────────
+  # ── macOS: a single Universal2 (arm64 + x86_64) .dmg built on one Apple-Silicon runner.
+  # GitHub retired the Intel `macos-13` runner (it queues forever, never picked up), so we no
+  # longer build a separate x86_64 leg. Instead: universal STATIC codec/crypto deps built from
+  # source (Homebrew is arch-native only) + official universal Qt (aqt via install-qt-action) +
+  # CMAKE_OSX_ARCHITECTURES="arm64;x86_64" → one fat .app that runs on both Intel and Apple
+  # Silicon. macdeployqt bundles the (universal) Qt frameworks and wraps it in a .dmg. ─────────
   macos:
-    name: macOS Qt (${{ matrix.arch }})
-    runs-on: ${{ matrix.runner }}
-    timeout-minutes: 60
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - { runner: macos-14, arch: arm64 }
-          - { runner: macos-13, arch: x86_64 }
+    name: macOS Qt (Universal2)
+    runs-on: macos-14
+    timeout-minutes: 120
+    env:
+      MACOSX_DEPLOYMENT_TARGET: "12.0"   # Qt 6.8 requires macOS 12+; deps built to match.
     steps:
       - name: Checkout source
         uses: actions/checkout@v4
@@ -58,18 +59,91 @@ jobs:
           ref: ${{ env.SRC_REF }}
           token: ${{ secrets.SRC_REPO_TOKEN }}
 
-      - name: Install Qt6 + codec deps (Homebrew)
-        run: brew install qt cmake ninja pkg-config opus openh264 libsodium openssl@3
+      - name: Install build tools (Homebrew)
+        run: brew install cmake ninja pkg-config nasm autoconf automake libtool
+
+      - name: Build universal (arm64+x86_64) static deps → /tmp/uni
+        shell: bash
+        run: |
+          set -euo pipefail
+          export MACOSX_DEPLOYMENT_TARGET=12.0
+          UNI=/tmp/uni; SRC=/tmp/src; J=$(sysctl -n hw.ncpu)
+          mkdir -p "$UNI/lib" "$UNI/include" "$SRC"
+          DL="${SCHAT_GH_MIRROR:-https://github.com}"
+
+          echo "::group::opus 1.5.2 (CMake, native universal)"
+          cd "$SRC"; curl -fsSL https://downloads.xiph.org/releases/opus/opus-1.5.2.tar.gz -o opus.tgz
+          tar xf opus.tgz && cd opus-1.5.2
+          cmake -S . -B b -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_OSX_ARCHITECTURES="arm64;x86_64" -DCMAKE_INSTALL_PREFIX="$UNI" \
+            -DOPUS_BUILD_SHARED_LIBRARY=OFF -DOPUS_BUILD_PROGRAMS=OFF
+          cmake --build b -j"$J"; cmake --install b
+          echo "::endgroup::"
+
+          echo "::group::openh264 2.4.1 (Makefile per-arch + lipo)"
+          cd "$SRC"; curl -fsSL "$DL/cisco/openh264/archive/refs/tags/v2.4.1.tar.gz" -o oh.tgz
+          tar xf oh.tgz && cd openh264-2.4.1
+          make -j"$J" OS=darwin ARCH=arm64  libraries; mv libopenh264.a /tmp/oh-arm64.a;  make clean >/dev/null
+          make -j"$J" OS=darwin ARCH=x86_64 libraries; mv libopenh264.a /tmp/oh-x86_64.a
+          lipo -create /tmp/oh-arm64.a /tmp/oh-x86_64.a -output "$UNI/lib/libopenh264.a"
+          mkdir -p "$UNI/include/wels"; cp -f codec/api/wels/*.h "$UNI/include/wels/"
+          echo "::endgroup::"
+
+          echo "::group::libsodium 1.0.20 (configure per-arch + lipo)"
+          cd "$SRC"; curl -fsSL https://download.libsodium.org/libsodium/releases/libsodium-1.0.20-stable.tar.gz -o sodium.tgz
+          mkdir -p sodium && tar -C sodium --strip-components=1 -xf sodium.tgz && cd sodium
+          for A in arm64 x86_64; do
+            H=$([ "$A" = arm64 ] && echo aarch64-apple-darwin || echo x86_64-apple-darwin)
+            make distclean >/dev/null 2>&1 || true
+            ./configure --enable-static --disable-shared --prefix="/tmp/sodium-$A" --host="$H" \
+              CC="clang -arch $A" CFLAGS="-arch $A -mmacosx-version-min=12.0 -O2"
+            make -j"$J"; make install
+          done
+          lipo -create /tmp/sodium-arm64/lib/libsodium.a /tmp/sodium-x86_64/lib/libsodium.a -output "$UNI/lib/libsodium.a"
+          cp -Rf /tmp/sodium-arm64/include/* "$UNI/include/"
+          echo "::endgroup::"
+
+          echo "::group::openssl 3.3.2 (Configure per-arch + lipo — libdatachannel DTLS backend)"
+          cd "$SRC"; curl -fsSL "$DL/openssl/openssl/releases/download/openssl-3.3.2/openssl-3.3.2.tar.gz" -o ssl.tgz
+          tar xf ssl.tgz
+          for A in arm64 x86_64; do
+            T=$([ "$A" = arm64 ] && echo darwin64-arm64-cc || echo darwin64-x86_64-cc)
+            rm -rf "ssl-$A"; cp -R openssl-3.3.2 "ssl-$A"; cd "ssl-$A"
+            ./Configure "$T" no-shared no-tests no-apps --prefix="/tmp/ssl-$A" -mmacosx-version-min=12.0
+            make -j"$J"; make install_sw
+            cd "$SRC"
+          done
+          lipo -create /tmp/ssl-arm64/lib/libssl.a    /tmp/ssl-x86_64/lib/libssl.a    -output "$UNI/lib/libssl.a"
+          lipo -create /tmp/ssl-arm64/lib/libcrypto.a /tmp/ssl-x86_64/lib/libcrypto.a -output "$UNI/lib/libcrypto.a"
+          cp -Rf /tmp/ssl-arm64/include/* "$UNI/include/"
+          mkdir -p "$UNI/lib/pkgconfig"; cp -f /tmp/ssl-arm64/lib/pkgconfig/*.pc "$UNI/lib/pkgconfig/" 2>/dev/null || true
+          echo "::endgroup::"
+
+          echo "=== universal dep archives (must all list arm64 + x86_64) ==="
+          for f in libopus libopenh264 libsodium libssl libcrypto; do lipo -info "$UNI/lib/$f.a"; done
+
+      - name: Install universal Qt6 (official, via aqt)
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: "6.8.2"
+          host: mac
+          target: desktop
+          arch: clang_64
+          modules: "qtmultimedia qtwebsockets qtimageformats"
 
       - name: Fetch third-party deps (libdatachannel source + single headers)
         working-directory: desktop/desktop-qt
         run: bash third_party/fetch_deps.sh
 
-      - name: Configure + build (Release)
+      - name: Configure + build (Universal2 Release)
         working-directory: desktop/desktop-qt
         run: |
+          set -euo pipefail
           cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_PREFIX_PATH="$(brew --prefix qt)"
+            -DCMAKE_OSX_ARCHITECTURES="arm64;x86_64" \
+            -DCMAKE_PREFIX_PATH="$QT_ROOT_DIR" \
+            -DSCHAT_MAC_DEP_PREFIX=/tmp/uni \
+            -DOPENSSL_ROOT_DIR=/tmp/uni -DOPENSSL_USE_STATIC_LIBS=TRUE
           cmake --build build -j"$(sysctl -n hw.ncpu)"
 
       - name: Package .dmg (macdeployqt -dmg)
@@ -79,16 +153,18 @@ jobs:
           set -euo pipefail
           VER=$(grep -E 'kVersion = "[^"]+"' core/include/schat/Version.h | sed -E 's/.*"([^"]+)".*/\1/')
           APP="build/app-qt/secretchat-qt.app"
+          echo "=== app binary archs (must be arm64 + x86_64) ==="
+          lipo -info "$APP/Contents/MacOS/secretchat-qt" || true
           codesign --force --deep --sign - "$APP" || true
-          # -dmg deploys the Qt frameworks/plugins/QML into the bundle AND wraps it in a .dmg.
-          "$(brew --prefix qt)/bin/macdeployqt" "$APP" -qmldir=app-qt/qml -dmg
+          # -dmg deploys the (universal) Qt frameworks/plugins/QML into the bundle AND wraps a .dmg.
+          "$QT_ROOT_DIR/bin/macdeployqt" "$APP" -qmldir=app-qt/qml -dmg
           mkdir -p out
-          mv build/app-qt/secretchat-qt.dmg "out/SecretChat-qt-macos-${VER}-${{ matrix.arch }}.dmg"
+          mv build/app-qt/secretchat-qt.dmg "out/SecretChat-qt-macos-${VER}-universal.dmg"
           ls -la out
 
       - uses: actions/upload-artifact@v4
         with:
-          name: qt-macos-${{ matrix.arch }}
+          name: qt-macos-universal
           path: desktop/desktop-qt/out/*
 
   # ── Windows: x64 via MSYS2/MINGW64. pacman provides gcc + Qt6 + OpenSSL + opus/libsodium/
@@ -254,7 +330,7 @@ jobs:
           body: |
             Qt6/QML desktop packaging (replaces the deleted Electron client), all platforms + arches:
 
-            - macOS: arm64 (Apple Silicon) + x86_64 (Intel) — **.dmg** (macdeployqt-bundled)
+            - macOS: **Universal2 .dmg** (single arm64 + x86_64 fat build; runs on Apple Silicon and Intel)
             - Windows: x64 — **installer .exe** (MSYS2 build + windeployqt + NSIS)
             - Linux: x86_64 + aarch64 + armhf — **.deb** (all arches) + **AppImage** (x86_64, self-contained); built on Debian trixie
 
