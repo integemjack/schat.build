@@ -143,7 +143,28 @@ jobs:
           STAGE="pkg/SecretChat"
           mkdir -p "$STAGE" out
           cp build/app-qt/secretchat-qt.exe "$STAGE/"
-          windeployqt --qmldir "$PWD/app-qt/qml" --release --no-translations "$STAGE/secretchat-qt.exe"
+          QTBIN="$(qmake6 -query QT_INSTALL_BINS)"; QMLSRC="$(qmake6 -query QT_INSTALL_QML)"
+          export PATH="$QTBIN:$PATH"
+          echo "QTBIN=$QTBIN"; ls "$QTBIN"/qmlimportscanner* "$QTBIN"/windeployqt* 2>&1 | head || true
+          # windeployqt's --qmldir scan (qmlimportscanner) is flaky on MSYS2; fall back to a
+          # manual QML deploy if it fails so the installer is still complete + self-contained.
+          if ! windeployqt --qmldir "$PWD/app-qt/qml" --release --no-translations "$STAGE/secretchat-qt.exe"; then
+            echo "windeployqt --qmldir failed → deploy core DLLs + copy QML modules manually"
+            windeployqt --release --no-translations "$STAGE/secretchat-qt.exe" || true
+            mkdir -p "$STAGE/qml"
+            for m in Qt QtCore QtQml QtQuick QtQuick.Controls QtQuick.Layouts QtQuick.Window \
+                     QtQuick.Dialogs QtQuick.Shapes QtQuick.Templates QtQuick.Effects \
+                     QtQuick.NativeStyle QtQuick.Controls.Basic QtMultimedia; do
+              [ -d "$QMLSRC/$m" ] && cp -r "$QMLSRC/$m" "$STAGE/qml/" || true
+            done
+            for d in Qt6QuickControls2 Qt6QuickControls2Impl Qt6QuickControls2Basic \
+                     Qt6QuickTemplates2 Qt6QuickLayouts Qt6QuickDialogs2 Qt6QuickDialogs2QuickImpl \
+                     Qt6QuickDialogs2Utils Qt6QmlModels Qt6QuickShapes Qt6LabsQmlModels \
+                     Qt6QuickEffects Qt6QmlWorkerScript; do
+              [ -f "$QTBIN/$d.dll" ] && cp "$QTBIN/$d.dll" "$STAGE/" || true
+            done
+            printf '[Paths]\nPrefix = .\n' > "$STAGE/qt.conf"
+          fi
           # Minimal NSIS installer: install to Program Files, Start-menu + desktop shortcut, uninstaller.
           cat > installer.nsi <<'NSI'
           !include "MUI2.nsh"
