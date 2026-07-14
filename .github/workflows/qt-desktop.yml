@@ -374,6 +374,38 @@ jobs:
             [ -f "/mingw64/bin/$d.dll" ] && cp "/mingw64/bin/$d.dll" "$STAGE/" || true
           done
           ls "$STAGE"/libssl* "$STAGE"/libcrypto* 2>/dev/null || echo "WARN: no openssl DLLs staged"
+          # ── Full runtime DLL closure (THE fix for the "downloaded package instant-exits" bug) ──
+          # windeployqt bundles Qt6*.dll + the plugin/QML DLLs, but NOT the ~30 non-Qt runtime DLLs
+          # they pull in: the MinGW runtime (libgcc_s_seh-1/libstdc++-6/libwinpthread-1), ICU
+          # (libicu*78), Qt's transitive deps (harfbuzz/freetype/pcre2/glib/brotli/zlib/png/md4c/…),
+          # the codecs (libopus-0/libopenh264-7/libsodium-26), AND — invisible to a static ldd on
+          # the exe because they're LoadLibrary'd — the plugin DLLs' OWN deps (sqldrivers/qsqlite →
+          # libsqlite3-0, imageformats/qjpeg → libjpeg-8, the glib-linked plugins → libgio/gobject/
+          # gmodule/ffi). Missing ANY of them makes the packaged app exit immediately with empty
+          # stderr on a clean (non-dev) machine — the whole reason a CI-built installer that
+          # "packaged fine" never actually launched. Walk ldd over EVERY dll/exe already staged
+          # (recursively, so plugin subdirs count) and copy every /mingw64 dependency next to the
+          # exe (the exe dir is always on the DLL search path); repeat until a pass adds nothing.
+          echo "=== resolving full DLL closure ==="
+          while :; do
+            before=$(find "$STAGE" -maxdepth 1 -iname '*.dll' | wc -l)
+            while IFS= read -r bin; do
+              ldd "$bin" 2>/dev/null | awk '/=> \/mingw64\// { print $3 }'
+            done < <(find "$STAGE" -type f \( -iname '*.dll' -o -iname '*.exe' \)) \
+              | sort -u | while IFS= read -r dep; do
+                  base=$(basename "$dep")
+                  [ -f "$STAGE/$base" ] || cp "$dep" "$STAGE/"
+                done
+            after=$(find "$STAGE" -maxdepth 1 -iname '*.dll' | wc -l)
+            echo "  DLL closure pass: $before -> $after"
+            if [ "$before" = "$after" ]; then break; fi
+          done
+          echo "staged top-level DLLs: $(find "$STAGE" -maxdepth 1 -iname '*.dll' | wc -l) (expect ~90)"
+          # Fail loudly if the MinGW runtime trio is still missing — that trio absent == the
+          # instant-exit bug is back and the package is DOA; better to fail the build than ship it.
+          for must in libgcc_s_seh-1 libstdc++-6 libwinpthread-1 libsqlite3-0; do
+            [ -f "$STAGE/$must.dll" ] || { echo "FATAL: $must.dll missing from package"; exit 1; }
+          done
           # Minimal NSIS installer: install to Program Files, Start-menu + desktop shortcut, uninstaller.
           cat > installer.nsi <<'NSI'
           !include "MUI2.nsh"
