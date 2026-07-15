@@ -159,7 +159,10 @@ jobs:
       - name: Install universal Qt6 (official, via aqt)
         uses: jurplel/install-qt-action@v4
         with:
-          version: "6.8.2"
+          # 6.9+:ApplicationWindow 的 SafeArea/topPadding 与 ExpandedClientAreaHint 原生窗口
+          # 效果需要它(6.8 下 QML 已做运行时探测兼容,但 mac 端要完整 chrome)。Linux 包仍是
+          # Debian trixie 的 Qt 6.8 → QML 必须继续保持 6.8 兼容(勿用声明式 6.9+ 属性)。
+          version: "6.9.3"
           host: mac
           target: desktop
           arch: clang_64
