@@ -245,15 +245,37 @@ jobs:
           mv "$APP" "$(dirname "$APP")/SChat.app"; APP="$(dirname "$APP")/SChat.app"
           # Sign AFTER macdeployqt. Signing BEFORE it (the old order) leaves an invalid signature —
           # install_name_tool's rewrites break the seal — and Apple Silicon SIGKILLs the app on
-          # launch with "Code Signature Invalid". Deep-sign the fully-assembled bundle instead.
+          # launch with "Code Signature Invalid".
+          # INSIDE-OUT signing (not `--deep`): --deep skips the QML plugin dylibs macdeployqt puts
+          # under Contents/Resources/qml — hardened-runtime library validation then kills the app
+          # the moment such a plugin loads ("打开就闪退" with a valid-looking outer signature).
+          # Sign every nested Mach-O first, then the outer bundle.
+          sign_nested() {   # "$@" = codesign flags (identity etc.) — signs all nested Mach-Os
+            find "$APP/Contents/Frameworks" "$APP/Contents/PlugIns" "$APP/Contents/Resources" \
+                 \( -name '*.dylib' -o -name '*.so' \) -type f 2>/dev/null | while read -r f; do
+              codesign --force "$@" "$f"
+            done
+            find "$APP/Contents/Frameworks" -maxdepth 1 -name '*.framework' -type d 2>/dev/null | while read -r f; do
+              codesign --force "$@" "$f"
+            done
+          }
           if [ -n "${SIGN_IDENTITY:-}" ] && [ "$SIGN_IDENTITY" != "-" ]; then
             # Real Developer ID + hardened runtime + secure timestamp (required for notarization).
-            codesign --force --deep --options runtime --timestamp --sign "$SIGN_IDENTITY" "$APP"
+            # Entitlements (source repo desktop/desktop-qt/app-qt/schat.entitlements): QML JIT +
+            # camera/mic device access — WITHOUT the device entitlements the hardened-runtime app
+            # is killed when 扫一扫/通话/语音 opens the camera or microphone.
+            [ -f app-qt/schat.entitlements ] || { echo "ERROR: app-qt/schat.entitlements missing (source checkout too old?) — a hardened-runtime build without the device entitlements crashes on camera/mic use"; exit 1; }
+            sign_nested --options runtime --timestamp --sign "$SIGN_IDENTITY"
+            codesign --force --options runtime --timestamp \
+              --entitlements app-qt/schat.entitlements --sign "$SIGN_IDENTITY" "$APP"
             echo "signed with: $SIGN_IDENTITY"
           else
-            codesign --force --deep --sign - "$APP"   # ad-hoc fallback (no cert secret)
+            sign_nested --sign -       # ad-hoc fallback (no cert secret)
+            codesign --force --sign - "$APP"
           fi
-          codesign -v "$APP" && echo "codesign verify OK"
+          # Strict deep verify — the old shallow `codesign -v` reported OK even when a nested
+          # dylib was left unsigned/broken (the exact failure users see as a launch crash).
+          codesign --verify --deep --strict --verbose=2 "$APP" && echo "codesign verify OK"
           # Build the .dmg from the SIGNED bundle. Do NOT use `macdeployqt -dmg` here — it would
           # re-deploy (install_name_tool again) and re-break the signature. hdiutil just packs it.
           mkdir -p out
