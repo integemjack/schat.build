@@ -278,19 +278,77 @@ jobs:
           # Strict deep verify — the old shallow `codesign -v` reported OK even when a nested
           # dylib was left unsigned/broken (the exact failure users see as a launch crash).
           codesign --verify --deep --strict --verbose=2 "$APP" && echo "codesign verify OK"
+          mkdir -p out
+          # In-app one-click update asset: a plain zip of the SIGNED bundle. UpdateChecker prefers
+          # .zip (unpack → replace the running bundle in place → relaunch, no dmg drag). The
+          # binaries inside are the same ones notarized via the dmg submission below (notary
+          # tickets are per code-signature, Gatekeeper resolves online), and the in-app download
+          # never carries quarantine anyway.
+          ditto -c -k --keepParent "$APP" "out/SChat-macos-${VER}-universal.zip"
           # Build the .dmg from the SIGNED bundle. Do NOT use `macdeployqt -dmg` here — it would
           # re-deploy (install_name_tool again) and re-break the signature. hdiutil just packs it.
-          mkdir -p out
+          # Custom Finder layout (cosmetics, best-effort — must NEVER block a release): 540x380
+          # window, 128pt icon centered on a 「双击运行」 hint background (source repo
+          # desktop/desktop-qt/scripts/dmg-background.png, DPI-144-tagged @2x). Flow: staging dir
+          # → UDRW dmg → Finder AppleScript writes the .DS_Store layout → convert to UDZO. Any
+          # failure falls back to the old plain UDZO pack.
           DMG="out/SChat-macos-${VER}-universal.dmg"
-          # hdiutil create can transiently fail with "Resource busy" on CI (Spotlight indexing the
-          # srcfolder / a lingering mount). Detach any stale volume and retry a few times.
-          for attempt in 1 2 3 4; do
+          DMGSTAGE="$RUNNER_TEMP/dmg-stage"
+          rm -rf "$DMGSTAGE"; mkdir -p "$DMGSTAGE/.background"
+          ditto "$APP" "$DMGSTAGE/SChat.app"
+          if [ -f scripts/dmg-background.png ]; then
+            cp scripts/dmg-background.png "$DMGSTAGE/.background/bg.png"
+          else
+            echo "no dmg background asset (old source checkout) — plain window"
+          fi
+          layout_dmg() {
+            set -e
+            RW="$RUNNER_TEMP/schat-rw.dmg"
+            rm -f "$RW"
             hdiutil detach "/Volumes/SChat" -force >/dev/null 2>&1 || true
-            if hdiutil create -volname "SChat" -srcfolder "$APP" -ov -format UDZO "$DMG"; then
-              break
-            fi
-            echo "hdiutil create failed (attempt $attempt/4) — retrying in 8s"; sleep 8
-          done
+            hdiutil create -volname "SChat" -srcfolder "$DMGSTAGE" -ov -format UDRW "$RW"
+            hdiutil attach "$RW" -noautoopen
+            sleep 2
+            osascript <<'OSA'
+          tell application "Finder"
+            tell disk "SChat"
+              open
+              set current view of container window to icon view
+              set toolbar visible of container window to false
+              set statusbar visible of container window to false
+              set the bounds of container window to {200, 120, 740, 500}
+              set vo to the icon view options of container window
+              set arrangement of vo to not arranged
+              set icon size of vo to 128
+              set text size of vo to 13
+              try
+                set background picture of vo to file ".background:bg.png"
+              end try
+              set position of item "SChat.app" of container window to {270, 150}
+              update without registering applications
+              delay 1
+              close
+            end tell
+          end tell
+          OSA
+            sync
+            hdiutil detach "/Volumes/SChat" -force
+            hdiutil convert "$RW" -format UDZO -o "$DMG" -ov
+            rm -f "$RW"
+          }
+          if ! ( layout_dmg ); then
+            echo "custom dmg layout failed — falling back to plain dmg"
+            rm -f "$DMG"
+            # hdiutil create can transiently fail with "Resource busy" on CI (Spotlight indexing
+            # the srcfolder / a lingering mount). Detach any stale volume and retry a few times.
+            for attempt in 1 2 3 4; do
+              hdiutil detach "/Volumes/SChat" -force >/dev/null 2>&1 || true
+              if hdiutil create -volname "SChat" -srcfolder "$APP" -ov -format UDZO "$DMG"; then
+                break
+              fi
+              echo "hdiutil create failed (attempt $attempt/4) — retrying in 8s"; sleep 8
+            done
+          fi
           [ -f "$DMG" ] || { echo "ERROR: dmg was not created"; exit 1; }
           # Notarize + staple the signed dmg (only with a real signature + notary creds; Apple
           # rejects ad-hoc submissions). Uses an App Store Connect API key (.p8).
@@ -456,9 +514,15 @@ jobs:
             File /r "pkg\SChat\*.*"
             CreateShortcut "$SMPROGRAMS\SChat.lnk" "$INSTDIR\secretchat-qt.exe"
             CreateShortcut "$DESKTOP\SChat.lnk" "$INSTDIR\secretchat-qt.exe"
+            ; Windows Defender 防火墙放行(装机即通,P2P 通话的 ICE 入站 UDP 检查不再依赖
+            ; 用户在首启弹窗上点「允许」—— 点了「取消」的机器永远不再提示,表现为通话
+            ; 一直「连接中」到超时挂断)。安装器本身 admin 提权,netsh 可用。
+            nsExec::ExecToLog 'netsh advfirewall firewall delete rule name="SChat"'
+            nsExec::ExecToLog 'netsh advfirewall firewall add rule name="SChat" dir=in action=allow program="$INSTDIR\secretchat-qt.exe" enable=yes profile=any'
             WriteUninstaller "$INSTDIR\uninstall.exe"
           SectionEnd
           Section "Uninstall"
+            nsExec::ExecToLog 'netsh advfirewall firewall delete rule name="SChat"'
             Delete "$SMPROGRAMS\SChat.lnk"
             Delete "$DESKTOP\SChat.lnk"
             RMDir /r "$INSTDIR"
