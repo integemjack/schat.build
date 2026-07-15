@@ -1,14 +1,13 @@
 name: Qt Desktop
 
 # Packages the Qt6/QML desktop (desktop/desktop-qt) — the replacement for the deleted Electron
-# client — for all 3 desktop OSes and both CPU families (x86_64 + arm64), plus 32-bit ARM on
-# Linux (armhf, for Raspberry Pi / SBCs).
+# client — for all 3 desktop OSes and both CPU families (x86_64 + arm64).
 #
 #   macOS   : Universal2 (arm64 + x86_64 in one fat .app) — .dmg via macdeployqt, built on a
 #             single Apple-Silicon runner (GitHub retired the Intel macos-13 runner)
 #   Windows : x64 (MSYS2/MINGW64)                    — NSIS installer via windeployqt + makensis
 #             (arm64 needs an MSVC port of the vendored MinGW deps — not covered yet)
-#   Linux   : x86_64 + aarch64 + armhf (Debian trixie containers) — .deb (all arches)
+#   Linux   : x86_64 + aarch64 (Debian trixie containers) — .deb (both arches)
 #             + a self-contained AppImage on x86_64 (linuxdeploy + plugin-qt)
 #
 # The macOS leg is build-verified locally; the Windows/Linux legs are proven by this workflow.
@@ -396,6 +395,14 @@ jobs:
             [ -f "/mingw64/bin/$d.dll" ] && cp "/mingw64/bin/$d.dll" "$STAGE/" || true
           done
           ls "$STAGE"/libssl* "$STAGE"/libcrypto* 2>/dev/null || echo "WARN: no openssl DLLs staged"
+          # 语音转文字引擎运行库(sherpa-onnx C API + onnxruntime,官方 MSVC 预编译,MT=静态
+          # CRT):AsrEngine 运行时 LoadLibrary exe 旁的 sherpa-onnx-c-api.dll;缺失仅「转文字」
+          # 不可用(SenseVoice 模型本体 ~163MB 由应用首次使用时下载,不进安装包)。
+          SHERPA_VER=1.13.4
+          curl -fsSL "https://github.com/k2-fsa/sherpa-onnx/releases/download/v${SHERPA_VER}/sherpa-onnx-v${SHERPA_VER}-win-x64-shared-MT-Release-no-tts-lib.tar.bz2" -o /tmp/sherpa.tar.bz2
+          mkdir -p /tmp/sherpa && tar -xf /tmp/sherpa.tar.bz2 -C /tmp/sherpa --strip-components=1
+          cp /tmp/sherpa/lib/*.dll "$STAGE/"
+          ls "$STAGE"/sherpa-onnx-c-api.dll "$STAGE"/onnxruntime.dll
           # ── Full runtime DLL closure (THE fix for the "downloaded package instant-exits" bug) ──
           # windeployqt bundles Qt6*.dll + the plugin/QML DLLs, but NOT the ~30 non-Qt runtime DLLs
           # they pull in: the MinGW runtime (libgcc_s_seh-1/libstdc++-6/libwinpthread-1), ICU
@@ -463,10 +470,10 @@ jobs:
           name: qt-windows-x64
           path: desktop/desktop-qt/out/*
 
-  # ── Linux: x86_64 + aarch64 + armhf, built + packaged in Debian trixie containers (trixie
-  # ships Qt 6.8 + libsodium ≥1.0.19 + codecs). Produces a .deb (all arches) and, on x86_64, a
-  # self-contained AppImage — via scripts/ci-linux-pkg.sh in the source repo. x86_64/aarch64
-  # run natively on matching runners; armhf runs under QEMU. ───────────────────────────────────
+  # ── Linux: x86_64 + aarch64, built + packaged in Debian trixie containers (trixie ships
+  # Qt 6.8 + libsodium ≥1.0.19 + codecs). Produces a .deb (both arches) and, on x86_64, a
+  # self-contained AppImage — via scripts/ci-linux-pkg.sh in the source repo. Both arches run
+  # natively on matching runners. (armhf/QEMU dropped 2026-07-15 — 每次多拖 ~1h 且无真实用户。)
   linux:
     name: Linux Qt (${{ matrix.arch }})
     runs-on: ${{ matrix.runner }}
@@ -477,7 +484,6 @@ jobs:
         include:
           - { runner: ubuntu-latest,    arch: x86_64,  image: "debian:trixie",         platform: linux/amd64 }
           - { runner: ubuntu-24.04-arm, arch: aarch64, image: "arm64v8/debian:trixie", platform: linux/arm64 }
-          - { runner: ubuntu-latest,    arch: armhf,   image: "arm32v7/debian:trixie", platform: linux/arm/v7 }
     steps:
       - name: Checkout source
         uses: actions/checkout@v4
@@ -485,9 +491,6 @@ jobs:
           repository: Ireoo/Secret-Chat
           ref: ${{ env.SRC_REF }}
           token: ${{ secrets.SRC_REPO_TOKEN }}
-
-      # QEMU is only needed for armhf on the x86 runner; harmless for the native x86_64/aarch64.
-      - uses: docker/setup-qemu-action@v3
 
       - name: Build + package (.deb + AppImage) in Debian trixie (${{ matrix.arch }})
         run: |
