@@ -59,7 +59,10 @@ jobs:
   # zip(一键更新资产)+ 自定义「双击运行」dmg → notarize+staple。arm64-only。──────────
   macos:
     name: macOS SwiftUI (arm64)
-    runs-on: macos-15
+    # macos-26(Xcode 26)—— 本地开发/实测同代工具链(Swift 6.3);macos-15 的 Xcode 16/
+    # Swift 6.0 strict concurrency 更严(non-Sendable [String:Any] 跨隔离返回直接报错),
+    # 实测编不过本地绿的代码。iOS 腿同样钉 macos-26。
+    runs-on: macos-26
     timeout-minutes: 90
     steps:
       - name: Checkout source
@@ -72,13 +75,12 @@ jobs:
       - name: Install build deps (Homebrew)
         run: brew install cmake ninja pkg-config opus openh264 libsodium openssl@3
 
-      - name: Select Xcode 16+ (Swift 6 toolchain)
+      - name: Select Xcode 26 (match local toolchain)
         shell: bash
         run: |
           set -euo pipefail
-          # Package.swift 是 swift-tools-version 6.0 —— 需要 Xcode 16/Swift 6。macos-15 默认
-          # 已是 16.x,这里显式选最新 16 保险(runner 镜像默认值会漂移)。
-          XC=$(ls -d /Applications/Xcode_16*.app 2>/dev/null | sort -V | tail -1 || true)
+          # 显式选最新 Xcode 26(runner 镜像默认值会漂移;Swift 需与本地开发工具链同代)。
+          XC=$(ls -d /Applications/Xcode_26*.app 2>/dev/null | sort -V | tail -1 || true)
           if [ -n "$XC" ]; then sudo xcode-select -s "$XC"; fi
           xcodebuild -version
           swift --version
