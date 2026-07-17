@@ -70,7 +70,7 @@ jobs:
   # Qt6/QML desktop (desktop/desktop-qt) — replaces the deleted Electron client. The full
   # multi-platform packaging (macOS Universal2 .dmg, Windows NSIS installer via MSYS2, Linux
   # .deb + AppImage via Debian trixie) lives in the REUSABLE qt-desktop.yml and is called here
-  # so the combined release below bundles every desktop artifact (qt-macos-universal /
+  # so the combined release below bundles every desktop artifact (macos-swiftui(原生 SwiftUI mac 包) /
   # qt-windows-x64 / qt-linux-{x86_64,aarch64,armhf}). Standalone `qt-desktop.yml` dispatch
   # still runs the same build for desktop-only test artifacts.
   desktop:

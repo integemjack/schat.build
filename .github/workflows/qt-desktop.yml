@@ -1,16 +1,18 @@
 name: Qt Desktop
 
-# Packages the Qt6/QML desktop (desktop/desktop-qt) — the replacement for the deleted Electron
-# client — for all 3 desktop OSes and both CPU families (x86_64 + arm64).
+# Packages the desktop clients for all 3 OSes.
 #
-#   macOS   : Universal2 (arm64 + x86_64 in one fat .app) — .dmg via macdeployqt, built on a
-#             single Apple-Silicon runner (GitHub retired the Intel macos-13 runner)
-#   Windows : x64 (MSYS2/MINGW64)                    — NSIS installer via windeployqt + makensis
+#   macOS   : 原生 SwiftUI 客户端 (desktop/macos, arm64) — 取代旧 Qt Universal2 腿。
+#             通话核心 schat_core+libdatachannel 静态链 + brew dylib 内嵌;签名+公证
+#             .dmg + 一键更新 .zip。Package.swift 的通话链接钉 arch-native brew dylib
+#             路径 → 暂无 x86_64/Universal(GitHub 已退役 Intel runner)。
+#   Windows : x64 (MSYS2/MINGW64) Qt6/QML          — NSIS installer via windeployqt + makensis
 #             (arm64 needs an MSVC port of the vendored MinGW deps — not covered yet)
-#   Linux   : x86_64 + aarch64 (Debian trixie containers) — .deb (both arches)
+#   Linux   : x86_64 + aarch64 (Debian trixie containers) Qt6/QML — .deb (both arches)
 #             + a self-contained AppImage on x86_64 (linuxdeploy + plugin-qt)
 #
-# The macOS leg is build-verified locally; the Windows/Linux legs are proven by this workflow.
+# The macOS SwiftUI leg mirrors desktop/macos/scripts/{build-core,package-app}.sh (本地实测
+# 流程) + qt 线沉淀的 inside-out 签名/公证;Windows/Linux legs are proven by this workflow.
 
 on:
   workflow_dispatch:
@@ -49,18 +51,16 @@ env:
   SCHAT_RAW_MIRROR: https://raw.githubusercontent.com
 
 jobs:
-  # ── macOS: a single Universal2 (arm64 + x86_64) .dmg built on one Apple-Silicon runner.
-  # GitHub retired the Intel `macos-13` runner (it queues forever, never picked up), so we no
-  # longer build a separate x86_64 leg. Instead: universal STATIC codec/crypto deps built from
-  # source (Homebrew is arch-native only) + official universal Qt (aqt via install-qt-action) +
-  # CMAKE_OSX_ARCHITECTURES="arm64;x86_64" → one fat .app that runs on both Intel and Apple
-  # Silicon. macdeployqt bundles the (universal) Qt frameworks and wraps it in a .dmg. ─────────
+  # ── macOS: 原生 SwiftUI 客户端(desktop/macos)。流程 = 本地脚本原样上 CI:
+  # fetch_deps → build-core.sh(schat_core+libdatachannel,无 Qt)→ package-app.sh
+  # (swift build -c release + 组装 SChat.app + 内嵌 brew dylib + ad-hoc 签)→ 真签覆盖
+  # (inside-out,hardened runtime + mic/camera entitlements —— 没有它们公证包在
+  # 通话/扫一扫/语音开摄像头麦克风瞬间被杀,与 qt 线 schat.entitlements 同因)→
+  # zip(一键更新资产)+ 自定义「双击运行」dmg → notarize+staple。arm64-only。──────────
   macos:
-    name: macOS Qt (Universal2)
-    runs-on: macos-14
-    timeout-minutes: 120
-    env:
-      MACOSX_DEPLOYMENT_TARGET: "12.0"   # Qt 6.8 requires macOS 12+; deps built to match.
+    name: macOS SwiftUI (arm64)
+    runs-on: macos-15
+    timeout-minutes: 90
     steps:
       - name: Checkout source
         uses: actions/checkout@v4
@@ -69,129 +69,34 @@ jobs:
           ref: ${{ env.SRC_REF }}
           token: ${{ secrets.SRC_REPO_TOKEN }}
 
-      - name: Install build tools (Homebrew)
-        run: brew install cmake ninja pkg-config nasm autoconf automake libtool
+      - name: Install build deps (Homebrew)
+        run: brew install cmake ninja pkg-config opus openh264 libsodium openssl@3
 
-      - name: Build universal (arm64+x86_64) static deps → /tmp/uni
+      - name: Select Xcode 16+ (Swift 6 toolchain)
         shell: bash
         run: |
           set -euo pipefail
-          export MACOSX_DEPLOYMENT_TARGET=12.0
-          UNI=/tmp/uni; SRC=/tmp/src; J=$(sysctl -n hw.ncpu)
-          mkdir -p "$UNI/lib" "$UNI/include" "$SRC"
-          DL="${SCHAT_GH_MIRROR:-https://github.com}"
-
-          echo "::group::opus 1.5.2 (CMake, native universal)"
-          cd "$SRC"; curl -fsSL https://downloads.xiph.org/releases/opus/opus-1.5.2.tar.gz -o opus.tgz
-          tar xf opus.tgz && cd opus-1.5.2
-          cmake -S . -B b -G Ninja -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_OSX_ARCHITECTURES="arm64;x86_64" -DCMAKE_INSTALL_PREFIX="$UNI" \
-            -DOPUS_BUILD_SHARED_LIBRARY=OFF -DOPUS_BUILD_PROGRAMS=OFF
-          cmake --build b -j"$J"; cmake --install b
-          echo "::endgroup::"
-
-          echo "::group::openh264 2.4.1 (Makefile per-arch, arch-pinned compiler + lipo)"
-          # openh264's darwin Makefile compiles the C/C++ with `-m64` (NOT `-arch x86_64`) for its
-          # x86_64 target. On an Intel host `-m64` == x86_64, but on THIS Apple-Silicon runner
-          # `-m64` just means "64-bit" → arm64 objects, while the x86 .asm files nasm-assemble as
-          # real x86_64 → a mixed archive lipo rejects. Pin CC/CXX to `clang -arch <A>` so an
-          # explicit -arch overrides the Makefile's trailing -m64 and every object is one arch.
-          cd "$SRC"; curl -fsSL "$DL/cisco/openh264/archive/refs/tags/v2.4.1.tar.gz" -o oh.tgz
-          tar xf oh.tgz
-          for A in arm64 x86_64; do
-            rm -rf "oh-$A"; cp -R openh264-2.4.1 "oh-$A"
-            make -C "oh-$A" -j"$J" OS=darwin ARCH="$A" \
-              CC="clang -arch $A" CXX="clang++ -arch $A" libraries
-            cp "oh-$A/libopenh264.a" "/tmp/oh-$A.a"
-            lipo -info "/tmp/oh-$A.a"   # must report a single arch, else the mix is back
-          done
-          lipo -create /tmp/oh-arm64.a /tmp/oh-x86_64.a -output "$UNI/lib/libopenh264.a"
-          mkdir -p "$UNI/include/wels"; cp -f openh264-2.4.1/codec/api/wels/*.h "$UNI/include/wels/"
-          echo "::endgroup::"
-
-          echo "::group::libsodium 1.0.20 (configure per-arch in SEPARATE trees + lipo)"
-          cd "$SRC"; curl -fsSL https://download.libsodium.org/libsodium/releases/libsodium-1.0.20-stable.tar.gz -o sodium.tgz
-          mkdir -p sodium-src && tar -C sodium-src --strip-components=1 -xf sodium.tgz
-          for A in arm64 x86_64; do
-            H=$([ "$A" = arm64 ] && echo aarch64-apple-darwin || echo x86_64-apple-darwin)
-            rm -rf "sodium-$A"; cp -R sodium-src "sodium-$A"
-            ( cd "sodium-$A" && ./configure --enable-static --disable-shared --prefix="/tmp/sodium-$A" --host="$H" \
-                CC="clang -arch $A" CFLAGS="-arch $A -mmacosx-version-min=12.0 -O2" \
-              && make -j"$J" && make install )
-          done
-          lipo -create /tmp/sodium-arm64/lib/libsodium.a /tmp/sodium-x86_64/lib/libsodium.a -output "$UNI/lib/libsodium.a"
-          cp -Rf /tmp/sodium-arm64/include/* "$UNI/include/"
-          echo "::endgroup::"
-
-          echo "::group::openssl 3.3.2 (Configure per-arch + lipo — STATIC for libdatachannel DTLS, SHARED for Qt TLS)"
-          # Build BOTH static (.a, linked into libdatachannel for DTLS) and shared (.dylib). Qt's
-          # openssl TLS backend dlopens libssl/libcrypto at RUNTIME — macdeployqt does NOT bundle
-          # OpenSSL, so without the dylibs the backend fails ("Failed to load libssl/libcrypto")
-          # and EVERY https/wss call dies at http=0 before login. We bundle the universal dylibs.
-          cd "$SRC"; curl -fsSL "$DL/openssl/openssl/releases/download/openssl-3.3.2/openssl-3.3.2.tar.gz" -o ssl.tgz
-          tar xf ssl.tgz
-          for A in arm64 x86_64; do
-            T=$([ "$A" = arm64 ] && echo darwin64-arm64-cc || echo darwin64-x86_64-cc)
-            rm -rf "ssl-$A"; cp -R openssl-3.3.2 "ssl-$A"; cd "ssl-$A"
-            ./Configure "$T" no-tests no-apps --prefix="/tmp/ssl-$A" -mmacosx-version-min=12.0
-            make -j"$J"; make install_sw
-            cd "$SRC"
-          done
-          lipo -create /tmp/ssl-arm64/lib/libssl.a    /tmp/ssl-x86_64/lib/libssl.a    -output "$UNI/lib/libssl.a"
-          lipo -create /tmp/ssl-arm64/lib/libcrypto.a /tmp/ssl-x86_64/lib/libcrypto.a -output "$UNI/lib/libcrypto.a"
-          # Shared dylibs for Qt: fix each thin dylib's install names FIRST (their build-tree
-          # /tmp paths won't exist on a user's Mac), then lipo the fixed thin libs universal.
-          # @loader_path for the inter-dylib ref → resolves next to itself (Frameworks/) always.
-          for A in arm64 x86_64; do
-            install_name_tool -id @rpath/libcrypto.3.dylib /tmp/ssl-$A/lib/libcrypto.3.dylib
-            install_name_tool -id @rpath/libssl.3.dylib    /tmp/ssl-$A/lib/libssl.3.dylib
-            install_name_tool -change /tmp/ssl-$A/lib/libcrypto.3.dylib @loader_path/libcrypto.3.dylib /tmp/ssl-$A/lib/libssl.3.dylib
-          done
-          lipo -create /tmp/ssl-arm64/lib/libcrypto.3.dylib /tmp/ssl-x86_64/lib/libcrypto.3.dylib -output "$UNI/lib/libcrypto.3.dylib"
-          lipo -create /tmp/ssl-arm64/lib/libssl.3.dylib    /tmp/ssl-x86_64/lib/libssl.3.dylib    -output "$UNI/lib/libssl.3.dylib"
-          cp -Rf /tmp/ssl-arm64/include/* "$UNI/include/"
-          mkdir -p "$UNI/lib/pkgconfig"; cp -f /tmp/ssl-arm64/lib/pkgconfig/*.pc "$UNI/lib/pkgconfig/" 2>/dev/null || true
-          echo "::endgroup::"
-
-          echo "=== universal dep archives (must all list arm64 + x86_64) ==="
-          for f in libopus libopenh264 libsodium libssl libcrypto; do lipo -info "$UNI/lib/$f.a"; done
-
-      - name: Install universal Qt6 (official, via aqt)
-        uses: jurplel/install-qt-action@v4
-        with:
-          # 6.9+:ApplicationWindow 的 SafeArea/topPadding 与 ExpandedClientAreaHint 原生窗口
-          # 效果需要它(6.8 下 QML 已做运行时探测兼容,但 mac 端要完整 chrome)。Linux 包仍是
-          # Debian trixie 的 Qt 6.8 → QML 必须继续保持 6.8 兼容(勿用声明式 6.9+ 属性)。
-          version: "6.9.3"
-          host: mac
-          target: desktop
-          arch: clang_64
-          # qt5compat = the Qt6 port of Qt5's GraphicalEffects (Main.qml imports
-          # Qt5Compat.GraphicalEffects for the blur effects). It's a RUNTIME QML module — the
-          # build/link never needs it, so omitting it built green but the app died on launch with
-          # `module "Qt5Compat.GraphicalEffects" is not installed`. qtshadertools is required too:
-          # the GraphicalEffects *private* plugin links QtShaderTools.framework, so without it the
-          # app dies one step later on `Cannot load ...graphicaleffectsprivateplugin: QtShaderTools
-          # not loaded`. macdeployqt bundles both once aqt installs them.
-          modules: "qtmultimedia qtwebsockets qtimageformats qt5compat qtshadertools"
+          # Package.swift 是 swift-tools-version 6.0 —— 需要 Xcode 16/Swift 6。macos-15 默认
+          # 已是 16.x,这里显式选最新 16 保险(runner 镜像默认值会漂移)。
+          XC=$(ls -d /Applications/Xcode_16*.app 2>/dev/null | sort -V | tail -1 || true)
+          if [ -n "$XC" ]; then sudo xcode-select -s "$XC"; fi
+          xcodebuild -version
+          swift --version
 
       - name: Fetch third-party deps (libdatachannel source + single headers)
         working-directory: desktop/desktop-qt
         run: bash third_party/fetch_deps.sh
 
-      - name: Configure + build (Universal2 Release)
-        working-directory: desktop/desktop-qt
-        run: |
-          set -euo pipefail
-          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_OSX_ARCHITECTURES="arm64;x86_64" \
-            -DCMAKE_PREFIX_PATH="$QT_ROOT_DIR" \
-            -DSCHAT_MAC_DEP_PREFIX=/tmp/uni \
-            -DOPENSSL_ROOT_DIR=/tmp/uni -DOPENSSL_USE_STATIC_LIBS=TRUE
-          cmake --build build -j"$(sysctl -n hw.ncpu)"
+      - name: Build call core (schat_core + libdatachannel, no Qt)
+        shell: bash
+        run: bash desktop/macos/scripts/build-core.sh
+
+      - name: Build + assemble SChat.app (package-app.sh)
+        shell: bash
+        run: bash desktop/macos/scripts/package-app.sh
 
       # Import the Developer ID cert into a throwaway keychain (only if the secret is set —
-      # otherwise the package step falls back to ad-hoc signing so forks still build).
+      # otherwise the bundle keeps package-app.sh's ad-hoc signature so forks still build).
       - name: Import Developer ID signing cert
         id: signcert
         shell: bash
@@ -218,9 +123,9 @@ jobs:
           echo "identity=$IDENTITY" >> "$GITHUB_OUTPUT"
           echo "imported identity: $IDENTITY"
 
-      - name: Package .dmg (macdeployqt -dmg)
+      - name: Sign + package (.zip / .dmg) + notarize
         shell: bash
-        working-directory: desktop/desktop-qt
+        working-directory: desktop/macos
         env:
           SIGN_IDENTITY: ${{ steps.signcert.outputs.identity }}
           NOTARY_KEY: ${{ secrets.MACOS_NOTARY_KEY }}
@@ -228,78 +133,51 @@ jobs:
           NOTARY_ISSUER: ${{ secrets.MACOS_NOTARY_ISSUER }}
         run: |
           set -euo pipefail
-          VER=$(grep -E 'kVersion = "[^"]+"' core/include/schat/Version.h | sed -E 's/.*"([^"]+)".*/\1/')
-          APP="build/app-qt/secretchat-qt.app"
-          echo "=== app binary archs (must be arm64 + x86_64) ==="
-          lipo -info "$APP/Contents/MacOS/secretchat-qt" || true
-          # Deploy Qt frameworks/plugins/QML FIRST (this rewrites Mach-O install names via
-          # install_name_tool). NOTE: no -dmg here on purpose.
-          "$QT_ROOT_DIR/bin/macdeployqt" "$APP" -qmldir=app-qt/qml
-          # Bundle the universal OpenSSL dylibs so Qt's openssl TLS backend can dlopen them at
-          # runtime (macdeployqt doesn't bundle OpenSSL; without these every https/wss dies at
-          # http=0). Frameworks/ is on the backend's dlopen search path; install names were
-          # already fixed to @rpath / @loader_path in the deps step.
-          cp /tmp/uni/lib/libssl.3.dylib /tmp/uni/lib/libcrypto.3.dylib "$APP/Contents/Frameworks/"
-          lipo -info "$APP/Contents/Frameworks/libssl.3.dylib" "$APP/Contents/Frameworks/libcrypto.3.dylib"
-          # Product name = SChat: rename the bundle (Finder/Dock show "SChat"). The inner binary
-          # stays secretchat-qt; CFBundleName is "SChat" (set in CMake). Rename BEFORE signing so the
-          # final-named bundle is what gets signed/notarized.
-          mv "$APP" "$(dirname "$APP")/SChat.app"; APP="$(dirname "$APP")/SChat.app"
-          # Sign AFTER macdeployqt. Signing BEFORE it (the old order) leaves an invalid signature —
-          # install_name_tool's rewrites break the seal — and Apple Silicon SIGKILLs the app on
-          # launch with "Code Signature Invalid".
-          # INSIDE-OUT signing (not `--deep`): --deep skips the QML plugin dylibs macdeployqt puts
-          # under Contents/Resources/qml — hardened-runtime library validation then kills the app
-          # the moment such a plugin loads ("打开就闪退" with a valid-looking outer signature).
-          # Sign every nested Mach-O first, then the outer bundle.
-          sign_nested() {   # "$@" = codesign flags (identity etc.) — signs all nested Mach-Os
-            find "$APP/Contents/Frameworks" "$APP/Contents/PlugIns" "$APP/Contents/Resources" \
-                 \( -name '*.dylib' -o -name '*.so' \) -type f 2>/dev/null | while read -r f; do
-              codesign --force "$@" "$f"
-            done
-            find "$APP/Contents/Frameworks" -maxdepth 1 -name '*.framework' -type d 2>/dev/null | while read -r f; do
-              codesign --force "$@" "$f"
-            done
-          }
+          VER=$(grep -m1 'marketingVersion = ' Sources/SecretChatMac/Models/ChatModels.swift | sed -E 's/.*"([^"]+)".*/\1/')
+          APP="dist/SChat.app"
+          [ -d "$APP" ] || { echo "ERROR: package-app.sh did not produce $APP"; exit 1; }
+          echo "=== app binary arch (arm64 expected) ==="
+          lipo -info "$APP/Contents/MacOS/SecretChatMac" || true
+          # hardened-runtime entitlements(真签才需要;qt 线 schat.entitlements 同因,
+          # SwiftUI 线无 QML JIT,只留 mic/camera 设备权限)。
+          cat > "$RUNNER_TEMP/mac.entitlements" <<'ENT'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>com.apple.security.device.audio-input</key><true/>
+            <key>com.apple.security.device.camera</key><true/>
+          </dict>
+          </plist>
+          ENT
           if [ -n "${SIGN_IDENTITY:-}" ] && [ "$SIGN_IDENTITY" != "-" ]; then
-            # Real Developer ID + hardened runtime + secure timestamp (required for notarization).
-            # Entitlements (source repo desktop/desktop-qt/app-qt/schat.entitlements): QML JIT +
-            # camera/mic device access — WITHOUT the device entitlements the hardened-runtime app
-            # is killed when 扫一扫/通话/语音 opens the camera or microphone.
-            [ -f app-qt/schat.entitlements ] || { echo "ERROR: app-qt/schat.entitlements missing (source checkout too old?) — a hardened-runtime build without the device entitlements crashes on camera/mic use"; exit 1; }
-            sign_nested --options runtime --timestamp --sign "$SIGN_IDENTITY"
+            # Inside-out:先重签 Frameworks 下每个 dylib(package-app.sh 改过 install name,
+            # 其 ad-hoc 签名也要被真签覆盖),再签外壳。
+            find "$APP/Contents/Frameworks" -name '*.dylib' -type f 2>/dev/null | while read -r f; do
+              codesign --force --options runtime --timestamp --sign "$SIGN_IDENTITY" "$f"
+            done
             codesign --force --options runtime --timestamp \
-              --entitlements app-qt/schat.entitlements --sign "$SIGN_IDENTITY" "$APP"
+              --entitlements "$RUNNER_TEMP/mac.entitlements" --sign "$SIGN_IDENTITY" "$APP"
             echo "signed with: $SIGN_IDENTITY"
           else
-            sign_nested --sign -       # ad-hoc fallback (no cert secret)
-            codesign --force --sign - "$APP"
+            echo "ad-hoc signature kept (no cert secret)"
           fi
-          # Strict deep verify — the old shallow `codesign -v` reported OK even when a nested
-          # dylib was left unsigned/broken (the exact failure users see as a launch crash).
+          # Strict deep verify — shallow `codesign -v` reports OK even when a nested dylib is
+          # broken (the exact failure users see as a launch crash).
           codesign --verify --deep --strict --verbose=2 "$APP" && echo "codesign verify OK"
           mkdir -p out
-          # In-app one-click update asset: a plain zip of the SIGNED bundle. UpdateChecker prefers
-          # .zip (unpack → replace the running bundle in place → relaunch, no dmg drag). The
-          # binaries inside are the same ones notarized via the dmg submission below (notary
-          # tickets are per code-signature, Gatekeeper resolves online), and the in-app download
-          # never carries quarantine anyway.
-          ditto -c -k --keepParent "$APP" "out/SChat-macos-${VER}-universal.zip"
-          # Build the .dmg from the SIGNED bundle. Do NOT use `macdeployqt -dmg` here — it would
-          # re-deploy (install_name_tool again) and re-break the signature. hdiutil just packs it.
-          # Custom Finder layout (cosmetics, best-effort — must NEVER block a release): 540x380
-          # window, 128pt icon centered on a 「双击运行」 hint background (source repo
-          # desktop/desktop-qt/scripts/dmg-background.png, DPI-144-tagged @2x). Flow: staging dir
-          # → UDRW dmg → Finder AppleScript writes the .DS_Store layout → convert to UDZO. Any
-          # failure falls back to the old plain UDZO pack.
-          DMG="out/SChat-macos-${VER}-universal.dmg"
+          # In-app one-click update asset: plain zip of the SIGNED bundle(客户端更新器优先
+          # .zip:解包原位替换重启;公证票据按签名在线解析,zip 无需单独 staple)。
+          ditto -c -k --keepParent "$APP" "out/SChat-macos-${VER}-arm64.zip"
+          # Custom Finder layout dmg(「双击运行」背景,best-effort,失败回退朴素 dmg)。
+          DMG="out/SChat-macos-${VER}-arm64.dmg"
           DMGSTAGE="$RUNNER_TEMP/dmg-stage"
           rm -rf "$DMGSTAGE"; mkdir -p "$DMGSTAGE/.background"
           ditto "$APP" "$DMGSTAGE/SChat.app"
-          if [ -f scripts/dmg-background.png ]; then
-            cp scripts/dmg-background.png "$DMGSTAGE/.background/bg.png"
+          if [ -f ../desktop-qt/scripts/dmg-background.png ]; then
+            cp ../desktop-qt/scripts/dmg-background.png "$DMGSTAGE/.background/bg.png"
           else
-            echo "no dmg background asset (old source checkout) — plain window"
+            echo "no dmg background asset — plain window"
           fi
           layout_dmg() {
             set -e
@@ -339,8 +217,6 @@ jobs:
           if ! ( layout_dmg ); then
             echo "custom dmg layout failed — falling back to plain dmg"
             rm -f "$DMG"
-            # hdiutil create can transiently fail with "Resource busy" on CI (Spotlight indexing
-            # the srcfolder / a lingering mount). Detach any stale volume and retry a few times.
             for attempt in 1 2 3 4; do
               hdiutil detach "/Volumes/SChat" -force >/dev/null 2>&1 || true
               if hdiutil create -volname "SChat" -srcfolder "$APP" -ov -format UDZO "$DMG"; then
@@ -350,13 +226,9 @@ jobs:
             done
           fi
           [ -f "$DMG" ] || { echo "ERROR: dmg was not created"; exit 1; }
-          # Notarize + staple the signed dmg (only with a real signature + notary creds; Apple
-          # rejects ad-hoc submissions). Uses an App Store Connect API key (.p8).
+          # Notarize + staple(仅真签 + 有公证凭据;政策:release 里绝不放未公证 dmg —— 公证
+          # 失败则本步失败、artifact 不上传,而不是发一个未公证包)。
           if [ -n "${SIGN_IDENTITY:-}" ] && [ "$SIGN_IDENTITY" != "-" ] && [ -n "${NOTARY_KEY:-}" ]; then
-            # REQUIRED (policy: a release must NEVER contain an un-notarized dmg). If notarytool
-            # times out / Apple rejects, this step FAILS → the artifact upload is skipped → no macOS
-            # dmg in the release (rather than an un-notarized one). During an Apple notary outage
-            # this leg fails until Apple recovers — re-run then.
             echo "$NOTARY_KEY" | base64 --decode > "$RUNNER_TEMP/nkey.p8"
             xcrun notarytool submit "$DMG" \
               --key "$RUNNER_TEMP/nkey.p8" --key-id "$NOTARY_KEY_ID" --issuer "$NOTARY_ISSUER" \
@@ -371,8 +243,8 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: qt-macos-universal
-          path: desktop/desktop-qt/out/*
+          name: macos-swiftui
+          path: desktop/macos/out/*
 
   # ── Windows: x64 via MSYS2/MINGW64. pacman provides gcc + Qt6 + OpenSSL + opus/libsodium/
   # openh264/libsrtp (all with pkg-config), so libdatachannel's DTLS finds OpenSSL and the core
