@@ -67,14 +67,15 @@ jobs:
           name: android
           path: out/*.apk
 
-  # Qt6/QML desktop (desktop/desktop-qt) — replaces the deleted Electron client. The full
-  # multi-platform packaging (macOS Universal2 .dmg, Windows NSIS installer via MSYS2, Linux
-  # .deb + AppImage via Debian trixie) lives in the REUSABLE qt-desktop.yml and is called here
+  # Desktop packaging — replaces the deleted Electron client. mac 是原生 SwiftUI 客户端
+  # (desktop/macos, arm64 .dmg + 一键更新 .zip);Windows/Linux 是 Qt6/QML (desktop/desktop-qt,
+  # NSIS installer via MSYS2 / .deb + AppImage via Debian trixie)。三条腿都住在 REUSABLE
+  # qt-desktop.yml 里,在这里被调用
   # so the combined release below bundles every desktop artifact (macos-swiftui(原生 SwiftUI mac 包) /
   # qt-windows-x64 / qt-linux-{x86_64,aarch64,armhf}). Standalone `qt-desktop.yml` dispatch
   # still runs the same build for desktop-only test artifacts.
   desktop:
-    name: Qt Desktop
+    name: Desktop (mac SwiftUI / Win+Linux Qt)
     uses: ./.github/workflows/qt-desktop.yml
     permissions:
       contents: write
