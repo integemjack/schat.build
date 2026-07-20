@@ -1,0 +1,222 @@
+# 在 schat.build（已配好 Developer ID 签名/公证 secret）里构建 ClashrAuto/clashauto 的 macOS
+# 通用包，签名+公证后发布到 clashauto 仓库的 Release。避免把证书 secret 复制到 clashauto。
+#
+# 需要的 secret（本仓库 integemjack/schat.build）：
+#   MACOS_CERT_P12 / MACOS_CERT_PW / MACOS_NOTARY_KEY / MACOS_NOTARY_KEY_ID / MACOS_NOTARY_ISSUER  （已有）
+#   CLASHAUTO_RELEASE_TOKEN  —— 对 ClashrAuto/clashauto 有 contents:write 的 PAT（需新增）
+name: clashauto macOS (signed)
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "要构建的 clashauto 分支/commit"
+        default: "master"
+        required: false
+
+env:
+  QT_VERSION: 6.8.3
+  BUILD_DIR: build-release
+  RUNTIME_RELEASE_TAG: v2.5.7
+  RUNTIME_LINUX_ASSET: clash-auto-amd64-2.5.7.zip
+
+jobs:
+  clashauto-macos:
+    name: clashauto macOS universal (signed + notarized)
+    runs-on: macos-14
+    steps:
+      - name: Checkout clashauto
+        uses: actions/checkout@v4
+        with:
+          repository: ClashrAuto/clashauto
+          ref: ${{ github.event.inputs.ref || 'master' }}
+          fetch-depth: 0
+
+      - name: Resolve build version
+        shell: bash
+        run: |
+          set -euo pipefail
+          base="$(sed -nE 's/.*project[[:space:]]*\([[:space:]]*[^ ]+[[:space:]]+VERSION[[:space:]]+([0-9]+(\.[0-9]+){1,3}).*/\1/p' clashauto-c++/CMakeLists.txt | head -n 1)"
+          [ -n "$base" ] || { echo "Cannot find project VERSION"; exit 1; }
+          major="$(echo "$base" | cut -d. -f1)"; minor="$(echo "$base" | cut -d. -f2)"; [ -n "$minor" ] || minor=0
+          version="${major}.${minor}.$(git rev-list --count HEAD)"
+          { echo "APP_VERSION=$version"; echo "RELEASE_TAG=v$version"; } >> "$GITHUB_ENV"
+          echo "clashauto version: $version"
+
+      - name: Download runtime resources
+        shell: bash
+        run: |
+          set -euo pipefail
+          url="https://github.com/ClashrAuto/Clashr-Auto-Desktop/releases/download/${RUNTIME_RELEASE_TAG}/${RUNTIME_LINUX_ASSET}"
+          zip_path="${RUNNER_TEMP}/${RUNTIME_LINUX_ASSET}"
+          curl -L --fail --retry 3 -o "$zip_path" "$url"
+          rm -rf Clashr-Auto; mkdir -p Clashr-Auto
+          python3 - "$zip_path" <<'PY'
+          import pathlib, sys, zipfile
+          zip_path = pathlib.Path(sys.argv[1])
+          target_root = pathlib.Path("Clashr-Auto")
+          prefixes = ("config/", "language/")
+          with zipfile.ZipFile(zip_path) as archive:
+              for entry in archive.infolist():
+                  name = entry.filename.replace("\\", "/")
+                  if not (name == "version" or name.startswith(prefixes)):
+                      continue
+                  target = target_root / name
+                  if entry.is_dir():
+                      target.mkdir(parents=True, exist_ok=True); continue
+                  target.parent.mkdir(parents=True, exist_ok=True)
+                  with archive.open(entry) as src, target.open("wb") as dst:
+                      dst.write(src.read())
+          PY
+          mkdir -p Clashr-Auto/command/clash
+          test -f Clashr-Auto/config/config.yaml
+
+      - name: Install build dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          brew install ninja
+          python3 -m pip install --user aqtinstall pillow \
+            || python3 -m pip install --user --break-system-packages aqtinstall pillow
+
+      - name: Install Qt (universal)
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m aqt install-qt mac desktop "$QT_VERSION" clang_64 -O "$HOME/Qt"
+          echo "QT_ROOT=$HOME/Qt/$QT_VERSION/macos" >> "$GITHUB_ENV"
+
+      - name: Generate icon.icns
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from PIL import Image
+          import pathlib
+          ico = Image.open("clashauto-c++/assets/icon.ico")
+          sizes = sorted(ico.info.get("sizes") or {ico.size})
+          ico.size = sizes[-1]; ico.load()
+          base = ico.convert("RGBA")
+          out = pathlib.Path("icon.iconset"); out.mkdir(exist_ok=True)
+          for s in (16, 32, 128, 256, 512):
+              base.resize((s, s), Image.LANCZOS).save(out / f"icon_{s}x{s}.png")
+              base.resize((s * 2, s * 2), Image.LANCZOS).save(out / f"icon_{s}x{s}@2x.png")
+          PY
+          iconutil -c icns -o clashauto-c++/assets/icon.icns icon.iconset
+
+      - name: Configure
+        shell: bash
+        run: |
+          cmake -S clashauto-c++ -B "$BUILD_DIR" -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DAPP_VERSION="$APP_VERSION" \
+            -DCMAKE_PREFIX_PATH="$QT_ROOT" \
+            -DCMAKE_OSX_ARCHITECTURES="x86_64;arm64" \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=13.0
+
+      - name: Build
+        shell: bash
+        run: cmake --build "$BUILD_DIR" --parallel
+
+      - name: Verify universal binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          bin="$BUILD_DIR/Clash Auto.app/Contents/MacOS/Clash Auto"
+          lipo -archs "$bin" | grep -q x86_64
+          lipo -archs "$bin" | grep -q arm64
+
+      - name: Import Developer ID signing cert
+        id: signcert
+        shell: bash
+        env:
+          CERT_P12: ${{ secrets.MACOS_CERT_P12 }}
+          CERT_PW: ${{ secrets.MACOS_CERT_PW }}
+        run: |
+          set -euo pipefail
+          if [ -z "${CERT_P12:-}" ]; then
+            echo "MACOS_CERT_P12 未设置 — 无法签名（本工作流要求真签名）"; exit 1
+          fi
+          KC="$RUNNER_TEMP/sign.keychain-db"; KPW="$(openssl rand -base64 18)"
+          security create-keychain -p "$KPW" "$KC"
+          security set-keychain-settings -lut 21600 "$KC"
+          security unlock-keychain -p "$KPW" "$KC"
+          echo "$CERT_P12" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security import "$RUNNER_TEMP/cert.p12" -k "$KC" -P "${CERT_PW:-}" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$KPW" "$KC" >/dev/null
+          security list-keychains -d user -s "$KC" $(security list-keychains -d user | sed 's/"//g')
+          IDENTITY=$(security find-identity -v -p codesigning "$KC" | grep -m1 "Developer ID Application" | sed -E 's/.*"(.*)".*/\1/')
+          rm -f "$RUNNER_TEMP/cert.p12"
+          [ -n "$IDENTITY" ] || { echo "证书里没有 Developer ID Application 身份"; exit 1; }
+          echo "identity=$IDENTITY" >> "$GITHUB_OUTPUT"
+          echo "imported identity: $IDENTITY"
+
+      - name: Stage app bundle (embed helper + inside-out sign)
+        shell: bash
+        env:
+          SIGN_IDENTITY: ${{ steps.signcert.outputs.identity }}
+        run: |
+          set -euo pipefail
+          APP="$BUILD_DIR/Clash Auto.app"
+          "$QT_ROOT/bin/macdeployqt" "$APP" -verbose=1
+
+          # 重新嵌入特权 helper 与 launchd plist（macdeployqt 之后，避免被改）
+          mkdir -p "$APP/Contents/Library/LaunchDaemons"
+          cp "$BUILD_DIR/com.clashrauto.clashauto.helper" "$APP/Contents/MacOS/com.clashrauto.clashauto.helper"
+          cp "clashauto-c++/helper/com.clashrauto.clashauto.helper.plist" "$APP/Contents/Library/LaunchDaemons/"
+          lipo -archs "$APP/Contents/MacOS/com.clashrauto.clashauto.helper"
+
+          # 运行时资源进 bundle：Contents/Clashr-Auto
+          mkdir -p "$APP/Contents/Clashr-Auto"
+          for item in command config language version; do
+            [ -e "Clashr-Auto/$item" ] && cp -a "Clashr-Auto/$item" "$APP/Contents/Clashr-Auto/"
+          done
+          test -f "$APP/Contents/Clashr-Auto/config/config.yaml"
+
+          # Inside-out：先签 helper，再 --deep 签 app（硬化运行时 + 时间戳，公证必需）
+          HELPER="$APP/Contents/MacOS/com.clashrauto.clashauto.helper"
+          codesign --force --options runtime --timestamp --sign "$SIGN_IDENTITY" "$HELPER"
+          codesign --force --deep --options runtime --timestamp --sign "$SIGN_IDENTITY" "$APP"
+          codesign --verify --deep --strict --verbose=2 "$APP" && echo "codesign verify OK"
+          codesign --verify --strict --verbose=2 "$HELPER" && echo "helper codesign verify OK"
+          # 打印签名主体，便于核对 Team = 6AXTRT5TV4
+          codesign -dvv "$APP" 2>&1 | grep -Ei 'Authority|TeamIdentifier' || true
+
+      - name: Create DMG + notarize + staple
+        shell: bash
+        env:
+          NOTARY_KEY: ${{ secrets.MACOS_NOTARY_KEY }}
+          NOTARY_KEY_ID: ${{ secrets.MACOS_NOTARY_KEY_ID }}
+          NOTARY_ISSUER: ${{ secrets.MACOS_NOTARY_ISSUER }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist/dmgroot
+          ditto "$BUILD_DIR/Clash Auto.app" "dist/dmgroot/Clash Auto.app"
+          ln -s /Applications dist/dmgroot/Applications
+          DMG="dist/ClashAuto-${APP_VERSION}-macos-universal.dmg"
+          hdiutil create -volname "Clash Auto" -srcfolder dist/dmgroot -ov -format UDZO "$DMG"
+          if [ -z "${NOTARY_KEY:-}" ]; then
+            echo "缺 notary 凭据，无法公证"; exit 1
+          fi
+          echo "$NOTARY_KEY" | base64 --decode > "$RUNNER_TEMP/nkey.p8"
+          xcrun notarytool submit "$DMG" \
+            --key "$RUNNER_TEMP/nkey.p8" --key-id "$NOTARY_KEY_ID" --issuer "$NOTARY_ISSUER" \
+            --wait --timeout 45m
+          xcrun stapler staple "$DMG"
+          xcrun stapler validate "$DMG" && echo "notarized + stapled OK"
+          rm -f "$RUNNER_TEMP/nkey.p8"
+
+      - name: Publish to clashauto release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.CLASHAUTO_RELEASE_TOKEN }}
+        run: |
+          set -euo pipefail
+          DMG="dist/ClashAuto-${APP_VERSION}-macos-universal.dmg"
+          test -f "$DMG"
+          shasum -a 256 "$DMG" | awk '{print $1}' > "$DMG.sha256"
+          # 目标 release 通常已由 clashauto 自身 CI 建好（v<version>）；不存在则建之
+          gh release create "$RELEASE_TAG" -R ClashrAuto/clashauto \
+            --title "$RELEASE_TAG" --notes "signed + notarized macOS build (built by schat.build)" 2>/dev/null || true
+          gh release upload "$RELEASE_TAG" "$DMG" "$DMG.sha256" --clobber -R ClashrAuto/clashauto
+          echo "已上传 $DMG 到 ClashrAuto/clashauto@$RELEASE_TAG（覆盖同名 mac 资产）"
