@@ -206,16 +206,27 @@ jobs:
           xcrun stapler validate "$DMG" && echo "notarized + stapled OK"
           rm -f "$RUNNER_TEMP/nkey.p8"
 
-      - name: Publish to clashauto release
+      # 无论如何都把签名+公证的 DMG 作为本 run 的 artifact 上传（无需任何跨仓库 token，直接下载即可测）
+      - name: Upload signed DMG artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ClashAuto-macos-universal-signed
+          path: dist/ClashAuto-*-macos-universal.dmg
+
+      # 可选：若配置了对 ClashrAuto/clashauto 有 contents:write 的 PAT，则同时发布到其 Release
+      - name: Publish to clashauto release (optional)
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.CLASHAUTO_RELEASE_TOKEN }}
         run: |
           set -euo pipefail
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo "未设置 CLASHAUTO_RELEASE_TOKEN —— 跳过发布到 clashauto release（DMG 已作为 artifact 上传，可直接下载）"
+            exit 0
+          fi
           DMG="dist/ClashAuto-${APP_VERSION}-macos-universal.dmg"
           test -f "$DMG"
           shasum -a 256 "$DMG" | awk '{print $1}' > "$DMG.sha256"
-          # 目标 release 通常已由 clashauto 自身 CI 建好（v<version>）；不存在则建之
           gh release create "$RELEASE_TAG" -R ClashrAuto/clashauto \
             --title "$RELEASE_TAG" --notes "signed + notarized macOS build (built by schat.build)" 2>/dev/null || true
           gh release upload "$RELEASE_TAG" "$DMG" "$DMG.sha256" --clobber -R ClashrAuto/clashauto
