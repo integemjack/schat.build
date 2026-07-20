@@ -230,4 +230,4 @@ jobs:
           gh release create "$RELEASE_TAG" -R ClashrAuto/clashauto \
             --title "$RELEASE_TAG" --notes "signed + notarized macOS build (built by schat.build)" 2>/dev/null || true
           gh release upload "$RELEASE_TAG" "$DMG" "$DMG.sha256" --clobber -R ClashrAuto/clashauto
-          echo "已上传 $DMG 到 ClashrAuto/clashauto@$RELEASE_TAG（覆盖同名 mac 资产）"
+          echo "uploaded $DMG to ClashrAuto/clashauto @ ${RELEASE_TAG} (mac asset clobbered)"
