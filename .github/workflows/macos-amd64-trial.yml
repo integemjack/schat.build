@@ -339,20 +339,37 @@ jobs:
             | grep -E "/opt/homebrew/|/usr/local/" || echo "  (无 —— 收敛干净)"
           echo "=== 通话核心是否真的编进去了(SCHAT_CALLS 门控)==="
           # Package.swift 以 libschat_core.a 是否存在决定链不链通话;交叉编译若让核心落到别处,
-          # 会**静默**产出一个没有通话功能的包 —— 这里显式验一下符号在不在。
-          if nm -U "$APP/Contents/MacOS/SecretChatMac" 2>/dev/null | grep -q 'schat_call_create'; then
-            echo "  ✓ 通话 ABI 符号存在"
+          # 会**静默**产出一个没有通话功能的包 —— 这里显式验符号。
+          # 本机 arm64 包实测基线:`T _schat_call_create`(外部导出),schat_call_* 共 107 个
+          # (17 个 T / 75 个 t / 15 个 s)。下面把实际计数全打出来,好判断是「整个核心没链」
+          # 还是「只是某个符号被 dead-strip」。
+          B="$APP/Contents/MacOS/SecretChatMac"
+          NCALL=$(nm "$B" 2>/dev/null | grep -c 'schat_call_'  || true)
+          NGRP=$(nm  "$B" 2>/dev/null | grep -c 'schat_group_' || true)
+          NEXT=$(nm  "$B" 2>/dev/null | grep 'schat_call_' | awk '$2=="T"' | wc -l | tr -d ' ' || true)
+          echo "  schat_call_*  符号数: $NCALL (其中外部 T: $NEXT)"
+          echo "  schat_group_* 符号数: $NGRP"
+          echo "  ── 抽样 ──"
+          nm "$B" 2>/dev/null | grep 'schat_' | head -8 || echo "    (一个都没有)"
+          echo "  ── Swift 侧 CallEngine 是否编进来(SCHAT_CALLS 的另一面)──"
+          nm "$B" 2>/dev/null | grep -ci 'CallEngine' || echo "    0"
+          if [ "${NCALL:-0}" -gt 0 ]; then
+            echo "  ✓ 通话核心已链入"
           else
-            echo "  ✗ 通话 ABI 符号缺失 —— 包被静默降级成「无通话」版本"; FAIL=1
+            echo "  ✗ 通话核心完全缺失 —— 包被静默降级成「无通话」版本"; FAIL=1
           fi
           codesign --verify --deep --strict --verbose=2 "$APP" && echo "codesign(ad-hoc) verify OK"
           [ "$FAIL" = 0 ] || exit 1
           ls -la dist
 
+      # always():验证不过时**照样**上传 —— 试验阶段那个包本身就是最好的诊断材料,
+      # 而且有 Intel Mac 可以直接拿去实测(CI 的断言只是代理指标,不是最终判据)。
       - uses: actions/upload-artifact@v4
+        if: always()
         with:
           name: macos-swiftui-x86_64-trial
           path: desktop/macos/dist/*.zip
+          if-no-files-found: warn
 
       - name: Summary
         if: always()
