@@ -1,0 +1,284 @@
+name: macOS amd64 Trial
+
+# 【试验性 / 不发 release / 不进 Build All】
+# 目的:验证 desktop/macos(SwiftUI 线)能否产出 **x86_64** 的 .app。
+# 现状是 arm64-only,卡点写在 qt-desktop.yml 头部:「Package.swift 的通话链接钉 arch-native
+# brew dylib 路径」——本工作流就是来试这条路通不通的。成功后再谈要不要转 universal。
+#
+# ── 为什么不用 Rosetta + Intel Homebrew ────────────────────────────────────────────────
+# 全程**只交叉链接、从不运行** x86_64 二进制,所以不需要 Rosetta:
+#   1. `brew fetch --bottle-tag=sonoma <formula>` 用 runner 自带的 arm64 brew **下载 Intel
+#      bottle 压缩包**(bottle 就是个 tar.gz,不装也能取),解包到 staging;
+#   2. 软链 /usr/local/opt/<formula> → staging —— Intel bottle 的 dylib install_name 本来就
+#      烧的是 `/usr/local/opt/...`,软链一搭,下游全部**零改动**地解析:
+#        · Package.swift 的 `\(brewOpt)/opus/lib/libopus.dylib` 链接路径
+#        · package-app.sh 的 `cp -f "$dep"`(它照 otool -L 报的绝对路径拷)
+#        · 那条「不再引用任何 brew 路径」的收敛断言
+#   bottle tag `sonoma` = x86_64 / macOS 14,与 Info.plist 的 LSMinimumSystemVersion 14.0 对齐。
+#
+# ── 对源码仓库的改动:零 ────────────────────────────────────────────────────────────────
+# 三处 arch 硬编码全部在 runner 上就地 patch(一次性,不回流源仓),每处都带断言,源码结构
+# 一变就当场失败而不是静默产出 arm64 包:
+#   A. Package.swift  : brewOpt 的 `/opt/homebrew/opt` 优先探测 → 钉死 `/usr/local/opt`
+#                       (runner 上 /opt/homebrew 必然存在,不钉死就永远选到 arm64 dylib)
+#   B. core/CMakeLists: APPLE 分支用 `brew --prefix opus` 拿路径 → PATH 里插一个 brew shim
+#                       把 --prefix 重定向到 /usr/local/opt(比 sed 六行更稳)
+#   C. package-app.sh : swift build 加 --arch x86_64;.build/release → 交叉编译的 bin 路径;
+#                       产物名 -arm64 → -x86_64
+#
+# ── 判定标准 ──────────────────────────────────────────────────────────────────────────
+# 每一层都 `lipo -info` 断言是 x86_64(核心 .a / 可执行文件 / 内嵌 dylib)。CI 绿 ≠ 能跑:
+# 本工作流只证明「编得出、链得上、arch 对」,真机启动/通话/TLS 仍需 Intel Mac 实测
+# (qt 线的教训:构建期全绿、装上秒崩的坑一次踩了四个)。
+#
+# 签名:只有 package-app.sh 的 ad-hoc 签名,不导入 Developer ID、不公证 —— 试验产物不分发。
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Ireoo/Secret-Chat 的分支或标签"
+        required: false
+        default: "main"
+      bottle_tag:
+        description: "Intel bottle 的 macOS 代号(x86_64):sonoma=14 / sequoia=15"
+        required: false
+        default: "sonoma"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: macos-amd64-trial-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  SRC_REPO: Ireoo/Secret-Chat
+  SRC_REF: ${{ inputs.ref || 'main' }}
+  BOTTLE_TAG: ${{ inputs.bottle_tag || 'sonoma' }}
+  # GitHub runner 直连 github.com — 跳过 fetch_deps.sh 默认的 gh-proxy 国内镜像。
+  SCHAT_GH_MIRROR: https://github.com
+  SCHAT_RAW_MIRROR: https://raw.githubusercontent.com
+  # Intel bottle 解包落点(软链源)。
+  INTEL_STAGE: /tmp/intel-deps
+
+jobs:
+  macos-amd64:
+    name: macOS SwiftUI (x86_64 trial)
+    # 与 qt-desktop.yml 的 mac 腿同镜像:macos-26/Xcode 26 = 本地开发同代工具链。
+    # 注意这是 **arm64 runner**,我们在其上交叉编译 x86_64(GitHub 已退役 Intel runner)。
+    runs-on: macos-26
+    timeout-minutes: 90
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          repository: Ireoo/Secret-Chat
+          ref: ${{ env.SRC_REF }}
+          token: ${{ secrets.SRC_REPO_TOKEN }}
+
+      - name: Select Xcode 26 (match local toolchain)
+        shell: bash
+        run: |
+          set -euo pipefail
+          XC=$(ls -d /Applications/Xcode_26*.app 2>/dev/null | sort -V | tail -1 || true)
+          if [ -n "$XC" ]; then sudo xcode-select -s "$XC"; fi
+          xcodebuild -version
+          swift --version
+          echo "host arch: $(uname -m)   (期望 arm64 —— 我们在 arm64 上交叉编 x86_64)"
+
+      - name: Install host build tools
+        run: brew install cmake ninja pkg-config
+
+      # ── 1. 取 Intel(x86_64)bottle 并搭出 /usr/local/opt 前缀 ──────────────────────
+      - name: Fetch x86_64 Homebrew bottles → /usr/local/opt
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$INTEL_STAGE"
+          sudo mkdir -p /usr/local/opt
+          # 依赖清单 = Package.swift callLinkFlags 里的那五个 dylib 来源(openssl@3 出两个)。
+          for f in opus openh264 libsodium openssl@3; do
+            echo "▸ fetching $f (bottle-tag=$BOTTLE_TAG) …"
+            # 某些 formula 在个别 tag 下没有 bottle —— 依次退到更新的代号,全失败才报错。
+            TB=""
+            for tag in "$BOTTLE_TAG" sequoia sonoma; do
+              if brew fetch --force --bottle-tag="$tag" "$f" >/dev/null 2>&1; then
+                TB=$(brew --cache --bottle-tag="$tag" "$f")
+                echo "  ✓ tag=$tag → $TB"
+                break
+              fi
+              echo "  · tag=$tag 无 bottle,继续尝试"
+            done
+            [ -n "$TB" ] && [ -f "$TB" ] || { echo "✗ $f 取不到任何 x86_64 bottle" >&2; exit 1; }
+            tar -xzf "$TB" -C "$INTEL_STAGE"
+            # bottle 解出来是 <formula>/<version>/{lib,include,...};取那唯一的版本目录。
+            CELLAR=$(find "$INTEL_STAGE/$f" -maxdepth 1 -mindepth 1 -type d | sort -V | tail -1)
+            [ -n "$CELLAR" ] || { echo "✗ $f 解包后找不到版本目录" >&2; exit 1; }
+            sudo rm -rf "/usr/local/opt/$f"
+            sudo ln -sfn "$CELLAR" "/usr/local/opt/$f"
+            echo "  → /usr/local/opt/$f -> $CELLAR"
+          done
+          echo "=== 断言:每个 dylib 都必须是 x86_64 ==="
+          FAIL=0
+          for d in /usr/local/opt/opus/lib/libopus.dylib \
+                   /usr/local/opt/openh264/lib/libopenh264.dylib \
+                   /usr/local/opt/libsodium/lib/libsodium.dylib \
+                   /usr/local/opt/openssl@3/lib/libssl.dylib \
+                   /usr/local/opt/openssl@3/lib/libcrypto.dylib; do
+            if [ ! -f "$d" ]; then echo "✗ 缺失 $d"; FAIL=1; continue; fi
+            INFO=$(lipo -info "$d")
+            echo "  $INFO"
+            case "$INFO" in *x86_64*) ;; *) echo "  ✗ 不是 x86_64!"; FAIL=1;; esac
+          done
+          [ "$FAIL" = 0 ] || { echo "x86_64 依赖准备失败" >&2; exit 1; }
+
+      # ── 2. 就地 patch 三处 arch 硬编码(带断言,匹配不到就失败)────────────────────
+      - name: Patch A — Package.swift 钉死 /usr/local/opt
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import re, pathlib, sys
+          p = pathlib.Path("desktop/macos/Package.swift")
+          s = p.read_text()
+          pat = (r'let brewOpt = FileManager\.default\.fileExists\(atPath: "/opt/homebrew/opt"\)'
+                 r' \? "/opt/homebrew/opt"\s*\n\s*: "/usr/local/opt"')
+          s2, n = re.subn(pat, 'let brewOpt = "/usr/local/opt"  // CI amd64 trial: 钉死 Intel bottle 前缀', s)
+          if n != 1:
+              sys.exit(f"✗ brewOpt 未匹配到(源码结构变了?)matches={n} —— 请更新本 patch")
+          p.write_text(s2)
+          print("✓ Package.swift patched")
+          PY
+          grep -n 'brewOpt' desktop/macos/Package.swift
+
+      - name: Patch B — brew shim(把 --prefix 重定向到 /usr/local/opt)
+        shell: bash
+        run: |
+          set -euo pipefail
+          # core/CMakeLists.txt 的 APPLE 分支用 `brew --prefix opus|openh264|libsodium` 定位依赖,
+          # 顶层 CMakeLists 用 `brew --prefix openssl@3`。在 arm64 runner 上真 brew 一律返回
+          # /opt/homebrew/opt(arm64!)—— 会把 arm64 dylib 链进 x86_64 目标。插一层 shim 拦掉。
+          mkdir -p /tmp/brewshim
+          cat > /tmp/brewshim/brew <<'SH'
+          #!/usr/bin/env bash
+          # amd64 trial shim:仅拦 `brew --prefix <formula>`,其余原样转发给真 brew。
+          if [ "${1:-}" = "--prefix" ] && [ -n "${2:-}" ]; then
+            echo "/usr/local/opt/$2"; exit 0
+          fi
+          exec /opt/homebrew/bin/brew "$@"
+          SH
+          chmod +x /tmp/brewshim/brew
+          echo "/tmp/brewshim" >> "$GITHUB_PATH"
+          echo "shim self-test: $(/tmp/brewshim/brew --prefix opus)"
+
+      # ── 3. 构建 ────────────────────────────────────────────────────────────────────
+      - name: Fetch third-party deps (libdatachannel source + single headers)
+        working-directory: desktop/desktop-qt
+        run: bash third_party/fetch_deps.sh
+
+      - name: Build call core as x86_64 (schat_core + libdatachannel)
+        shell: bash
+        run: |
+          set -euo pipefail
+          # build-core.sh 的 cmake 配置行不带 arch —— 注入交叉编译三件套。
+          grep -q '\-DSCHAT_BUILD_APP=OFF' desktop/macos/scripts/build-core.sh || {
+            echo "✗ build-core.sh 结构变了,找不到 -DSCHAT_BUILD_APP=OFF"; exit 1; }
+          sed -i '' 's|-DSCHAT_BUILD_APP=OFF|-DSCHAT_BUILD_APP=OFF -DCMAKE_OSX_ARCHITECTURES=x86_64 -DCMAKE_OSX_DEPLOYMENT_TARGET=14.0 -DOPENSSL_ROOT_DIR=/usr/local/opt/openssl@3|' \
+            desktop/macos/scripts/build-core.sh
+          grep -n 'cmake -S' desktop/macos/scripts/build-core.sh
+          bash desktop/macos/scripts/build-core.sh
+
+      - name: Verify core libs are x86_64
+        shell: bash
+        run: |
+          set -euo pipefail
+          B=desktop/desktop-qt/build
+          FAIL=0
+          for f in core/libschat_core.a \
+                   third_party/libdatachannel/libdatachannel-static.a \
+                   third_party/libdatachannel/deps/usrsctp/usrsctplib/libusrsctp.a \
+                   third_party/libdatachannel/deps/libsrtp/libsrtp2.a \
+                   third_party/libdatachannel/deps/libjuice/libjuice-static.a; do
+            INFO=$(lipo -info "$B/$f" 2>&1 || echo "MISSING")
+            echo "  $f: $INFO"
+            case "$INFO" in *x86_64*) ;; *) echo "    ✗ 不是 x86_64!"; FAIL=1;; esac
+          done
+          [ "$FAIL" = 0 ] || { echo "核心库架构不对 —— 交叉编译没生效" >&2; exit 1; }
+
+      # ⚠️ Patch C 必须排在核心库构建**之后**:Package.swift 的 `callsAvailable` 是靠探测
+      # libschat_core.a 是否存在来决定链不链通话的,而 SwiftPM 会**缓存 manifest 的求值结果**
+      # (缓存键只看 manifest 内容 + 工具链,不看它查过的文件系统)。核心库还没编出来就先跑一次
+      # swift(哪怕只是 --show-bin-path),会把 callsAvailable=false 的结果焊进缓存,之后真正
+      # 构建时直接复用 → 静默产出一个**没有通话功能**的包。故:先编核心,再问路径,再打包;
+      # 并且一律带 --manifest-cache none 双保险。
+      - name: Patch C — package-app.sh 交叉编译 + 产物改名
+        shell: bash
+        working-directory: desktop/macos
+        run: |
+          set -euo pipefail
+          # 交叉编译时 SwiftPM 的产物落在 .build/<triple>/release,不是 .build/release。
+          # 不硬编 triple —— 直接问 SwiftPM 要(源码/工具链一变也不会错)。
+          BINPATH=$(swift build -c release --arch x86_64 --manifest-cache none --show-bin-path)
+          echo "x86_64 bin path: $BINPATH"
+          [ -n "$BINPATH" ] || { echo "✗ --show-bin-path 返回空" >&2; exit 1; }
+          grep -q 'swift build -c release' scripts/package-app.sh || { echo "✗ 找不到 swift build 行"; exit 1; }
+          grep -q '\.build/release' scripts/package-app.sh          || { echo "✗ 找不到 .build/release"; exit 1; }
+          grep -q -- '-arm64\.zip' scripts/package-app.sh           || { echo "✗ 找不到 -arm64.zip"; exit 1; }
+          sed -i '' 's|swift build -c release$|swift build -c release --arch x86_64 --manifest-cache none|' scripts/package-app.sh
+          sed -i '' "s|\.build/release|${BINPATH}|g"                 scripts/package-app.sh
+          sed -i '' 's|-arm64\.zip|-x86_64.zip|'                     scripts/package-app.sh
+          echo "=== patch 结果 ==="
+          grep -n 'swift build\|'"$(basename "$BINPATH")"'\|x86_64\.zip' scripts/package-app.sh
+
+      - name: Build + assemble SChat.app (x86_64)
+        shell: bash
+        run: bash desktop/macos/scripts/package-app.sh
+
+      # ── 4. 判定 ────────────────────────────────────────────────────────────────────
+      - name: Verify .app is x86_64
+        shell: bash
+        working-directory: desktop/macos
+        run: |
+          set -euo pipefail
+          APP="dist/SChat.app"
+          [ -d "$APP" ] || { echo "✗ package-app.sh 没产出 $APP"; exit 1; }
+          FAIL=0
+          echo "=== 可执行文件 ==="
+          INFO=$(lipo -info "$APP/Contents/MacOS/SecretChatMac")
+          echo "  $INFO"
+          case "$INFO" in *x86_64*) ;; *) echo "  ✗ 不是 x86_64!"; FAIL=1;; esac
+          echo "=== 内嵌 dylib ==="
+          for f in "$APP/Contents/Frameworks"/*.dylib; do
+            [ -e "$f" ] || continue
+            INFO=$(lipo -info "$f")
+            echo "  $INFO"
+            case "$INFO" in *x86_64*) ;; *) echo "  ✗ 不是 x86_64!"; FAIL=1;; esac
+          done
+          echo "=== 残留 brew 绝对路径(应为空)==="
+          otool -L "$APP/Contents/MacOS/SecretChatMac" "$APP/Contents/Frameworks"/*.dylib 2>/dev/null \
+            | grep -E "/opt/homebrew/|/usr/local/opt/" || echo "  (无 —— 收敛干净)"
+          echo "=== 通话核心是否真的编进去了(SCHAT_CALLS 门控)==="
+          # Package.swift 以 libschat_core.a 是否存在决定链不链通话;交叉编译若让核心落到别处,
+          # 会**静默**产出一个没有通话功能的包 —— 这里显式验一下符号在不在。
+          if nm -U "$APP/Contents/MacOS/SecretChatMac" 2>/dev/null | grep -q 'schat_call_create'; then
+            echo "  ✓ 通话 ABI 符号存在"
+          else
+            echo "  ✗ 通话 ABI 符号缺失 —— 包被静默降级成「无通话」版本"; FAIL=1
+          fi
+          codesign --verify --deep --strict --verbose=2 "$APP" && echo "codesign(ad-hoc) verify OK"
+          [ "$FAIL" = 0 ] || exit 1
+          ls -la dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-swiftui-x86_64-trial
+          path: desktop/macos/dist/*.zip
+
+      - name: Summary
+        if: always()
+        shell: bash
+        run: |
+          echo "本工作流只验证「编得出 / 链得上 / arch 正确」。" >> "$GITHUB_STEP_SUMMARY"
+          echo "**未**验证:真机启动、TLS、通话、扫码 —— 这些必须在 Intel Mac 上实测" >> "$GITHUB_STEP_SUMMARY"
+          echo "(qt 线有过「CI 全绿、装上秒崩」的四连坑先例)。" >> "$GITHUB_STEP_SUMMARY"
