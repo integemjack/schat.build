@@ -49,7 +49,17 @@ name: macOS Universal Trial
 # CI 绿 ≠ 能跑:真机启动/TLS/通话/扫码仍需 Intel + Apple Silicon 两台实测
 # (qt 线的教训:构建期全绿、装上秒崩的坑一次踩了四个)。
 #
-# 签名:只有 package-app.sh 的 ad-hoc 签名,不导入 Developer ID、不公证 —— 试验产物不分发。
+# ── 签名 / 公证 / 发布 ──────────────────────────────────────────────────────────────
+# 真签(Developer ID,inside-out)+ 公证 + staple,然后发到一个 **prerelease**。
+#
+# ⚠️ 必须是 prerelease,不能进正式 release:mac 更新器盯的是
+# `/releases/latest`(UpdaterMac.swift),而 GitHub 的 latest **会跳过 prerelease 与 draft**
+# —— 放这里自动更新器永远看不到,对现有用户零风险。正式 release 里同版本还挂着 CI 出的
+# arm64 包,两个 .zip 会在 pickAsset 里撞车(它只按「含 mac + 不含 qt + .zip 优先」挑,
+# 顺序不可控),低于该版本的用户可能被推到试验包上。
+# 项目既有政策(qt-desktop.yml):release 里绝不放未公证的包 —— 故公证失败即整步失败,
+# 不上传,而不是发一个未公证包。
+# 没配签名/公证 secrets 时(fork)保持 ad-hoc 并**跳过发布**,只留 artifact。
 
 on:
   workflow_dispatch:
@@ -63,8 +73,9 @@ on:
         required: false
         default: "sonoma"
 
+# 需要 write:本工作流会把签名+公证后的包发到一个 **prerelease**。
 permissions:
-  contents: read
+  contents: write
 
 concurrency:
   group: macos-universal-trial-${{ github.ref }}
@@ -399,7 +410,68 @@ jobs:
         shell: bash
         run: bash desktop/macos/scripts/package-app.sh
 
-      # ── 4. 判定 ──────────────────────────────────────────────────────────────────
+      # ── 4. 真签(Developer ID)────────────────────────────────────────────────────
+      # 与 qt-desktop.yml mac 腿同一套(throwaway keychain + inside-out 逐个签)。
+      # 没有 secret 时保持 package-app.sh 的 ad-hoc 签名,后面的公证与发布会自动跳过。
+      - name: Import Developer ID signing cert
+        id: signcert
+        shell: bash
+        env:
+          CERT_P12: ${{ secrets.MACOS_CERT_P12 }}
+          CERT_PW: ${{ secrets.MACOS_CERT_PW }}
+        run: |
+          set -euo pipefail
+          if [ -z "${CERT_P12:-}" ]; then
+            echo "MACOS_CERT_P12 not set — 保持 ad-hoc 签名"; echo "identity=-" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          KC="$RUNNER_TEMP/sign.keychain-db"; KPW="$(openssl rand -base64 18)"
+          security create-keychain -p "$KPW" "$KC"
+          security set-keychain-settings -lut 21600 "$KC"
+          security unlock-keychain -p "$KPW" "$KC"
+          echo "$CERT_P12" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security import "$RUNNER_TEMP/cert.p12" -k "$KC" -P "${CERT_PW:-}" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$KPW" "$KC" >/dev/null
+          security list-keychains -d user -s "$KC" $(security list-keychains -d user | sed 's/"//g')
+          IDENTITY=$(security find-identity -v -p codesigning "$KC" | grep -m1 "Developer ID Application" | sed -E 's/.*"(.*)".*/\1/')
+          rm -f "$RUNNER_TEMP/cert.p12"
+          [ -n "$IDENTITY" ] || { echo "no Developer ID identity in the imported cert"; exit 1; }
+          echo "identity=$IDENTITY" >> "$GITHUB_OUTPUT"
+          echo "imported identity: $IDENTITY"
+
+      - name: Sign (inside-out, hardened runtime)
+        shell: bash
+        working-directory: desktop/macos
+        env:
+          SIGN_IDENTITY: ${{ steps.signcert.outputs.identity }}
+        run: |
+          set -euo pipefail
+          APP="dist/SChat.app"
+          # hardened runtime 下没有设备 entitlement,公证包会在开摄像头/麦克风瞬间被系统杀
+          # (与 qt 线 schat.entitlements 同因;SwiftUI 线无 QML JIT,只留 mic/camera)。
+          cat > "$RUNNER_TEMP/mac.entitlements" <<'ENT'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>com.apple.security.device.audio-input</key><true/>
+            <key>com.apple.security.device.camera</key><true/>
+          </dict>
+          </plist>
+          ENT
+          if [ -n "${SIGN_IDENTITY:-}" ] && [ "$SIGN_IDENTITY" != "-" ]; then
+            # inside-out:先重签 Frameworks 下每个 dylib(package-app.sh 改过 install name,
+            # 其 ad-hoc 签名要被真签覆盖),再签外壳。`--deep` 会漏签嵌套件,别用。
+            find "$APP/Contents/Frameworks" -name '*.dylib' -type f 2>/dev/null | while read -r f; do
+              codesign --force --options runtime --timestamp --sign "$SIGN_IDENTITY" "$f"
+            done
+            codesign --force --options runtime --timestamp \
+              --entitlements "$RUNNER_TEMP/mac.entitlements" --sign "$SIGN_IDENTITY" "$APP"
+            echo "signed with: $SIGN_IDENTITY"
+          else
+            echo "ad-hoc signature kept (no cert secret)"
+          fi
+
+      # ── 5. 判定 ──────────────────────────────────────────────────────────────────
       - name: Verify .app is universal (both slices)
         shell: bash
         working-directory: desktop/macos
@@ -442,18 +514,128 @@ jobs:
             echo "  [$a] schat_call_*: ${NCALL:-0}   schat_group_*: ${NGRP:-0}"
             [ "${NCALL:-0}" -gt 0 ] || { echo "    ✗ [$a] 通话核心缺失 —— 该片被静默降级"; FAIL=1; }
           done
-          codesign --verify --deep --strict --verbose=2 "$APP" && echo "codesign(ad-hoc) verify OK"
+          # 浅校验会在嵌套件坏掉时仍报 OK(= 用户看到的启动崩溃),必须 --deep --strict。
+          codesign --verify --deep --strict --verbose=2 "$APP" && echo "codesign verify OK"
           [ "$FAIL" = 0 ] || exit 1
           ls -la dist
 
-      # always():验证不过时**照样**上传 —— 试验阶段那个包本身就是最好的诊断材料,
+      # ── 6. 打包(zip + dmg)+ 公证 + staple ───────────────────────────────────────
+      - name: Package (.zip / .dmg) + notarize + staple
+        id: pkg
+        shell: bash
+        working-directory: desktop/macos
+        env:
+          SIGN_IDENTITY: ${{ steps.signcert.outputs.identity }}
+          NOTARY_KEY: ${{ secrets.MACOS_NOTARY_KEY }}
+          NOTARY_KEY_ID: ${{ secrets.MACOS_NOTARY_KEY_ID }}
+          NOTARY_ISSUER: ${{ secrets.MACOS_NOTARY_ISSUER }}
+        run: |
+          set -euo pipefail
+          VER=$(grep -m1 'marketingVersion = ' Sources/SecretChatMac/Models/ChatModels.swift | sed -E 's/.*"([^"]+)".*/\1/')
+          APP="dist/SChat.app"
+          echo "version=$VER" >> "$GITHUB_OUTPUT"
+          # package-app.sh 产出的那个 zip 是 **ad-hoc 签名时** 打的 —— 真签之后必须重打,
+          # 否则发出去的是签名过期的旧副本。
+          rm -f dist/*.zip
+          DMG="dist/SChat-macos-${VER}-universal.dmg"
+          rm -f "$DMG"
+          for attempt in 1 2 3 4; do
+            hdiutil detach "/Volumes/SChat" -force >/dev/null 2>&1 || true
+            if hdiutil create -volname "SChat" -srcfolder "$APP" -ov -format UDZO "$DMG"; then break; fi
+            echo "hdiutil create failed (attempt $attempt/4) — retrying in 8s"; sleep 8
+          done
+          [ -f "$DMG" ] || { echo "ERROR: dmg was not created"; exit 1; }
+
+          NOTARIZED=0
+          if [ -n "${SIGN_IDENTITY:-}" ] && [ "$SIGN_IDENTITY" != "-" ] && [ -n "${NOTARY_KEY:-}" ]; then
+            echo "$NOTARY_KEY" | base64 --decode > "$RUNNER_TEMP/nkey.p8"
+            xcrun notarytool submit "$DMG" \
+              --key "$RUNNER_TEMP/nkey.p8" --key-id "$NOTARY_KEY_ID" --issuer "$NOTARY_ISSUER" \
+              --wait --timeout 45m
+            xcrun stapler staple "$DMG"
+            xcrun stapler validate "$DMG"
+            # 公证票据是按**代码签名**(cdhash)注册的,所以同一个 .app 也能 staple ——
+            # 钉进 bundle 后连离线首开都不用联网校验(比生产线只发在线票据的 zip 更好一点)。
+            xcrun stapler staple "$APP" && xcrun stapler validate "$APP" || echo "app staple 失败(不致命,在线票据仍有效)"
+            rm -f "$RUNNER_TEMP/nkey.p8"
+            NOTARIZED=1
+            echo "notarized + stapled OK"
+          else
+            echo "未配签名/公证 secrets —— 跳过公证(该包不会被发布)"
+          fi
+          echo "notarized=$NOTARIZED" >> "$GITHUB_OUTPUT"
+          # zip 从**已 staple 的** bundle 打(更新器优先 .zip:解包原位替换重启)。
+          ditto -c -k --keepParent "$APP" "dist/SChat-macos-${VER}-universal.zip"
+          ls -la dist
+
+      # always():验证不过时**照样**上传 artifact —— 那个包本身就是最好的诊断材料,
       # 而且有 Intel Mac 可以直接拿去实测(CI 的断言只是代理指标,不是最终判据)。
+      # 注意这只是 artifact(登录可见、不进 release),与下面的 prerelease 发布是两回事。
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: macos-swiftui-universal-trial
-          path: desktop/macos/dist/*.zip
+          path: |
+            desktop/macos/dist/*.zip
+            desktop/macos/dist/*.dmg
           if-no-files-found: warn
+
+      # ── 7. 发布到 prerelease(仅在真签 + 公证成功时)──────────────────────────────
+      # ⚠️ prerelease 而非正式 release:mac 更新器盯 /releases/latest,而 GitHub 的 latest
+      # 会跳过 prerelease 与 draft ⇒ 自动更新器永远看不到这里,对现有用户零风险。
+      - name: Publish to prerelease
+        if: steps.pkg.outputs.notarized == '1'
+        shell: bash
+        working-directory: desktop/macos
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VER: ${{ steps.pkg.outputs.version }}
+        run: |
+          set -euo pipefail
+          REPO="${GITHUB_REPOSITORY}"
+          TAG="macos-universal-trial-${VER}"
+          API="https://api.github.com/repos/${REPO}"
+          hdr=(-H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json")
+
+          # 幂等:同 tag 已存在就复用,否则新建(prerelease=true)。
+          REL=$(curl -s "${hdr[@]}" "$API/releases/tags/$TAG")
+          RID=$(printf '%s' "$REL" | python3 -c "import json,sys;print(json.load(sys.stdin).get('id') or '')")
+          if [ -z "$RID" ]; then
+            BODY=$(python3 -c "
+          import json
+          print(json.dumps({
+            'tag_name': '$TAG', 'name': 'macOS Universal 试验包 $VER', 'prerelease': True, 'draft': False,
+            'body': ('**试验性 Universal2(arm64 + x86_64)包** —— 由 macos-universal-trial.yml 产出。\n\n'
+                     '真签(Developer ID)+ 公证 + staple,可正常安装。\n\n'
+                     '⚠️ 刻意标为 prerelease:mac 更新器盯 /releases/latest,而 latest 会跳过 '
+                     'prerelease ⇒ 不会被推送给任何现有用户。\n\n'
+                     '未验证:真机启动 / TLS / 通话 / 扫码 —— 需 Intel + Apple Silicon 两台实测。')
+          }))")
+            RID=$(curl -s "${hdr[@]}" -X POST "$API/releases" -d "$BODY" \
+                  | python3 -c "import json,sys;print(json.load(sys.stdin).get('id') or '')")
+            [ -n "$RID" ] || { echo "✗ 创建 prerelease 失败" >&2; exit 1; }
+            echo "created prerelease $TAG (id=$RID)"
+          else
+            echo "reusing existing prerelease $TAG (id=$RID)"
+          fi
+
+          for f in dist/SChat-macos-${VER}-universal.zip dist/SChat-macos-${VER}-universal.dmg; do
+            [ -f "$f" ] || continue
+            NAME=$(basename "$f")
+            # 同名资产先删再传(幂等重跑)。
+            OLD=$(curl -s "${hdr[@]}" "$API/releases/$RID/assets" \
+                  | NAME="$NAME" python3 -c "
+          import json,sys,os
+          n=os.environ['NAME']
+          print(next((str(a['id']) for a in json.load(sys.stdin) if a['name']==n), ''))")
+            [ -z "$OLD" ] || curl -s "${hdr[@]}" -X DELETE "$API/releases/assets/$OLD" >/dev/null
+            curl -s "${hdr[@]}" -H "Content-Type: application/octet-stream" \
+              --data-binary @"$f" \
+              "https://uploads.github.com/repos/${REPO}/releases/$RID/assets?name=$NAME" >/dev/null
+            echo "  ✓ uploaded $NAME ($(du -h "$f" | cut -f1))"
+          done
+          echo "prerelease: https://github.com/${REPO}/releases/tag/$TAG"
+          echo "### 已发布 prerelease [\`$TAG\`](https://github.com/${REPO}/releases/tag/$TAG)" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Summary
         if: always()
