@@ -6,25 +6,24 @@ name: macOS amd64 Trial
 # brew dylib 路径」——本工作流就是来试这条路通不通的。成功后再谈要不要转 universal。
 #
 # ── 为什么不用 Rosetta + Intel Homebrew ────────────────────────────────────────────────
-# 全程**只交叉链接、从不运行** x86_64 二进制,所以不需要 Rosetta:
-#   1. `brew fetch --bottle-tag=sonoma <formula>` 用 runner 自带的 arm64 brew **下载 Intel
-#      bottle 压缩包**(bottle 就是个 tar.gz,不装也能取),解包到 staging;
-#   2. 软链 /usr/local/opt/<formula> → staging —— Intel bottle 的 dylib install_name 本来就
-#      烧的是 `/usr/local/opt/...`,软链一搭,下游全部**零改动**地解析:
-#        · Package.swift 的 `\(brewOpt)/opus/lib/libopus.dylib` 链接路径
-#        · package-app.sh 的 `cp -f "$dep"`(它照 otool -L 报的绝对路径拷)
-#        · 那条「不再引用任何 brew 路径」的收敛断言
-#   bottle tag `sonoma` = x86_64 / macOS 14,与 Info.plist 的 LSMinimumSystemVersion 14.0 对齐。
+# 全程**只交叉链接、从不运行** x86_64 二进制,所以不需要 Rosetta:直接从 ghcr 拉 Intel
+# bottle 的 blob(bottle 就是个 tar.gz),在 /usr/local 下还原出一套与真实 brew 安装
+# **逐字节同构**的布局(真 Cellar + opt/ 软链 + 替换掉 install_name 占位符),下游
+# Package.swift 的链接路径、package-app.sh 的 `cp -f "$dep"`、以及那条「不再引用任何
+# brew 路径」的收敛断言就都能零改动地工作。bottle tag `sonoma` = x86_64/macOS 14,
+# 与 Info.plist 的 LSMinimumSystemVersion 14.0 对齐。细节与两个坑见下面步骤里的注释。
 #
 # ── 对源码仓库的改动:零 ────────────────────────────────────────────────────────────────
-# 三处 arch 硬编码全部在 runner 上就地 patch(一次性,不回流源仓),每处都带断言,源码结构
-# 一变就当场失败而不是静默产出 arm64 包:
+# 四处在 runner 上就地 patch(一次性,不回流源仓),每处都带断言,源码结构一变就当场失败,
+# 而不是静默产出 arm64 / 缺依赖 / 无通话功能的包:
 #   A. Package.swift  : brewOpt 的 `/opt/homebrew/opt` 优先探测 → 钉死 `/usr/local/opt`
 #                       (runner 上 /opt/homebrew 必然存在,不钉死就永远选到 arm64 dylib)
 #   B. core/CMakeLists: APPLE 分支用 `brew --prefix opus` 拿路径 → PATH 里插一个 brew shim
 #                       把 --prefix 重定向到 /usr/local/opt(比 sed 六行更稳)
 #   C. package-app.sh : swift build 加 --arch x86_64;.build/release → 交叉编译的 bin 路径;
 #                       产物名 -arm64 → -x86_64
+#   D. package-app.sh : brew 路径模式 `/usr/local/opt/` 放宽到 `/usr/local/` —— 这条是绕过
+#                       一个**既有缺陷**(不是本 CI 特有),详见该步注释,试验通过后应回源仓修
 #
 # ── 判定标准 ──────────────────────────────────────────────────────────────────────────
 # 每一层都 `lipo -info` 断言是 x86_64(核心 .a / 可执行文件 / 内嵌 dylib)。CI 绿 ≠ 能跑:
@@ -139,17 +138,23 @@ jobs:
           done
 
           echo "=== 还原 install_name 占位符(照 brew install 的口径)==="
+          # ⚠️ 本步是 `set -euo pipefail`:任何 `… | grep X | …` 在**无匹配**时 grep 退出 1,
+          # pipefail 让整条管道失败、set -e 当场杀步 —— 而「没有 @@ 依赖」是完全正常的情况
+          # (libopus 就只依赖 libSystem)。所以凡是可能空匹配的 grep 一律先落到变量并 `|| true`,
+          # 绝不直接接管道。(run 29743226728 就是死在这里,一个字符没输出。)
           find /usr/local/Cellar -name '*.dylib' -type f | while read -r d; do
             ID=$(otool -D "$d" | tail -1)
             N=${ID//@@HOMEBREW_PREFIX@@//usr/local}; N=${N//@@HOMEBREW_CELLAR@@//usr/local/Cellar}
             [ "$N" = "$ID" ] || install_name_tool -id "$N" "$d" 2>/dev/null || true
-            otool -L "$d" | tail -n +2 | awk '{print $1}' | grep '@@HOMEBREW' | while read -r dep; do
+            DEPS=$(otool -L "$d" | tail -n +2 | awk '{print $1}' | grep '@@HOMEBREW' || true)
+            for dep in $DEPS; do
               ND=${dep//@@HOMEBREW_PREFIX@@//usr/local}; ND=${ND//@@HOMEBREW_CELLAR@@//usr/local/Cellar}
               install_name_tool -change "$dep" "$ND" "$d" 2>/dev/null || true
             done
             # install_name_tool 会让原签名失效 —— 重新 ad-hoc 签,免得后续工具链挑刺。
             codesign -f -s - "$d" >/dev/null 2>&1 || true
           done
+          echo "  ✓ 重定位完成($(find /usr/local/Cellar -name '*.dylib' -type f | wc -l | tr -d ' ') 个 dylib)"
 
           echo "=== 断言:x86_64 + 无残留占位符 + 依赖可解析 ==="
           FAIL=0
@@ -168,8 +173,11 @@ jobs:
             echo "  $INFO"
             case "$INFO" in *x86_64*) ;; *) echo "    ✗ 不是 x86_64!"; FAIL=1;; esac
             # 每个非系统依赖都必须能在磁盘上解析到 —— 这是「装上能不能起来」的最早关口。
-            otool -L "$d" | tail -n +2 | awk '{print $1}' | grep -v '^/usr/lib/' | grep -v '^/System/' \
-              | while read -r p; do [ -f "$p" ] || echo "    ✗ 依赖解析不到: $p"; done
+            # (同样先落变量 + || true:全被过滤光时 grep -v 退出 1 会被 pipefail 放大成杀步。)
+            REFS=$(otool -L "$d" | tail -n +2 | awk '{print $1}' | grep -v '^/usr/lib/' | grep -v '^/System/' || true)
+            for p in $REFS; do
+              [ -f "$p" ] || { echo "    ✗ 依赖解析不到: $p"; FAIL=1; }
+            done
           done
           [ "$FAIL" = 0 ] || { echo "x86_64 依赖准备失败" >&2; exit 1; }
 
@@ -190,7 +198,7 @@ jobs:
           p.write_text(s2)
           print("✓ Package.swift patched")
           PY
-          grep -n 'brewOpt' desktop/macos/Package.swift
+          grep -n 'brewOpt' desktop/macos/Package.swift || true
 
       - name: Patch B — brew shim(把 --prefix 重定向到 /usr/local/opt)
         shell: bash
@@ -226,7 +234,7 @@ jobs:
             echo "✗ build-core.sh 结构变了,找不到 -DSCHAT_BUILD_APP=OFF"; exit 1; }
           sed -i '' 's|-DSCHAT_BUILD_APP=OFF|-DSCHAT_BUILD_APP=OFF -DCMAKE_OSX_ARCHITECTURES=x86_64 -DCMAKE_OSX_DEPLOYMENT_TARGET=14.0 -DOPENSSL_ROOT_DIR=/usr/local/opt/openssl@3|' \
             desktop/macos/scripts/build-core.sh
-          grep -n 'cmake -S' desktop/macos/scripts/build-core.sh
+          grep -n 'cmake -S' desktop/macos/scripts/build-core.sh || true
           bash desktop/macos/scripts/build-core.sh
 
       - name: Verify core libs are x86_64
@@ -269,7 +277,7 @@ jobs:
           sed -i '' "s|\.build/release|${BINPATH}|g"                 scripts/package-app.sh
           sed -i '' 's|-arm64\.zip|-x86_64.zip|'                     scripts/package-app.sh
           echo "=== patch 结果 ==="
-          grep -n 'swift build\|'"$(basename "$BINPATH")"'\|x86_64\.zip' scripts/package-app.sh
+          grep -n 'swift build\|'"$(basename "$BINPATH")"'\|x86_64\.zip' scripts/package-app.sh || true
 
       - name: Patch D — package-app.sh 的 brew 路径模式在 /usr/local 下是漏的
         shell: bash
@@ -300,7 +308,7 @@ jobs:
           p.write_text(s)
           print("✓ package-app.sh 路径模式已放宽")
           PY
-          grep -n 'usr/local' scripts/package-app.sh
+          grep -n 'usr/local' scripts/package-app.sh || true
 
       - name: Build + assemble SChat.app (x86_64)
         shell: bash
@@ -328,7 +336,7 @@ jobs:
           done
           echo "=== 残留 brew 绝对路径(应为空)==="
           otool -L "$APP/Contents/MacOS/SecretChatMac" "$APP/Contents/Frameworks"/*.dylib 2>/dev/null \
-            | grep -E "/opt/homebrew/|/usr/local/opt/" || echo "  (无 —— 收敛干净)"
+            | grep -E "/opt/homebrew/|/usr/local/" || echo "  (无 —— 收敛干净)"
           echo "=== 通话核心是否真的编进去了(SCHAT_CALLS 门控)==="
           # Package.swift 以 libschat_core.a 是否存在决定链不链通话;交叉编译若让核心落到别处,
           # 会**静默**产出一个没有通话功能的包 —— 这里显式验一下符号在不在。
