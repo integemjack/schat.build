@@ -67,13 +67,14 @@ jobs:
           name: android
           path: out/*.apk
 
-  # Desktop packaging — replaces the deleted Electron client. mac 是原生 SwiftUI 客户端
-  # (desktop/macos, arm64 .dmg + 一键更新 .zip);Windows/Linux 是 Qt6/QML (desktop/desktop-qt,
-  # NSIS installer via MSYS2 / .deb + AppImage via Debian trixie)。三条腿都住在 REUSABLE
-  # qt-desktop.yml 里,在这里被调用
-  # so the combined release below bundles every desktop artifact (macos-swiftui(原生 SwiftUI mac 包) /
-  # qt-windows-x64 / qt-linux-{x86_64,aarch64,armhf}). Standalone `qt-desktop.yml` dispatch
-  # still runs the same build for desktop-only test artifacts.
+  # Desktop packaging — replaces the deleted Electron client. mac 有**两条并存的腿**:原生
+  # SwiftUI 苹果特效版(desktop/macos, arm64, macOS 14+)+ Qt/QML 通用兼容版(desktop/desktop-qt,
+  # arm64+x86_64, minos 12.0 → macOS 12/13+ 与 Intel);Windows/Linux 是 Qt6/QML(NSIS via MSYS2 /
+  # .deb + AppImage via Debian trixie)。四条腿都住在 REUSABLE qt-desktop.yml 里,在这里被调用,
+  # so the combined release below bundles every desktop artifact (macos-swiftui(SwiftUI mac 包) /
+  # qt-macos-universal(Qt 通用 mac 包) / qt-windows-x64 / qt-linux-{x86_64,aarch64,armhf})。
+  # release 靠 download-artifact merge-multiple 自动收录本次 run 的全部 artifact,故加一条腿
+  # 无需改 release job。Standalone `qt-desktop.yml` dispatch still runs the same build for tests.
   desktop:
     name: Desktop (mac SwiftUI / Win+Linux Qt)
     uses: ./.github/workflows/qt-desktop.yml
