@@ -158,8 +158,14 @@ jobs:
 
           echo "=== 断言:x86_64 + 无残留占位符 + 依赖可解析 ==="
           FAIL=0
-          if find /usr/local/Cellar -name '*.dylib' -type f -exec otool -L {} \; | grep -q '@@HOMEBREW'; then
-            echo "  ✗ 仍有未还原的 @@HOMEBREW_*@@ 占位符"; FAIL=1
+          # ⚠️ 绝不用 `… | grep -q X` —— 它一匹配上就退出并关掉管道,上游(find/otool/nm 这类
+          # 输出量大的)写入时吃 SIGPIPE 非零退出,`pipefail` 再把它当成整条管道的状态 ⇒
+          # **匹配成功反而被判为失败**。用在断言里就是「有问题时报告没问题」的假阴性。
+          # (run 29743553321 的「通话 ABI 符号缺失」就是这么来的:符号一直都在。)
+          # 一律改 `grep -c`(读到 EOF,无 SIGPIPE)+ 数字比较。
+          NLEFT=$(find /usr/local/Cellar -name '*.dylib' -type f -exec otool -L {} \; | grep -c '@@HOMEBREW' || true)
+          if [ "${NLEFT:-0}" -gt 0 ]; then
+            echo "  ✗ 仍有 $NLEFT 处未还原的 @@HOMEBREW_*@@ 占位符"; FAIL=1
           else
             echo "  ✓ 无残留占位符"
           fi
