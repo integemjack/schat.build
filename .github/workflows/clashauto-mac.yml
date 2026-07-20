@@ -238,7 +238,17 @@ jobs:
           DMG="dist/ClashAuto-${APP_VERSION}-macos-universal.dmg"
           test -f "$DMG"
           shasum -a 256 "$DMG" | awk '{print $1}' > "$DMG.sha256"
-          gh release create "$RELEASE_TAG" -R ClashrAuto/clashauto \
-            --title "$RELEASE_TAG" --notes "signed + notarized macOS build (built by schat.build)" 2>/dev/null || true
+          # 必须落到 clashauto CI 建的那个 release 上：name="Clash Auto <ver>" 且标记 latest。
+          # mac 客户端更新是 GET /releases/latest 读 tag_name、再从 latest 里挑 DMG——若这里
+          # 另建一个标题为 "v<ver>"、非 latest 的 release，签名包就不在客户端能取到的 latest 上。
+          if gh release view "$RELEASE_TAG" -R ClashrAuto/clashauto >/dev/null 2>&1; then
+            # 已存在（多半是 clashauto CI 先建好的 "Clash Auto <ver>"）：不改名字，只确保仍是 latest。
+            gh release edit "$RELEASE_TAG" -R ClashrAuto/clashauto --latest >/dev/null 2>&1 || true
+          else
+            # 尚未建：按与 clashauto CI 完全一致的命名新建，并显式标记 latest。
+            gh release create "$RELEASE_TAG" -R ClashrAuto/clashauto \
+              --title "Clash Auto ${APP_VERSION}" --latest \
+              --notes "signed + notarized macOS build (built by schat.build)"
+          fi
           gh release upload "$RELEASE_TAG" "$DMG" "$DMG.sha256" --clobber -R ClashrAuto/clashauto
-          echo "uploaded $DMG to ClashrAuto/clashauto @ ${RELEASE_TAG} (mac asset clobbered)"
+          echo "uploaded $DMG to ClashrAuto/clashauto release 'Clash Auto ${APP_VERSION}' (${RELEASE_TAG}, latest, mac asset clobbered)"
