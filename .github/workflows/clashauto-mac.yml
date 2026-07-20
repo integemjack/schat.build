@@ -173,13 +173,24 @@ jobs:
           done
           test -f "$APP/Contents/Clashr-Auto/config/config.yaml"
 
-          # Inside-out：先签 helper，再 --deep 签 app（硬化运行时 + 时间戳，公证必需）
+          # 签名（硬化运行时 + 时间戳，公证必需）。关键：helper 必须用显式 -i 指定
+          # identifier = com.yuehongsun.auto.helper（= launchd Label）。否则 codesign 会把可执行名
+          # com.yuehongsun.auto.helper 末尾的「.helper」当扩展名剥掉，得到 identifier=com.yuehongsun.auto，
+          # 与注册的 Label 不一致 → SMAppService daemon 一启动即被系统以 Launch Constraint Violation
+          # 用 SIGKILL 杀掉，核心永远无法以 root 运行（应用侧 XPC 报「Couldn't communicate with a
+          # helper application」并回退非 root）。
           HELPER="$APP/Contents/MacOS/com.yuehongsun.auto.helper"
-          codesign --force --options runtime --timestamp --sign "$SIGN_IDENTITY" "$HELPER"
+          HELPER_ID="com.yuehongsun.auto.helper"
+          # 1) --deep 一把签全（含 Qt frameworks）——但它会把 helper 的 identifier 又剥回 com.yuehongsun.auto
           codesign --force --deep --options runtime --timestamp --sign "$SIGN_IDENTITY" "$APP"
+          # 2) 用显式 -i 单独重签 helper 纠正 identifier（这会改 helper 的 cdhash）
+          codesign --force --options runtime --timestamp -i "$HELPER_ID" --sign "$SIGN_IDENTITY" "$HELPER"
+          # 3) helper 变了 → 外层 app 封存过期，浅签一次 app 重新封存 helper 的新 cdhash（不加 --deep，避免再剥）
+          codesign --force --options runtime --timestamp --sign "$SIGN_IDENTITY" "$APP"
           codesign --verify --deep --strict --verbose=2 "$APP" && echo "codesign verify OK"
           codesign --verify --strict --verbose=2 "$HELPER" && echo "helper codesign verify OK"
-          # 打印签名主体，便于核对 Team = 6AXTRT5TV4
+          # 核对 helper 的 identifier 必须 = com.yuehongsun.auto.helper（= Label），否则仍会被 Launch Constraint 杀
+          echo "helper identity:"; codesign -dvv "$HELPER" 2>&1 | grep -Ei 'Identifier|TeamIdentifier'
           codesign -dvv "$APP" 2>&1 | grep -Ei 'Authority|TeamIdentifier' || true
 
       - name: Create DMG + notarize + staple
