@@ -349,6 +349,52 @@ jobs:
           PY
           grep -n 'usr/local' scripts/package-app.sh || true
 
+      - name: Patch E — 压平 XCBuild 的嵌套资源 bundle
+        shell: bash
+        working-directory: desktop/macos
+        run: |
+          set -euo pipefail
+          # 多架构 `swift build --arch a --arch b` 会让 SwiftPM 切到 **XCBuild**
+          # (产物路径 .build/apple/…),而两套构建系统产出的**资源 bundle 布局不同**:
+          #   原生 SwiftPM : SecretChatMac_SecretChatMac.bundle/appicon.png        (扁平)
+          #   XCBuild      : SecretChatMac_SecretChatMac.bundle/Contents/Resources/appicon.png
+          # 而 Sources/…/Models/AppResources.swift 的查找只认「扁平」与「散放」两种形态,
+          # 不认嵌套 —— 所以这不只是打包断言的问题:不处理的话 universal 包在**运行时**
+          # 也找不到 notify.wav / appicon.png(按设计不崩,但提示音退回系统音、登录页图标
+          # 变占位)。package-app.sh 那条 `resource missing from bundle` 断言正是拦下这个的。
+          #
+          # 选择在**打包时压平**而不是改 AppResources:这样 .app 内的布局与现有 arm64 包
+          # 完全一致(运行时行为是已经验证过的),且只动一处。转生产时这段应回源码仓库的
+          # package-app.sh —— 它对「哪套构建系统产出的」保持中立,是正确的归一化位置。
+          # ⚠️ 注入的 shell 片段必须写在 YAML 块标量的缩进之内,再用 textwrap.dedent 还原 ——
+          # 直接把它顶格写在 python 三引号里会低于块标量缩进,YAML 当场认为块在那里结束(踩过)。
+          python3 - <<'PY'
+          import pathlib, sys, textwrap
+          p = pathlib.Path("scripts/package-app.sh")
+          s = p.read_text()
+          anchor = 'cp -R "$RES_BUNDLE" "$APP/Contents/Resources/"\n'
+          if s.count(anchor) != 1:
+              sys.exit(f"✗ 锚点未唯一匹配(count={s.count(anchor)}) —— 源码结构变了,请更新本 patch")
+          block = anchor + textwrap.dedent("""\
+              # 归一化资源 bundle 布局:XCBuild(多架构)产出嵌套的 Contents/Resources,
+              # 原生 SwiftPM(单架构)产出扁平 —— AppResources.swift 只认扁平,统一压平。
+              RB="$APP/Contents/Resources/$(basename "$RES_BUNDLE")"
+              echo "▸ 资源 bundle 布局(压平前):"; ls -1 "$RB" | head -10
+              if [ -d "$RB/Contents/Resources" ]; then
+                  echo "▸ 检测到 XCBuild 嵌套布局,压平 …"
+                  find "$RB/Contents/Resources" -mindepth 1 -maxdepth 1 -exec mv -f {} "$RB/" \\;
+                  if [ -f "$RB/Contents/Info.plist" ] && [ ! -f "$RB/Info.plist" ]; then
+                      mv -f "$RB/Contents/Info.plist" "$RB/"
+                  fi
+                  rm -rf "$RB/Contents"
+                  echo "▸ 资源 bundle 布局(压平后):"; ls -1 "$RB" | head -10
+              fi
+              """)
+          p.write_text(s.replace(anchor, block))
+          print("✓ package-app.sh 已插入资源 bundle 归一化")
+          PY
+          bash -n scripts/package-app.sh && echo "✓ package-app.sh 语法仍合法"
+
       - name: Build + assemble SChat.app (universal)
         shell: bash
         run: bash desktop/macos/scripts/package-app.sh
