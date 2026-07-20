@@ -90,46 +90,86 @@ jobs:
       - name: Install host build tools
         run: brew install cmake ninja pkg-config
 
-      # ── 1. 取 Intel(x86_64)bottle 并搭出 /usr/local/opt 前缀 ──────────────────────
-      - name: Fetch x86_64 Homebrew bottles → /usr/local/opt
+      # ── 1. 取 Intel(x86_64)bottle,还原成一套真实的 /usr/local Homebrew 布局 ──────
+      #
+      # ⚠️ 不走 `brew fetch --bottle-tag=` —— 实测(run 29742862534)它在 bottle 取不到时
+      # **仍返回 exit 0**,只打一条 warning「Bottle for tag :sonoma is unavailable」,导致
+      # 「先判成功、再拿到空路径」。改为直接读 formulae.brew.sh 的 JSON 拿 ghcr blob URL
+      # (匿名拉取的固定令牌 `Bearer QQ==`,Homebrew 自己也是这么干的)+ sha256 校验。
+      #
+      # ⚠️ bottle 里的 install_name 是**占位符**,不是真实路径:
+      #     id  : @@HOMEBREW_PREFIX@@/opt/opus/lib/libopus.0.dylib
+      #     dep : @@HOMEBREW_CELLAR@@/openssl@3/3.6.3/lib/libcrypto.3.dylib
+      # (bottle 是可重定位的,由 `brew install` 在安装时替换)。不还原的话链接器会把
+      # `@@HOMEBREW_PREFIX@@/...` 记进 load command,而 package-app.sh 的重写器与那条
+      # 收敛断言都只认 /opt/homebrew|/usr/local 开头 —— 匹配不到 ⇒ 不重写 ⇒ 断言照样绿 ⇒
+      # 产出一个装上必然 dyld 失败的包。所以这里照 brew 的口径逐字替换:
+      #     @@HOMEBREW_PREFIX@@ → /usr/local        @@HOMEBREW_CELLAR@@ → /usr/local/Cellar
+      # 并解到真 Cellar + 软链 opt/,与 Intel Mac 上真实 brew 安装的形态逐字节同构。
+      - name: Fetch x86_64 bottles → 还原 /usr/local Homebrew 布局
         shell: bash
         run: |
           set -euo pipefail
+          sudo mkdir -p /usr/local/Cellar /usr/local/opt
+          sudo chown -R "$(id -u)":"$(id -g)" /usr/local/Cellar /usr/local/opt
           mkdir -p "$INTEL_STAGE"
-          sudo mkdir -p /usr/local/opt
-          # 依赖清单 = Package.swift callLinkFlags 里的那五个 dylib 来源(openssl@3 出两个)。
+          # 依赖清单 = Package.swift callLinkFlags 里那五个 dylib 的来源(openssl@3 出两个)。
           for f in opus openh264 libsodium openssl@3; do
-            echo "▸ fetching $f (bottle-tag=$BOTTLE_TAG) …"
-            # 某些 formula 在个别 tag 下没有 bottle —— 依次退到更新的代号,全失败才报错。
-            TB=""
-            for tag in "$BOTTLE_TAG" sequoia sonoma; do
-              if brew fetch --force --bottle-tag="$tag" "$f" >/dev/null 2>&1; then
-                TB=$(brew --cache --bottle-tag="$tag" "$f")
-                echo "  ✓ tag=$tag → $TB"
-                break
-              fi
-              echo "  · tag=$tag 无 bottle,继续尝试"
-            done
-            [ -n "$TB" ] && [ -f "$TB" ] || { echo "✗ $f 取不到任何 x86_64 bottle" >&2; exit 1; }
-            tar -xzf "$TB" -C "$INTEL_STAGE"
-            # bottle 解出来是 <formula>/<version>/{lib,include,...};取那唯一的版本目录。
-            CELLAR=$(find "$INTEL_STAGE/$f" -maxdepth 1 -mindepth 1 -type d | sort -V | tail -1)
-            [ -n "$CELLAR" ] || { echo "✗ $f 解包后找不到版本目录" >&2; exit 1; }
-            sudo rm -rf "/usr/local/opt/$f"
-            sudo ln -sfn "$CELLAR" "/usr/local/opt/$f"
-            echo "  → /usr/local/opt/$f -> $CELLAR"
+            echo "▸ $f (bottle-tag=$BOTTLE_TAG) …"
+            API="https://formulae.brew.sh/api/formula/${f/@/%40}.json"
+            read -r URL SHA < <(curl -fsSL "$API" | python3 -c "
+          import json,sys,os
+          d=json.load(sys.stdin)
+          files=d['bottle']['stable']['files']
+          tag=os.environ['BOTTLE_TAG']
+          if tag not in files:
+              sys.exit(f'✗ 该 formula 没有 {tag} 的 x86_64 bottle;可用 tag: {sorted(files)}')
+          print(files[tag]['url'], files[tag]['sha256'])
+          ")
+            [ -n "$URL" ] || { echo "✗ $f 取不到 bottle URL" >&2; exit 1; }
+            TB="$INTEL_STAGE/$f.tar.gz"
+            curl -fsSL -H "Authorization: Bearer QQ==" -o "$TB" "$URL"
+            echo "$SHA  $TB" | shasum -a 256 -c - || { echo "✗ $f bottle sha256 不匹配" >&2; exit 1; }
+            # tarball 根就是 <formula>/<version>/… —— 直接解进 Cellar 即为真实布局。
+            tar -xzf "$TB" -C /usr/local/Cellar
+            V=$(find "/usr/local/Cellar/$f" -maxdepth 1 -mindepth 1 -type d | sort -V | tail -1)
+            [ -n "$V" ] || { echo "✗ $f 解包后找不到版本目录" >&2; exit 1; }
+            ln -sfn "$V" "/usr/local/opt/$f"
+            echo "  → /usr/local/opt/$f -> $V"
           done
-          echo "=== 断言:每个 dylib 都必须是 x86_64 ==="
+
+          echo "=== 还原 install_name 占位符(照 brew install 的口径)==="
+          find /usr/local/Cellar -name '*.dylib' -type f | while read -r d; do
+            ID=$(otool -D "$d" | tail -1)
+            N=${ID//@@HOMEBREW_PREFIX@@//usr/local}; N=${N//@@HOMEBREW_CELLAR@@//usr/local/Cellar}
+            [ "$N" = "$ID" ] || install_name_tool -id "$N" "$d" 2>/dev/null || true
+            otool -L "$d" | tail -n +2 | awk '{print $1}' | grep '@@HOMEBREW' | while read -r dep; do
+              ND=${dep//@@HOMEBREW_PREFIX@@//usr/local}; ND=${ND//@@HOMEBREW_CELLAR@@//usr/local/Cellar}
+              install_name_tool -change "$dep" "$ND" "$d" 2>/dev/null || true
+            done
+            # install_name_tool 会让原签名失效 —— 重新 ad-hoc 签,免得后续工具链挑刺。
+            codesign -f -s - "$d" >/dev/null 2>&1 || true
+          done
+
+          echo "=== 断言:x86_64 + 无残留占位符 + 依赖可解析 ==="
           FAIL=0
+          if find /usr/local/Cellar -name '*.dylib' -type f -exec otool -L {} \; | grep -q '@@HOMEBREW'; then
+            echo "  ✗ 仍有未还原的 @@HOMEBREW_*@@ 占位符"; FAIL=1
+          else
+            echo "  ✓ 无残留占位符"
+          fi
           for d in /usr/local/opt/opus/lib/libopus.dylib \
                    /usr/local/opt/openh264/lib/libopenh264.dylib \
                    /usr/local/opt/libsodium/lib/libsodium.dylib \
                    /usr/local/opt/openssl@3/lib/libssl.dylib \
                    /usr/local/opt/openssl@3/lib/libcrypto.dylib; do
-            if [ ! -f "$d" ]; then echo "✗ 缺失 $d"; FAIL=1; continue; fi
+            if [ ! -f "$d" ]; then echo "  ✗ 缺失 $d"; FAIL=1; continue; fi
             INFO=$(lipo -info "$d")
             echo "  $INFO"
-            case "$INFO" in *x86_64*) ;; *) echo "  ✗ 不是 x86_64!"; FAIL=1;; esac
+            case "$INFO" in *x86_64*) ;; *) echo "    ✗ 不是 x86_64!"; FAIL=1;; esac
+            # 每个非系统依赖都必须能在磁盘上解析到 —— 这是「装上能不能起来」的最早关口。
+            otool -L "$d" | tail -n +2 | awk '{print $1}' | grep -v '^/usr/lib/' | grep -v '^/System/' \
+              | while read -r p; do [ -f "$p" ] || echo "    ✗ 依赖解析不到: $p"; done
           done
           [ "$FAIL" = 0 ] || { echo "x86_64 依赖准备失败" >&2; exit 1; }
 
@@ -230,6 +270,37 @@ jobs:
           sed -i '' 's|-arm64\.zip|-x86_64.zip|'                     scripts/package-app.sh
           echo "=== patch 结果 ==="
           grep -n 'swift build\|'"$(basename "$BINPATH")"'\|x86_64\.zip' scripts/package-app.sh
+
+      - name: Patch D — package-app.sh 的 brew 路径模式在 /usr/local 下是漏的
+        shell: bash
+        working-directory: desktop/macos
+        run: |
+          set -euo pipefail
+          # package-app.sh 的 dylib 重写器与收敛断言用的模式是:
+          #     /opt/homebrew/  |  /usr/local/opt/
+          #        ↑ 宽(连 Cellar 一起吃)     ↑ 窄(吃不到 /usr/local/Cellar/)
+          # 而 brew 把库间依赖写成 Cellar 路径(实测本机 arm64:libssl 依赖
+          # /opt/homebrew/Cellar/openssl@3/3.6.2/lib/libcrypto.3.dylib)。arm64 一直没事
+          # 纯粹是走了宽的那一支;/usr/local 前缀下 libcrypto 会被漏掉 —— 不被拷进
+          # Frameworks、不被改 install name,而断言用的是同一个窄模式所以照样绿 ⇒
+          # 又一个「CI 全绿、装上 dyld 失败」。这里把窄的那支放宽到 /usr/local/。
+          #
+          # ⚠️ 这不是本 CI 特有的问题,是 package-app.sh 对**任何 /usr/local 前缀主机**
+          # (即所有 Intel Mac 上的本地打包)都存在的既有缺陷 —— 试验通过后应回源码仓库修。
+          python3 - <<'PY'
+          import pathlib, sys
+          p = pathlib.Path("scripts/package-app.sh")
+          s = p.read_text()
+          awk_old,  awk_new  = r"\/usr\/local\/opt\/", r"\/usr\/local\/"   # awk 正则里的转义形态
+          grep_old, grep_new = "/usr/local/opt/",      "/usr/local/"       # grep -E 里的裸形态
+          n1, n2 = s.count(awk_old), s.count(grep_old)
+          if (n1, n2) != (1, 2):
+              sys.exit(f"✗ 模式出现次数不符(期望 awk=1 grep=2,实得 awk={n1} grep={n2}) —— 源码结构变了,请更新本 patch")
+          s = s.replace(awk_old, awk_new).replace(grep_old, grep_new)
+          p.write_text(s)
+          print("✓ package-app.sh 路径模式已放宽")
+          PY
+          grep -n 'usr/local' scripts/package-app.sh
 
       - name: Build + assemble SChat.app (x86_64)
         shell: bash
