@@ -1,0 +1,418 @@
+name: macOS Universal Trial
+
+# 【试验性 / 不发 release / 不进 Build All】
+# 产出 desktop/macos(SwiftUI 线)的 **Universal2(arm64 + x86_64)** .app。
+# 前身是 macos-amd64-trial.yml —— 那一轮已证明 x86_64 交叉编译完全可行
+# (run 29744193964/29744652692 全绿:核心五个 .a、可执行文件、五个内嵌 dylib 全 x86_64,
+# 通话核心完整链入,符号数与 arm64 基线逐项一致)。本工作流在其上合成 universal。
+#
+# ── 为什么 universal 而不是两个独立包 ────────────────────────────────────────────────
+# 难点(拿到 x86_64 的 C++ 核心与四个依赖)两条路完全相同,universal 只是多一次 lipo;
+# 而两个独立资产会给更新器新增一条 arch 挑选轴,挑错 = 把用户的 app 换成跑不起来的二进制。
+# 客户端侧零改动:UpdaterMac.pickAsset 早已让名字含 `universal` 的资产豁免 arch 匹配。
+#
+# ── 依赖:两个架构都从 ghcr 取 bottle,lipo 前先统一 install_name ────────────────────
+# ⚠️ **不能**拿「runner 上 brew install 的 arm64」去和「下载的 x86_64 bottle」lipo:
+# fat Mach-O 的每个 slice **各自保留 LC_ID_DYLIB**,前者 id 是 /opt/homebrew/…、后者是
+# /usr/local/… ⇒ 两片互相矛盾;链接器按目标架构记录各自那个,而 package-app.sh 的
+# `otool -L` 默认只报宿主架构那一片 ⇒ 只有一片被重写,另一片装上必然 dyld 失败,
+# 且所有断言照样绿。故两个架构一律从 ghcr 下 bottle(版本一致、处理一致),各自把
+# install_name 占位符还原到**同一组** /usr/local/… 目标之后再 lipo。
+#
+# ⚠️ bottle 里的 install_name 是占位符不是真实路径(@@HOMEBREW_PREFIX@@ /
+# @@HOMEBREW_CELLAR@@,由 brew install 在安装时替换)。不还原 ⇒ 链接器把 @@…@@ 记进
+# load command ⇒ package-app.sh 的重写器与收敛断言都匹配不到 ⇒ 断言照样绿 ⇒ 产出
+# 装上必然 dyld 失败的包。
+#
+# ── 核心库:两趟单架构 + lipo,不用单趟 CMAKE_OSX_ARCHITECTURES="arm64;x86_64" ──────
+# 两趟的每一趟都是**已经验证过绿**的配置(arm64 = 生产在跑,x86_64 = 前一轮试验),
+# 失败可隔离可诊断;单趟多架构下某个子工程若自己覆写 CMAKE_OSX_ARCHITECTURES,会**静默**
+# 产出瘦归档。代价只是核心构建时间 ×2。
+#
+# ── 对源码仓库的改动:零 ────────────────────────────────────────────────────────────
+# 四处在 runner 上就地 patch(一次性,不回流源仓),每处带断言,源码结构一变当场失败:
+#   A. Package.swift  : brewOpt 的 /opt/homebrew/opt 优先探测 → 钉死 /usr/local/opt
+#   B. core/CMakeLists: APPLE 分支的 `brew --prefix` → PATH 插 shim 重定向到 /usr/local/opt
+#   C. package-app.sh : swift build 加 --arch arm64 --arch x86_64;.build/release → 实际
+#                       bin 路径;产物名 -arm64 → -universal
+#   D. package-app.sh : brew 路径模式 /usr/local/opt/ 放宽到 /usr/local/ —— 绕过一个
+#                       **既有缺陷**(不是本 CI 特有),详见该步注释,试验通过后应回源仓修
+#
+# ── 断言铁律(两条都是本试验踩出来的)────────────────────────────────────────────────
+#   1. 断言里绝不用 `… | grep -q X`:grep -q 一匹配上就退出并关管道,上游(nm/find/otool
+#      这类输出量大的)吃 SIGPIPE 非零退出,pipefail 再把它当成整条管道的状态 ⇒ **匹配成功
+#      反而判失败**。用在断言上就是「有问题时报告没问题」。一律 `grep -c` + 数字比较。
+#   2. `set -euo pipefail` 下可空匹配的 grep 必须先落变量 + `|| true`,绝不直接接管道。
+#
+# ── 判定标准 ────────────────────────────────────────────────────────────────────────
+# 每一层都断言**两个架构都在**(核心 .a / 可执行文件 / 内嵌 dylib),通话核心两片都要有符号。
+# CI 绿 ≠ 能跑:真机启动/TLS/通话/扫码仍需 Intel + Apple Silicon 两台实测
+# (qt 线的教训:构建期全绿、装上秒崩的坑一次踩了四个)。
+#
+# 签名:只有 package-app.sh 的 ad-hoc 签名,不导入 Developer ID、不公证 —— 试验产物不分发。
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Ireoo/Secret-Chat 的分支或标签"
+        required: false
+        default: "main"
+      bottle_tag:
+        description: "bottle 的 macOS 代号(会同时取 <tag> 与 arm64_<tag>):sonoma=14 / sequoia=15"
+        required: false
+        default: "sonoma"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: macos-universal-trial-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  SRC_REPO: Ireoo/Secret-Chat
+  SRC_REF: ${{ inputs.ref || 'main' }}
+  BOTTLE_TAG: ${{ inputs.bottle_tag || 'sonoma' }}
+  # GitHub runner 直连 github.com — 跳过 fetch_deps.sh 默认的 gh-proxy 国内镜像。
+  SCHAT_GH_MIRROR: https://github.com
+  SCHAT_RAW_MIRROR: https://raw.githubusercontent.com
+  BOTTLE_STAGE: /tmp/bottles
+
+jobs:
+  macos-universal:
+    name: macOS SwiftUI (universal trial)
+    # 与 qt-desktop.yml 的 mac 腿同镜像:macos-26/Xcode 26 = 本地开发同代工具链。
+    # arm64 runner;x86_64 那半是交叉编译出来的(GitHub 已退役 Intel runner)。
+    runs-on: macos-26
+    timeout-minutes: 120
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          repository: Ireoo/Secret-Chat
+          ref: ${{ env.SRC_REF }}
+          token: ${{ secrets.SRC_REPO_TOKEN }}
+
+      - name: Select Xcode 26 (match local toolchain)
+        shell: bash
+        run: |
+          set -euo pipefail
+          XC=$(ls -d /Applications/Xcode_26*.app 2>/dev/null | sort -V | tail -1 || true)
+          if [ -n "$XC" ]; then sudo xcode-select -s "$XC"; fi
+          xcodebuild -version
+          swift --version
+          echo "host arch: $(uname -m)"
+
+      - name: Install host build tools
+        run: brew install cmake ninja pkg-config
+
+      # ── 1. 两个架构的 bottle → 统一 install_name → lipo 成 universal /usr/local 布局 ──
+      - name: Fetch both-arch bottles → universal /usr/local layout
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo mkdir -p /usr/local/Cellar /usr/local/opt
+          sudo chown -R "$(id -u)":"$(id -g)" /usr/local/Cellar /usr/local/opt
+          rm -rf "$BOTTLE_STAGE"; mkdir -p "$BOTTLE_STAGE/x86_64"
+
+          # 把一棵解包好的 bottle 树里所有 dylib 的 install_name 占位符还原成真实 /usr/local 路径。
+          # 两个架构都调用它 ⇒ 两片的 id / 依赖引用完全一致 ⇒ lipo 后自洽。
+          relocate_tree() {   # $1 = 树根
+            find "$1" -name '*.dylib' -type f | while read -r d; do
+              ID=$(otool -D "$d" | tail -1)
+              N=${ID//@@HOMEBREW_PREFIX@@//usr/local}; N=${N//@@HOMEBREW_CELLAR@@//usr/local/Cellar}
+              [ "$N" = "$ID" ] || install_name_tool -id "$N" "$d" 2>/dev/null || true
+              DEPS=$(otool -L "$d" | tail -n +2 | awk '{print $1}' | grep '@@HOMEBREW' || true)
+              for dep in $DEPS; do
+                ND=${dep//@@HOMEBREW_PREFIX@@//usr/local}; ND=${ND//@@HOMEBREW_CELLAR@@//usr/local/Cellar}
+                install_name_tool -change "$dep" "$ND" "$d" 2>/dev/null || true
+              done
+            done
+          }
+
+          # 依赖清单 = Package.swift callLinkFlags 里那五个 dylib 的来源(openssl@3 出两个)。
+          for f in opus openh264 libsodium openssl@3; do
+            echo "▸ $f …"
+            API="https://formulae.brew.sh/api/formula/${f/@/%40}.json"
+            META=$(curl -fsSL "$API")
+            for slot in arm64 x86_64; do
+              if [ "$slot" = arm64 ]; then TAG="arm64_${BOTTLE_TAG}"; else TAG="${BOTTLE_TAG}"; fi
+              read -r URL SHA < <(printf '%s' "$META" | TAG="$TAG" python3 -c "
+          import json,sys,os
+          d=json.load(sys.stdin)
+          files=d['bottle']['stable']['files']
+          tag=os.environ['TAG']
+          if tag not in files:
+              sys.exit(f'没有 {tag} 的 bottle;可用: {sorted(files)}')
+          print(files[tag]['url'], files[tag]['sha256'])
+          ")
+              [ -n "$URL" ] || { echo "✗ $f/$TAG 取不到 bottle URL" >&2; exit 1; }
+              TB="$BOTTLE_STAGE/$f-$slot.tar.gz"
+              curl -fsSL -H "Authorization: Bearer QQ==" -o "$TB" "$URL"
+              echo "$SHA  $TB" | shasum -a 256 -c - >/dev/null \
+                || { echo "✗ $f/$TAG bottle sha256 不匹配" >&2; exit 1; }
+              # arm64 那份解进真 Cellar(它同时提供 headers/pkgconfig);x86_64 解到 staging 只取 dylib。
+              if [ "$slot" = arm64 ]; then tar -xzf "$TB" -C /usr/local/Cellar
+              else                         tar -xzf "$TB" -C "$BOTTLE_STAGE/x86_64"; fi
+            done
+
+            VA=$(basename "$(find "/usr/local/Cellar/$f"    -maxdepth 1 -mindepth 1 -type d | sort -V | tail -1)")
+            VX=$(basename "$(find "$BOTTLE_STAGE/x86_64/$f" -maxdepth 1 -mindepth 1 -type d | sort -V | tail -1)")
+            [ -n "$VA" ] && [ -n "$VX" ] || { echo "✗ $f 解包后找不到版本目录" >&2; exit 1; }
+            # 版本必须一致,否则 lipo 出来的两片是不同版本的库(ABI/符号可能对不上)。
+            [ "$VA" = "$VX" ] || { echo "✗ $f 两架构版本不一致: arm64=$VA x86_64=$VX" >&2; exit 1; }
+            ln -sfn "/usr/local/Cellar/$f/$VA" "/usr/local/opt/$f"
+
+            relocate_tree "/usr/local/Cellar/$f/$VA"
+            relocate_tree "$BOTTLE_STAGE/x86_64/$f/$VX"
+
+            # 逐个 dylib 合成 universal(两片 install_name 已统一,合出来自洽)。
+            find "/usr/local/Cellar/$f/$VA" -name '*.dylib' -type f | while read -r d; do
+              REL=${d#/usr/local/Cellar/$f/$VA/}
+              X="$BOTTLE_STAGE/x86_64/$f/$VX/$REL"
+              if [ ! -f "$X" ]; then echo "    · 无 x86_64 对应物,跳过: $REL"; continue; fi
+              lipo -create "$d" "$X" -output "$d.uni" && mv -f "$d.uni" "$d"
+              codesign -f -s - "$d" >/dev/null 2>&1 || true
+            done
+            echo "  → /usr/local/opt/$f -> Cellar/$f/$VA (universal)"
+          done
+
+          echo "=== 断言:两架构俱全 + 无残留占位符 + 依赖可解析 ==="
+          FAIL=0
+          # ⚠️ 绝不用 `… | grep -q`(见文件头铁律 1);一律 grep -c + 数字比较。
+          NLEFT=$(find /usr/local/Cellar -name '*.dylib' -type f -exec otool -L {} \; | grep -c '@@HOMEBREW' || true)
+          if [ "${NLEFT:-0}" -gt 0 ]; then echo "  ✗ 仍有 $NLEFT 处未还原的占位符"; FAIL=1
+          else echo "  ✓ 无残留占位符"; fi
+          for d in /usr/local/opt/opus/lib/libopus.dylib \
+                   /usr/local/opt/openh264/lib/libopenh264.dylib \
+                   /usr/local/opt/libsodium/lib/libsodium.dylib \
+                   /usr/local/opt/openssl@3/lib/libssl.dylib \
+                   /usr/local/opt/openssl@3/lib/libcrypto.dylib; do
+            if [ ! -f "$d" ]; then echo "  ✗ 缺失 $d"; FAIL=1; continue; fi
+            INFO=$(lipo -info "$d")
+            echo "  $INFO"
+            case "$INFO" in *arm64*)  ;; *) echo "    ✗ 缺 arm64!";  FAIL=1;; esac
+            case "$INFO" in *x86_64*) ;; *) echo "    ✗ 缺 x86_64!"; FAIL=1;; esac
+            for a in arm64 x86_64; do
+              REFS=$(otool -arch "$a" -L "$d" | tail -n +2 | awk '{print $1}' \
+                     | grep -v '^/usr/lib/' | grep -v '^/System/' || true)
+              for p in $REFS; do [ -f "$p" ] || { echo "    ✗ [$a] 依赖解析不到: $p"; FAIL=1; }; done
+            done
+          done
+          [ "$FAIL" = 0 ] || { echo "universal 依赖准备失败" >&2; exit 1; }
+
+      # ── 2. 就地 patch(带断言,匹配不到就失败)────────────────────────────────────
+      - name: Patch A — Package.swift 钉死 /usr/local/opt
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import re, pathlib, sys
+          p = pathlib.Path("desktop/macos/Package.swift")
+          s = p.read_text()
+          pat = (r'let brewOpt = FileManager\.default\.fileExists\(atPath: "/opt/homebrew/opt"\)'
+                 r' \? "/opt/homebrew/opt"\s*\n\s*: "/usr/local/opt"')
+          s2, n = re.subn(pat, 'let brewOpt = "/usr/local/opt"  // CI universal trial: 钉死 universal 前缀', s)
+          if n != 1:
+              sys.exit(f"✗ brewOpt 未匹配到(源码结构变了?)matches={n} —— 请更新本 patch")
+          p.write_text(s2)
+          print("✓ Package.swift patched")
+          PY
+          grep -n 'brewOpt' desktop/macos/Package.swift || true
+
+      - name: Patch B — brew shim(把 --prefix 重定向到 /usr/local/opt)
+        shell: bash
+        run: |
+          set -euo pipefail
+          # core/CMakeLists.txt 的 APPLE 分支用 `brew --prefix opus|openh264|libsodium` 定位依赖,
+          # 顶层 CMakeLists 用 `brew --prefix openssl@3`。真 brew 在 arm64 runner 上一律返回
+          # /opt/homebrew/opt(瘦 arm64)—— 会让 x86_64 那趟链不到东西。插一层 shim 拦掉。
+          mkdir -p /tmp/brewshim
+          cat > /tmp/brewshim/brew <<'SH'
+          #!/usr/bin/env bash
+          # universal trial shim:仅拦 `brew --prefix <formula>`,其余原样转发给真 brew。
+          if [ "${1:-}" = "--prefix" ] && [ -n "${2:-}" ]; then
+            echo "/usr/local/opt/$2"; exit 0
+          fi
+          exec /opt/homebrew/bin/brew "$@"
+          SH
+          chmod +x /tmp/brewshim/brew
+          echo "/tmp/brewshim" >> "$GITHUB_PATH"
+          echo "shim self-test: $(/tmp/brewshim/brew --prefix opus)"
+
+      # ── 3. 构建 ──────────────────────────────────────────────────────────────────
+      - name: Fetch third-party deps (libdatachannel source + single headers)
+        working-directory: desktop/desktop-qt
+        run: bash third_party/fetch_deps.sh
+
+      - name: Build call core twice (arm64 + x86_64) → lipo into build/
+        shell: bash
+        run: |
+          set -euo pipefail
+          QT="$PWD/desktop/desktop-qt"
+          # 两趟单架构而不是单趟多架构 —— 理由见文件头。配置项与 build-core.sh 保持一致
+          # (Debug + SCHAT_BUILD_APP=OFF),只多钉 arch / 部署目标 / universal 的 OpenSSL 前缀。
+          for A in arm64 x86_64; do
+            echo "▸▸▸ 构建核心 ($A) …"
+            cmake -S "$QT" -B "$QT/build-$A" \
+              -DCMAKE_BUILD_TYPE=Debug -DSCHAT_BUILD_APP=OFF \
+              -DCMAKE_OSX_ARCHITECTURES="$A" -DCMAKE_OSX_DEPLOYMENT_TARGET=14.0 \
+              -DOPENSSL_ROOT_DIR=/usr/local/opt/openssl@3 >/dev/null
+            cmake --build "$QT/build-$A" --target schat_core -j"$(sysctl -n hw.ncpu)"
+          done
+          # Package.swift 写死 coreBuild = ../desktop-qt/build,故把 lipo 结果放回那些路径。
+          LIBS="core/libschat_core.a
+          third_party/libdatachannel/libdatachannel-static.a
+          third_party/libdatachannel/deps/usrsctp/usrsctplib/libusrsctp.a
+          third_party/libdatachannel/deps/libsrtp/libsrtp2.a
+          third_party/libdatachannel/deps/libjuice/libjuice-static.a"
+          echo "▸▸▸ lipo → build/ …"
+          for rel in $LIBS; do
+            A="$QT/build-arm64/$rel"; X="$QT/build-x86_64/$rel"
+            [ -f "$A" ] || { echo "✗ 缺 arm64 产物: $rel" >&2; exit 1; }
+            [ -f "$X" ] || { echo "✗ 缺 x86_64 产物: $rel" >&2; exit 1; }
+            mkdir -p "$(dirname "$QT/build/$rel")"
+            lipo -create "$A" "$X" -output "$QT/build/$rel"
+            echo "  ✓ $rel"
+          done
+
+      - name: Verify core libs are universal
+        shell: bash
+        run: |
+          set -euo pipefail
+          B="$PWD/desktop/desktop-qt/build"
+          FAIL=0
+          for f in core/libschat_core.a \
+                   third_party/libdatachannel/libdatachannel-static.a \
+                   third_party/libdatachannel/deps/usrsctp/usrsctplib/libusrsctp.a \
+                   third_party/libdatachannel/deps/libsrtp/libsrtp2.a \
+                   third_party/libdatachannel/deps/libjuice/libjuice-static.a; do
+            INFO=$(lipo -info "$B/$f" 2>&1 || echo "MISSING")
+            echo "  $f: $INFO"
+            case "$INFO" in *arm64*)  ;; *) echo "    ✗ 缺 arm64!";  FAIL=1;; esac
+            case "$INFO" in *x86_64*) ;; *) echo "    ✗ 缺 x86_64!"; FAIL=1;; esac
+          done
+          [ "$FAIL" = 0 ] || { echo "核心库不是 universal" >&2; exit 1; }
+
+      # ⚠️ Patch C 必须排在核心库构建**之后**:Package.swift 的 callsAvailable 靠探测
+      # libschat_core.a 是否存在决定链不链通话,而 SwiftPM 会**缓存 manifest 求值结果**
+      # (缓存键只看 manifest 内容 + 工具链,不看它查过的文件系统)。核心库还没编出来就先跑
+      # 一次 swift(哪怕只是 --show-bin-path),会把 callsAvailable=false 焊进缓存,之后真正
+      # 构建时复用 → 静默产出**没有通话功能**的包。故:先编核心,再问路径,再打包;
+      # 并一律带 --manifest-cache none 双保险。
+      - name: Patch C — package-app.sh 出 universal + 产物改名
+        shell: bash
+        working-directory: desktop/macos
+        run: |
+          set -euo pipefail
+          # 多架构构建时 SwiftPM 的产物不在 .build/release —— 不硬编路径,直接问它要。
+          BINPATH=$(swift build -c release --arch arm64 --arch x86_64 --manifest-cache none --show-bin-path)
+          echo "universal bin path: $BINPATH"
+          [ -n "$BINPATH" ] || { echo "✗ --show-bin-path 返回空" >&2; exit 1; }
+          grep -q 'swift build -c release' scripts/package-app.sh || { echo "✗ 找不到 swift build 行"; exit 1; }
+          grep -q '\.build/release' scripts/package-app.sh          || { echo "✗ 找不到 .build/release"; exit 1; }
+          grep -q -- '-arm64\.zip' scripts/package-app.sh           || { echo "✗ 找不到 -arm64.zip"; exit 1; }
+          sed -i '' 's|swift build -c release$|swift build -c release --arch arm64 --arch x86_64 --manifest-cache none|' scripts/package-app.sh
+          sed -i '' "s|\.build/release|${BINPATH}|g"                 scripts/package-app.sh
+          sed -i '' 's|-arm64\.zip|-universal.zip|'                  scripts/package-app.sh
+          echo "=== patch 结果 ==="
+          grep -n 'swift build\|universal\.zip' scripts/package-app.sh || true
+
+      - name: Patch D — package-app.sh 的 brew 路径模式在 /usr/local 下是漏的
+        shell: bash
+        working-directory: desktop/macos
+        run: |
+          set -euo pipefail
+          # package-app.sh 的 dylib 重写器与收敛断言用的模式是:
+          #     /opt/homebrew/  |  /usr/local/opt/
+          #        ↑ 宽(连 Cellar 一起吃)     ↑ 窄(吃不到 /usr/local/Cellar/)
+          # 而 brew 把库间依赖写成 Cellar 路径(实测 arm64:libssl 依赖
+          # /opt/homebrew/Cellar/openssl@3/3.6.2/lib/libcrypto.3.dylib)。arm64 一直没事纯粹
+          # 是走了宽的那一支;/usr/local 前缀下 libcrypto 会被漏拷、不改 install name,而断言
+          # 用的是同一个窄模式所以照样绿 ⇒ 又一个「CI 全绿、装上 dyld 失败」。放宽窄的那支。
+          #
+          # ⚠️ 这不是本 CI 特有的问题,是 package-app.sh 对**任何 /usr/local 前缀主机**
+          # (即所有 Intel Mac 上的本地打包)都存在的既有缺陷 —— 试验通过后应回源码仓库修。
+          python3 - <<'PY'
+          import pathlib, sys
+          p = pathlib.Path("scripts/package-app.sh")
+          s = p.read_text()
+          awk_old,  awk_new  = r"\/usr\/local\/opt\/", r"\/usr\/local\/"   # awk 正则里的转义形态
+          grep_old, grep_new = "/usr/local/opt/",      "/usr/local/"       # grep -E 里的裸形态
+          n1, n2 = s.count(awk_old), s.count(grep_old)
+          if (n1, n2) != (1, 2):
+              sys.exit(f"✗ 模式出现次数不符(期望 awk=1 grep=2,实得 awk={n1} grep={n2}) —— 源码结构变了,请更新本 patch")
+          s = s.replace(awk_old, awk_new).replace(grep_old, grep_new)
+          p.write_text(s)
+          print("✓ package-app.sh 路径模式已放宽")
+          PY
+          grep -n 'usr/local' scripts/package-app.sh || true
+
+      - name: Build + assemble SChat.app (universal)
+        shell: bash
+        run: bash desktop/macos/scripts/package-app.sh
+
+      # ── 4. 判定 ──────────────────────────────────────────────────────────────────
+      - name: Verify .app is universal (both slices)
+        shell: bash
+        working-directory: desktop/macos
+        run: |
+          set -euo pipefail
+          APP="dist/SChat.app"
+          [ -d "$APP" ] || { echo "✗ package-app.sh 没产出 $APP"; exit 1; }
+          B="$APP/Contents/MacOS/SecretChatMac"
+          FAIL=0
+          echo "=== 可执行文件 ==="
+          INFO=$(lipo -info "$B"); echo "  $INFO"
+          case "$INFO" in *arm64*)  ;; *) echo "  ✗ 缺 arm64!";  FAIL=1;; esac
+          case "$INFO" in *x86_64*) ;; *) echo "  ✗ 缺 x86_64!"; FAIL=1;; esac
+          echo "=== 内嵌 dylib ==="
+          for f in "$APP/Contents/Frameworks"/*.dylib; do
+            [ -e "$f" ] || continue
+            INFO=$(lipo -info "$f"); echo "  $INFO"
+            case "$INFO" in *arm64*)  ;; *) echo "    ✗ 缺 arm64!";  FAIL=1;; esac
+            case "$INFO" in *x86_64*) ;; *) echo "    ✗ 缺 x86_64!"; FAIL=1;; esac
+          done
+          # ⚠️ 残留路径 / 符号都必须**逐 slice** 查:otool/nm 默认只报宿主架构那一片,
+          # 只查默认片正是「一片好、一片坏」这类 bug 的藏身处。
+          echo "=== 残留 brew 绝对路径(逐 slice,应为空)==="
+          for a in arm64 x86_64; do
+            N=$(otool -arch "$a" -L "$B" "$APP/Contents/Frameworks"/*.dylib 2>/dev/null \
+                | grep -c -E "/opt/homebrew/|/usr/local/" || true)
+            if [ "${N:-0}" -gt 0 ]; then
+              echo "  ✗ [$a] 仍有 $N 处 brew 路径"; FAIL=1
+              otool -arch "$a" -L "$B" "$APP/Contents/Frameworks"/*.dylib 2>/dev/null \
+                | grep -E "/opt/homebrew/|/usr/local/" | head -5 || true
+            else
+              echo "  ✓ [$a] 收敛干净"
+            fi
+          done
+          echo "=== 通话核心是否两片都链入(SCHAT_CALLS 门控)==="
+          # 基线(本机 arm64 生产包 + 前一轮 x86_64 试验包一致):schat_call_* 107 个 / 外部 T 17 个。
+          for a in arm64 x86_64; do
+            NCALL=$(nm -arch "$a" "$B" 2>/dev/null | grep -c 'schat_call_'  || true)
+            NGRP=$(nm  -arch "$a" "$B" 2>/dev/null | grep -c 'schat_group_' || true)
+            echo "  [$a] schat_call_*: ${NCALL:-0}   schat_group_*: ${NGRP:-0}"
+            [ "${NCALL:-0}" -gt 0 ] || { echo "    ✗ [$a] 通话核心缺失 —— 该片被静默降级"; FAIL=1; }
+          done
+          codesign --verify --deep --strict --verbose=2 "$APP" && echo "codesign(ad-hoc) verify OK"
+          [ "$FAIL" = 0 ] || exit 1
+          ls -la dist
+
+      # always():验证不过时**照样**上传 —— 试验阶段那个包本身就是最好的诊断材料,
+      # 而且有 Intel Mac 可以直接拿去实测(CI 的断言只是代理指标,不是最终判据)。
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: macos-swiftui-universal-trial
+          path: desktop/macos/dist/*.zip
+          if-no-files-found: warn
+
+      - name: Summary
+        if: always()
+        shell: bash
+        run: |
+          echo "本工作流只验证「编得出 / 链得上 / 两片架构都在」。" >> "$GITHUB_STEP_SUMMARY"
+          echo "**未**验证:真机启动、TLS、通话、扫码 —— 需 Intel + Apple Silicon 两台实测" >> "$GITHUB_STEP_SUMMARY"
+          echo "(qt 线有过「CI 全绿、装上秒崩」的四连坑先例)。" >> "$GITHUB_STEP_SUMMARY"
