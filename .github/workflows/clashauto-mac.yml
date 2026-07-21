@@ -7,6 +7,11 @@
 name: clashauto macOS (signed)
 
 on:
+  # 向本分支(clashauto-mac)推提交即触发——clashauto 仓库 push 到 master 后，其 CI 会用
+  # PAT 向这里推一个空提交来触发本次 mac 打包（inputs.ref 为空 → 下方 checkout 回退到
+  # clashauto 的 master，即刚发布的 release commit）。保留 workflow_dispatch 供手动指定 ref。
+  push:
+    branches: [clashauto-mac]
   workflow_dispatch:
     inputs:
       ref:
