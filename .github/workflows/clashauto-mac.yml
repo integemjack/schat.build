@@ -158,7 +158,10 @@ jobs:
         run: |
           set -euo pipefail
           APP="$BUILD_DIR/Clash Auto.app"
-          "$QT_ROOT/bin/macdeployqt" "$APP" -verbose=1
+          # QML 前端：必须 -qmldir 指向 .qml 源目录，macdeployqt 才会把 Qt Quick 运行时
+          # (Qt6Quick / QtQuick.Controls[Basic] / Layouts / Templates / Window 插件) 部署进 bundle，
+          # 否则签名包因缺 QML 运行时无法启动。
+          "$QT_ROOT/bin/macdeployqt" "$APP" -qmldir="clashauto-c++/qml" -verbose=1
 
           # 重新嵌入特权 helper 与 launchd plist（macdeployqt 之后，避免被改）
           mkdir -p "$APP/Contents/Library/LaunchDaemons"
