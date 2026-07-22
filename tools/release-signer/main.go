@@ -341,7 +341,10 @@ func main() {
 	sigKey := envOr("RELEASE_SIG_KEY", "official-current")
 	notes := os.Getenv("RELEASE_NOTES")
 	uploadURL := envOr("UPDATE_UPLOAD_URL", "https://jiami.chat/desktop/releases/upload")
-	token := os.Getenv("RELEASE_UPLOAD_TOKEN")
+	// TrimSpace: a GitHub Actions secret pasted with a trailing newline would otherwise be sent
+	// as `Bearer <token>\n`. The server trims the received value so this is usually harmless, but
+	// normalize here too so both ends agree regardless of how each secret was entered.
+	token := strings.TrimSpace(os.Getenv("RELEASE_UPLOAD_TOKEN"))
 
 	publishedAt := time.Now().UnixMilli()
 	if s := strings.TrimSpace(os.Getenv("RELEASE_PUBLISHED_AT")); s != "" {
@@ -405,7 +408,7 @@ func main() {
 	}
 
 	// 2. upload each asset (best-effort; one failure never aborts the run).
-	uploaded, failed := 0, 0
+	uploaded, failed, unauthorized, tooLarge := 0, 0, 0, 0
 	if token == "" {
 		fmt.Printf("[release-signer] RELEASE_UPLOAD_TOKEN empty — skipping HTTP upload, writing manifest only\n")
 	} else {
@@ -413,11 +416,34 @@ func main() {
 		for _, a := range assets {
 			if err := uploadAsset(client, uploadURL, token, a); err != nil {
 				failed++
-				fmt.Printf("[release-signer] UPLOAD FAIL %s → %s/%s/%s/%s: %v\n", a.Name, a.Line, a.OS, a.Arch, a.Format, err)
+				msg := err.Error()
+				var hint string
+				switch {
+				case strings.Contains(msg, "HTTP 401"), strings.Contains(msg, "HTTP 403"):
+					unauthorized++
+					// The server rejected the Bearer token. This is NOT a signing problem —
+					// align RELEASE_UPLOAD_TOKEN (this run) with the server's
+					// CHATSERVER_RELEASE_UPLOAD_TOKEN (byte-exact), then redeploy the server.
+					hint = " [hint: token mismatch — CI RELEASE_UPLOAD_TOKEN != server CHATSERVER_RELEASE_UPLOAD_TOKEN (or server token unset); GitHub-manifest fallback still covers this asset]"
+				case strings.Contains(msg, "HTTP 413"):
+					tooLarge++
+					// The body was rejected before reaching the server (an <html> error page,
+					// not the server's JSON too_large) — a CDN/reverse-proxy request-body cap
+					// (Cloudflare Free/Pro = 100 MiB). Assets over the cap can't be POSTed through
+					// it; they stay on the signed GitHub-release mirror, which is still verified.
+					hint = fmt.Sprintf(" [hint: %.1f MiB exceeds the CDN/proxy request-body cap (Cloudflare = 100 MiB); this asset falls back to the signed GitHub mirror]", float64(a.Size)/(1<<20))
+				}
+				fmt.Printf("[release-signer] UPLOAD FAIL %s → %s/%s/%s/%s: %v%s\n", a.Name, a.Line, a.OS, a.Arch, a.Format, err, hint)
 				continue
 			}
 			uploaded++
 			fmt.Printf("[release-signer] uploaded %s → %s/%s/%s/%s v%s\n", a.Name, a.Line, a.OS, a.Arch, a.Format, a.Version)
+		}
+		if unauthorized > 0 {
+			fmt.Printf("[release-signer] ⚠️  %d upload(s) rejected 401/403 — the server's CHATSERVER_RELEASE_UPLOAD_TOKEN does not match this run's RELEASE_UPLOAD_TOKEN (or is unset). Fix the token on the server + redeploy; the signed GitHub manifest below still covers these assets.\n", unauthorized)
+		}
+		if tooLarge > 0 {
+			fmt.Printf("[release-signer] ⚠️  %d upload(s) rejected 413 (too large for the CDN/proxy). Route the upload around the 100 MiB Cloudflare cap or accept the GitHub mirror for oversized assets.\n", tooLarge)
 		}
 	}
 
