@@ -229,6 +229,44 @@ jobs:
           body: ${{ steps.cl.outputs.body }}
           files: dist/**
 
+      # ── Self-hosted update distribution (Step 2) — sign each desktop/android asset
+      # with the official Ed25519 key, POST it to jiami.chat's release-upload endpoint,
+      # and attach a combined signed manifest to THIS release as a GitHub fallback
+      # mirror (docs/update_distribution_plan.md §6 item 12 + decision #11).
+      # ALWAYS continue-on-error: a signing/upload hiccup must never fail the release.
+      # The release job checked out the SOURCE repo into the workspace, so the CI repo
+      # (schat.build, where the signer lives) is checked out into a subpath.
+      - name: Checkout schat.build (release signer)
+        if: always()
+        continue-on-error: true
+        uses: actions/checkout@v4
+        with:
+          path: _ci
+      - name: Setup Go (release signer)
+        if: always()
+        continue-on-error: true
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+          cache: false # signer is stdlib-only (no go.sum); nothing to cache
+      - name: Sign + publish desktop/android release assets to jiami.chat + write manifest
+        if: always()
+        continue-on-error: true
+        env:
+          RELEASE_SIGN_ED25519_KEY: ${{ secrets.RELEASE_SIGN_ED25519_KEY }}
+          RELEASE_UPLOAD_TOKEN: ${{ secrets.RELEASE_UPLOAD_TOKEN }}
+          UPDATE_UPLOAD_URL: https://jiami.chat/desktop/releases/upload
+        run: |
+          cd _ci/tools/release-signer
+          go run . -dir "$GITHUB_WORKSPACE/dist" -manifest "$GITHUB_WORKSPACE/schat-update-manifest.json"
+      - name: Attach signed manifest to GitHub release (signed fallback mirror)
+        if: always()
+        continue-on-error: true
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.SRC_REF }}-b${{ github.run_number }}
+          files: schat-update-manifest.json
+
   # 任何构建腿失败 → 在本仓库(schat.build)开/追评一个 issue;恢复绿 → 自动关闭。
   # 单 job 汇总:列本次 run 的全部 job(含 desktop 复用工作流的子腿 macOS/Windows/Linux),
   # 按 job 名去掉 reusable 的容器腿,用 issue body 里的隐藏指纹标记 `<!-- schat-ci-fp: build/<slug> -->`

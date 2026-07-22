@@ -32,5 +32,9 @@
 | 名称 | 用途 |
 |---|---|
 | `SRC_REPO_TOKEN` | 有 Ireoo/Secret-Chat 读权限的 PAT，供 actions/checkout clone 私有源仓库 |
+| `RELEASE_SIGN_ED25519_KEY` | **官方更新分发签名私钥**（自建更新通道 Step 2）。base64url 无填充，32 字节 seed 或 64 字节完整 Ed25519 私钥均可。`release` job 用它对每个桌面/安卓资产按 `schat-release/1` 规范字节 Ed25519 签名。仅作 Actions secret 冷存，绝不入库；对应公钥 baked 进三端客户端 + chatserver 做上传时再验。 |
+| `RELEASE_UPLOAD_TOKEN` | jiami.chat `POST /desktop/releases/upload` 的上传 Bearer 令牌，**必须等于** chatserver 的 `CHATSERVER_RELEASE_UPLOAD_TOKEN`。空 = 签名器只写 manifest 不上传。 |
 
 Docker 推送用内置 `GITHUB_TOKEN`（`packages: write`），无需额外配置。
+
+> **自建更新分发（Step 2）**：`build.yml` 的 `release` job 末尾追加了 4 个 `continue-on-error` 步骤——checkout 本仓库到 `_ci/`、装 Go、跑 `tools/release-signer`（对 `dist/**` 逐个资产签名 + POST 到 jiami.chat + 写出合并签名 manifest）、把 manifest 作为附加 release 资产上传（GitHub 兜底镜像仍是签名可验的）。签名器纯 Go 标准库、字节对齐 `docs/fixtures/update_distribution/vectors.json`；本地可 `cd tools/release-signer && go test ./...` 回归。**永不硬失败，绝不改 `qt-desktop.yml`。**
