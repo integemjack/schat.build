@@ -255,15 +255,13 @@ jobs:
         env:
           RELEASE_SIGN_ED25519_KEY: ${{ secrets.RELEASE_SIGN_ED25519_KEY }}
           RELEASE_UPLOAD_TOKEN: ${{ secrets.RELEASE_UPLOAD_TOKEN }}
-          # release.jiami.chat is a DNS-only (grey-cloud) record → direct to the origin, bypassing
-          # Cloudflare's 100 MiB request-body cap so the >100 MiB assets (android APK, qt-mac
-          # universal) can upload too. The origin serves the chatserver's self-signed identity cert
-          # (Cloudflare's edge cert — the one clients pin — is a DIFFERENT cert), so cert
-          # verification is disabled for THIS leg only; trust rests on the Bearer token + the
-          # per-asset Ed25519 signature the server re-verifies (see the signer's comment). If you
-          # put a publicly-trusted cert on release.jiami.chat, drop UPDATE_UPLOAD_INSECURE_TLS.
+          # release.jiami.chat is a DNS-only (grey-cloud) record → direct to the origin (nginx),
+          # bypassing Cloudflare's 100 MiB request-body cap so the >100 MiB assets (android APK,
+          # qt-mac universal) can upload too. Verified from a clean host: it resolves to the origin
+          # (server: nginx, no cloudflare edge) AND presents a publicly-trusted cert, so TLS
+          # verification stays ON. (The signer supports UPDATE_UPLOAD_INSECURE_TLS=1 as an escape
+          # hatch if a future bypass host ever serves a self-signed cert; not needed here.)
           UPDATE_UPLOAD_URL: https://release.jiami.chat/desktop/releases/upload
-          UPDATE_UPLOAD_INSECURE_TLS: "1"
         run: |
           cd _ci/tools/release-signer
           go run . -dir "$GITHUB_WORKSPACE/dist" -manifest "$GITHUB_WORKSPACE/schat-update-manifest.json"
