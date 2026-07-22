@@ -228,3 +228,91 @@ jobs:
           name: "SChat ${{ env.SRC_REF }} build ${{ github.run_number }}"
           body: ${{ steps.cl.outputs.body }}
           files: dist/**
+
+  # 任何构建腿失败 → 在本仓库(schat.build)开/追评一个 issue;恢复绿 → 自动关闭。
+  # 单 job 汇总:列本次 run 的全部 job(含 desktop 复用工作流的子腿 macOS/Windows/Linux),
+  # 按 job 名去掉 reusable 的容器腿,用 issue body 里的隐藏指纹标记 `<!-- schat-ci-fp: build/<slug> -->`
+  # 去重(每条腿至多一个 open issue,后续失败追评论)。issue 开在本仓库,GITHUB_TOKEN 即够,无需 PAT。
+  report-failures:
+    name: Report build failures
+    needs: [android, desktop, server, docker, m5core2]
+    if: always()
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+      actions: read
+      contents: read
+    steps:
+      - name: Open/close issues by leg result
+        uses: actions/github-script@v7
+        env:
+          SRC_REF: ${{ env.SRC_REF }}
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const { owner, repo } = context.repo;
+            const runId = context.runId;
+            const runUrl = `${context.serverUrl}/${owner}/${repo}/actions/runs/${runId}`;
+            const ref = process.env.SRC_REF || 'main';
+            const SELF = 'Report build failures';
+
+            // 本次 run 的全部 job —— 含 reusable(desktop)工作流的子腿。
+            const jobs = await github.paginate(github.rest.actions.listJobsForWorkflowRun, {
+              owner, repo, run_id: runId, per_page: 100,
+            });
+            const legs = jobs.filter(j => j.name !== SELF && !j.name.startsWith(SELF + ' /'));
+            const names = legs.map(l => l.name);
+            // reusable 容器腿的名字是其子腿名的前缀(`X / Y`)——只报最具体的子腿,不报容器。
+            const isContainer = (n) => names.some(o => o !== n && o.startsWith(n + ' / '));
+
+            async function ensureLabel(name, color) {
+              try { await github.rest.issues.getLabel({ owner, repo, name }); }
+              catch (e) { try { await github.rest.issues.createLabel({ owner, repo, name, color }); } catch (e2) {} }
+            }
+            await ensureLabel('ci-failure', 'd73a4a');
+
+            // 直接列(非 search,无索引延迟),按 body 里的隐藏指纹去重。
+            const existing = await github.paginate(github.rest.issues.listForRepo, {
+              owner, repo, labels: 'ci-failure', state: 'all', per_page: 100,
+            });
+            const findByFp = (fp) => existing.find(i => (i.body || '').includes(`<!-- schat-ci-fp: ${fp} -->`));
+
+            for (const leg of legs) {
+              if (isContainer(leg.name)) continue;
+              if (!['success', 'failure'].includes(leg.conclusion)) continue; // 跳过 skipped/cancelled/进行中
+              const slug = leg.name.replace(/[^a-zA-Z0-9]+/g, '-').replace(/(^-|-$)/g, '').toLowerCase();
+              const fp = `build/${slug}`;
+              const marker = `<!-- schat-ci-fp: ${fp} -->`;
+              const issue = findByFp(fp);
+              if (leg.conclusion === 'failure') {
+                const title = `[CI] 构建失败: ${leg.name}`;
+                const body = [
+                  `**腿**: \`${leg.name}\``,
+                  `**分支**: \`${ref}\``,
+                  `**Run**: ${runUrl}`,
+                  `**构建号**: #${context.runNumber}`,
+                  ``,
+                  `_同一条腿的后续失败会在此追加评论,恢复绿后自动关闭。_`,
+                  ``,
+                  marker,
+                ].join('\n');
+                if (issue) {
+                  if (issue.state === 'closed') {
+                    await github.rest.issues.update({ owner, repo, issue_number: issue.number, state: 'open' });
+                  }
+                  await github.rest.issues.createComment({
+                    owner, repo, issue_number: issue.number,
+                    body: `🔴 再次失败 · build #${context.runNumber} · ${runUrl}`,
+                  });
+                } else {
+                  await github.rest.issues.create({ owner, repo, title, body, labels: ['ci-failure'] });
+                }
+              } else if (issue && issue.state === 'open') {
+                await github.rest.issues.createComment({
+                  owner, repo, issue_number: issue.number,
+                  body: `✅ 已恢复 · build #${context.runNumber} · ${runUrl} — 自动关闭。`,
+                });
+                await github.rest.issues.update({ owner, repo, issue_number: issue.number, state: 'closed' });
+              }
+            }
+
