@@ -29,6 +29,7 @@ package main
 import (
 	"crypto/ed25519"
 	"crypto/sha256"
+	"crypto/tls"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -412,7 +413,20 @@ func main() {
 	if token == "" {
 		fmt.Printf("[release-signer] RELEASE_UPLOAD_TOKEN empty — skipping HTTP upload, writing manifest only\n")
 	} else {
-		client := &http.Client{Timeout: 20 * time.Minute}
+		// UPDATE_UPLOAD_INSECURE_TLS=1 skips server-cert verification on the upload leg. This is
+		// for a direct-to-origin bypass host (e.g. release.jiami.chat, a DNS-only record that
+		// sidesteps Cloudflare's 100 MiB request-body cap) whose chatserver serves a SELF-SIGNED
+		// identity cert — Go would otherwise reject it. Safe here because upload trust does NOT
+		// rest on this TLS: the endpoint is Bearer-token gated AND every asset is Ed25519-signed
+		// over §3.1 canonical bytes + sha256-bound, and the server re-verifies that sig against a
+		// baked official key before storing. TLS on this leg is only defense-in-depth. Default OFF
+		// (secure); flip it OFF once the bypass host has a publicly-trusted cert.
+		tr := http.DefaultTransport.(*http.Transport).Clone()
+		if v := strings.ToLower(envOr("UPDATE_UPLOAD_INSECURE_TLS", "")); v == "1" || v == "true" {
+			tr.TLSClientConfig = &tls.Config{InsecureSkipVerify: true} // #nosec G402 — see comment above
+			fmt.Printf("[release-signer] ⚠️  UPDATE_UPLOAD_INSECURE_TLS set — TLS cert verification DISABLED for the upload leg (direct-to-origin bypass host; trust is on the token + Ed25519 sig, not this TLS)\n")
+		}
+		client := &http.Client{Timeout: 20 * time.Minute, Transport: tr}
 		for _, a := range assets {
 			if err := uploadAsset(client, uploadURL, token, a); err != nil {
 				failed++
