@@ -255,6 +255,10 @@ jobs:
         env:
           RELEASE_SIGN_ED25519_KEY: ${{ secrets.RELEASE_SIGN_ED25519_KEY }}
           RELEASE_UPLOAD_TOKEN: ${{ secrets.RELEASE_UPLOAD_TOKEN }}
+          # The per-line changelog (same body attached to the GitHub release above). The signer
+          # forwards it as the upload's `notes` field so the self-hosted manifest's notes/body is
+          # populated — without this the desktop 更新说明 renders blank on the self-hosted path.
+          RELEASE_NOTES: ${{ steps.cl.outputs.body }}
           # release.jiami.chat is a DNS-only (grey-cloud) record → direct to the origin (nginx),
           # bypassing Cloudflare's 100 MiB request-body cap so the >100 MiB assets (android APK,
           # qt-mac universal) can upload too. Verified from a clean host: it resolves to the origin

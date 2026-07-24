@@ -221,7 +221,7 @@ func sha256File(path string) (string, int64, error) {
 // upload one asset (multipart) to the release upload endpoint.
 // ─────────────────────────────────────────────────────────────────────────────
 
-func uploadAsset(client *http.Client, endpoint, token string, a Asset) error {
+func uploadAsset(client *http.Client, endpoint, token, notes string, a Asset) error {
 	f, err := os.Open(a.path)
 	if err != nil {
 		return err
@@ -243,6 +243,11 @@ func uploadAsset(client *http.Client, endpoint, token string, a Asset) error {
 			{"publishedAt", strconv.FormatInt(a.PublishedAt, 10)},
 			{"mandatory", strconv.Itoa(a.Mandatory)},
 			{"minVersion", a.MinVersion},
+			// UNSIGNED display mirror (NOT in §3.1 canonical bytes) — the per-line changelog the
+			// server stores + echoes back as the manifest's notes/body. Omitting it left the
+			// self-hosted manifest's notes empty ⇒ clients showed a blank 更新说明 (the GitHub
+			// fallback mirror was unaffected — it's built separately via buildCombined).
+			{"notes", notes},
 		}
 		for _, kv := range fields {
 			if werr = mw.WriteField(kv[0], kv[1]); werr != nil {
@@ -428,7 +433,7 @@ func main() {
 		}
 		client := &http.Client{Timeout: 20 * time.Minute, Transport: tr}
 		for _, a := range assets {
-			if err := uploadAsset(client, uploadURL, token, a); err != nil {
+			if err := uploadAsset(client, uploadURL, token, notes, a); err != nil {
 				failed++
 				msg := err.Error()
 				var hint string
