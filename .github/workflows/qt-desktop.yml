@@ -717,49 +717,59 @@ jobs:
           #
           # 「引导子集」= 对 SChatSetupUI.exe 单独跑一次 windeployqt 的产出目录整棵树。
           # 刻意不手写 DLL 清单:那种清单每次 Qt 升级都会悄悄过期,漏一个就是安装器打不开。
+          #
+          # 两种造法,**都用 --selftest 验过才算数**(实测教训:9.12.323 那次扫描成功、子集从
+          # 1653 文件/127M 瘦到 76 文件/93M,结果那套精简集根本加载不起 QML —— 是 selftest
+          # 把它拦在了 CI 里,没发出去):
+          #   scan  = windeployqt --qmldir 扫描,只带真正 import 到的模块。小,首帧快。
+          #   blunt = 手工把 QtQml/QtQuick 整棵 QML 模块树拷进来。大约一倍体积,但一直能跑。
+          # 先试 scan,不过就退回 blunt;两个都不过才让 Windows 腿失败。
           BOOT="pkg/boot"
-          mkdir -p "$BOOT"
-          cp build/installer/SChatSetupUI.exe "$BOOT/"
-          # ⚠️ qmlimportscanner **不在** QT_INSTALL_BINS(MSYS2 把它放在 QT_INSTALL_LIBEXECS),
-          # windeployqt 找不到它就只报一句 "Process failed to start" 然后整个 --qmldir 扫描失败
-          # —— 这正是上面应用腿一直在走手工回退的原因。回退分支是 `cp -r QtQuick` 全树,对应用
-          # 无所谓(反正都要装),但对**引导子集**是实打实的首帧延迟:实测 9.12.322 首版 CI 包引导
-          # 子集 1653 文件/123.5MB、交接要 2.6s,扫描修好后只剩真正 import 到的那几个模块。
-          # 只在这个子 shell 里改 PATH:应用腿的部署路径是线上验证过的,不在这次改动里动它。
           QTLIBEXEC="$(qmake6 -query QT_INSTALL_LIBEXECS)"
           echo "QTLIBEXEC=$QTLIBEXEC"; ls "$QTLIBEXEC"/qmlimportscanner* 2>&1 | head -2 || true
-          # 两手都要:qmake6 吐的是 `D:/a/...` 这种 Windows 路径,**直接塞进 MSYS2 的冒号分隔
-          # PATH 会被 `D:` 的冒号劈成两段**(9.12.323 第一次修就栽在这,加了等于没加)——
-          # 所以先 cygpath -u 转成 /d/a/...;同时再把 qmlimportscanner 复制到 windeployqt 旁边,
-          # 覆盖「它其实是按自身目录找、根本不查 PATH」的另一种可能。两条都不成也不致命:
-          # 回退分支照样产出能用的包,只是引导子集大一些(首帧多约 1 秒)。
+          # qmlimportscanner 不在 QT_INSTALL_BINS。两手都要:qmake6 吐的是 `D:/a/...` 这种
+          # Windows 路径,**直接塞进 MSYS2 的冒号分隔 PATH 会被 `D:` 的冒号劈成两段**(等于
+          # 没加),所以先 cygpath -u;同时再把它复制到 windeployqt 旁边,覆盖「按自身目录找、
+          # 根本不查 PATH」的另一种可能。
           cp -n "$QTLIBEXEC"/qmlimportscanner* "$QTBIN"/ 2>/dev/null || true
-          if ! ( export PATH="$(cygpath -u "$QTLIBEXEC"):$PATH"; windeployqt --qmldir "$PWD/installer/ui/qml" --release --no-translations "$BOOT/SChatSetupUI.exe" ); then
-            echo "windeployqt --qmldir failed for the setup UI → deploy core DLLs + copy QML modules manually"
-            windeployqt --release --no-translations "$BOOT/SChatSetupUI.exe" || true
-            mkdir -p "$BOOT/qml"
-            # Setup.qml 只 import QtQuick + QtQuick.Window(刻意不引 Controls,见该文件头注释)。
-            for m in QtQml QtQuick; do
-              [ -d "$QMLSRC/$m" ] && cp -r "$QMLSRC/$m" "$BOOT/qml/" || true
+
+          build_boot() {   # $1 = scan | blunt;返回 0 = 这套引导集真能把 QML 跑起来
+            rm -rf "$BOOT"; mkdir -p "$BOOT"
+            cp build/installer/SChatSetupUI.exe "$BOOT/"
+            if [ "$1" = scan ]; then
+              ( export PATH="$(cygpath -u "$QTLIBEXEC"):$PATH"
+                windeployqt --qmldir "$PWD/installer/ui/qml" --release --no-translations "$BOOT/SChatSetupUI.exe" ) || return 1
+            else
+              windeployqt --release --no-translations "$BOOT/SChatSetupUI.exe" || true
+              mkdir -p "$BOOT/qml"
+              # Setup.qml 只 import QtQuick + QtQuick.Window(刻意不引 Controls,见该文件头注释),
+              # 但整棵拷是为了不去猜 Qt 内部的模块依赖 —— 这条分支的职责是「一定能跑」。
+              for m in QtQml QtQuick; do
+                [ -d "$QMLSRC/$m" ] && cp -r "$QMLSRC/$m" "$BOOT/qml/" || true
+              done
+              for d in Qt6QmlModels Qt6QmlWorkerScript Qt6QmlMeta Qt6OpenGL; do
+                [ -f "$QTBIN/$d.dll" ] && cp "$QTBIN/$d.dll" "$BOOT/" || true
+              done
+              printf '[Paths]\nPrefix = .\n' > "$BOOT/qt.conf"
+            fi
+            dll_closure "$BOOT"
+            # 「三个 MinGW 运行时 DLL 在不在」这类存在性检查挡不住「QtQuick 的 qml 模块没进来」,
+            # 而后者的表现是用户双击安装包、启动图闪一下就没了。所以只认 --selftest 的退出码:
+            # 拿这套文件真把 QML 加载一遍(不弹窗)。
+            for must in libgcc_s_seh-1 libstdc++-6 libwinpthread-1; do
+              [ -f "$BOOT/$must.dll" ] || { echo "  [$1] 缺 $must.dll"; return 1; }
             done
-            for d in Qt6QmlModels Qt6QmlWorkerScript Qt6QmlMeta Qt6OpenGL; do
-              [ -f "$QTBIN/$d.dll" ] && cp "$QTBIN/$d.dll" "$BOOT/" || true
-            done
-            printf '[Paths]\nPrefix = .\n' > "$BOOT/qt.conf"
+            ( cd "$BOOT" && ./SChatSetupUI.exe --selftest ) || return 1
+            echo "  [$1] selftest OK: $(find "$BOOT" -type f | wc -l) files, $(du -sh "$BOOT" | cut -f1)"
+          }
+
+          if build_boot scan; then
+            echo "引导子集 = 最小集(windeployqt --qmldir)"
+          else
+            echo "最小集不可用 → 回退到全量 QML 模块树"
+            build_boot blunt || { echo "FATAL: 两种引导子集都跑不起 QML(安装界面在用户机上会打不开)"; exit 1; }
+            echo "引导子集 = 全量树(回退)"
           fi
-          dll_closure "$BOOT"
-          # 引导子集起不来 = 交互安装直接瞎(静默升级不受影响,但用户手动装就没戏),
-          # 所以这三个缺一即让 Windows 腿失败,不要「best-effort」放过去。
-          for must in libgcc_s_seh-1 libstdc++-6 libwinpthread-1; do
-            [ -f "$BOOT/$must.dll" ] || { echo "FATAL: $must.dll missing from the setup-UI bootstrap set"; exit 1; }
-          done
-          echo "bootstrap set: $(find "$BOOT" -type f | wc -l) files, $(du -sh "$BOOT" | cut -f1)"
-          # 冒烟测试:拿这套引导文件真把 QML 加载一遍(--selftest 不弹窗、只看退出码)。
-          # 上面那三个 DLL 的存在性检查挡不住「QtQuick 的 qml 模块没进来」这类漏项,而那种漏项
-          # 的表现是用户双击安装包、启动图闪一下就没了 —— 必须在这里红,不能发出去。
-          ( cd "$BOOT" && ./SChatSetupUI.exe --selftest ) \
-            || { echo "FATAL: 引导子集跑不起 QML(安装界面在用户机上会打不开)"; exit 1; }
-          echo "setup-UI selftest OK"
 
           # mkpkg 求两棵树的并集:两边都有的 Qt DLL 只存一份(引导时解到 %TEMP%、安装时写进
           # 安装目录),并把引导子集排到 solid LZMA 流的最前面,好让 stub 只解压前缀就能起界面。
