@@ -739,6 +739,16 @@ jobs:
             if [ "$1" = scan ]; then
               ( export PATH="$(cygpath -u "$QTLIBEXEC"):$PATH"
                 windeployqt --qmldir "$PWD/installer/ui/qml" --release --no-translations "$BOOT/SChatSetupUI.exe" ) || return 1
+              # windeployqt 从不写 qt.conf,而 QML 引擎按 Qt6Core 里编死的相对路径找模块。
+              # 官方 Qt 编死的恰好是 `qml`(与 windeployqt 的部署布局一致,所以本机自打包
+              # 侥幸能跑);MSYS2 的 Qt 编死的是 `share/qt6/qml`,引擎在用户机上去找
+              # boot/share/qt6/qml → "module QtQuick.Window is not installed" —— 9.12.323 那次
+              # 76 文件精简集 selftest 失败的**全部**原因(2026-07-26 本机三组对照实验证实:
+              # 好集把 qml/ 改名即复现同款报错,qt.conf 桥接后复活)。qt.conf 存在时未指定项
+              # 回落到硬编码默认 Qml2Imports=qml(而非构建期路径),恰好就是部署布局 ——
+              # 与 blunt 同款的一行 Prefix 即可。留 [ -f ] 守卫:未来 windeployqt 若自己写了
+              # qt.conf,以它的为准。
+              [ -f "$BOOT/qt.conf" ] || printf '[Paths]\nPrefix = .\n' > "$BOOT/qt.conf"
             else
               windeployqt --release --no-translations "$BOOT/SChatSetupUI.exe" || true
               mkdir -p "$BOOT/qml"
@@ -759,7 +769,16 @@ jobs:
             for must in libgcc_s_seh-1 libstdc++-6 libwinpthread-1; do
               [ -f "$BOOT/$must.dll" ] || { echo "  [$1] 缺 $must.dll"; return 1; }
             done
-            ( cd "$BOOT" && ./SChatSetupUI.exe --selftest ) || return 1
+            # GUI 子系统进程的 Qt 日志默认走 OutputDebugString,CI 日志里什么都看不见 ——
+            # QT_ASSUME_STDERR_HAS_CONSOLE=1 让失败原因(QQmlApplicationEngine 的 warnings,
+            # 比如 "module X is not installed")落进 stderr;失败时再带 QML_IMPORT_TRACE 复跑
+            # 一遍,把 import 解析现场也打出来,别再让 selftest 静默失败逼人盲猜。
+            ( cd "$BOOT" && QT_ASSUME_STDERR_HAS_CONSOLE=1 ./SChatSetupUI.exe --selftest ) || {
+              echo "  [$1] selftest 失败,带 QML_IMPORT_TRACE 复跑拿现场:"
+              ( cd "$BOOT" && QT_ASSUME_STDERR_HAS_CONSOLE=1 QML_IMPORT_TRACE=1 \
+                  ./SChatSetupUI.exe --selftest 2>&1 | tail -n 40 ) || true
+              return 1
+            }
             echo "  [$1] selftest OK: $(find "$BOOT" -type f | wc -l) files, $(du -sh "$BOOT" | cut -f1)"
           }
 
