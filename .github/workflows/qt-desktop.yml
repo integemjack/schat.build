@@ -9,7 +9,7 @@ name: Qt Desktop
 #     · macos-qt = Qt/QML 通用兼容版 (desktop/desktop-qt, arm64 + x86_64) — minos 12.0,跑
 #                  macOS 12/13+ 与 Intel(Qt 不碰系统新 API,解决「macOS 13 装不上」)。资产名带
 #                  `qt` 标记,Swift 更新器 pickAsset 按 -qt/qt- 排除它 → 两条线自动更新永不串包。
-#   Windows : x64 (MSYS2/MINGW64) Qt6/QML          — NSIS installer via windeployqt + makensis
+#   Windows : x64 (MSYS2/MINGW64) Qt6/QML          — 自制安装器 (windeployqt + installer/mkpkg)
 #             (arm64 needs an MSVC port of the vendored MinGW deps — not covered yet)
 #   Linux   : x86_64 + aarch64 (Debian trixie containers) Qt6/QML — .deb (both arches)
 #             + a self-contained AppImage on x86_64 (linuxdeploy + plugin-qt)
@@ -579,7 +579,8 @@ jobs:
   # ── Windows: x64 via MSYS2/MINGW64. pacman provides gcc + Qt6 + OpenSSL + opus/libsodium/
   # openh264/libsrtp (all with pkg-config), so libdatachannel's DTLS finds OpenSSL and the core
   # links the codecs via pkg-config (the CMake MSYS2 branch). windeployqt bundles the Qt DLLs;
-  # NSIS builds a self-contained installer .exe. ──────────────────────────────────────────────
+  # 源仓 desktop/desktop-qt/installer/ 的自制安装器把这一切压成一个自解压 setup.exe
+  # (2026-07-26 起取代 NSIS —— MUI2 DPI 不感知,高缩放机器上整窗被拉伸)。─────────────
   windows:
     name: Windows Qt (x64, MSYS2 → installer)
     runs-on: windows-latest
@@ -606,7 +607,7 @@ jobs:
             mingw-w64-x86_64-qt6-multimedia mingw-w64-x86_64-qt6-websockets mingw-w64-x86_64-qt6-tools
             mingw-w64-x86_64-qt6-5compat mingw-w64-x86_64-qt6-shadertools
             mingw-w64-x86_64-opus mingw-w64-x86_64-libsodium mingw-w64-x86_64-openh264
-            mingw-w64-x86_64-openssl mingw-w64-x86_64-libsrtp mingw-w64-x86_64-nsis
+            mingw-w64-x86_64-openssl mingw-w64-x86_64-libsrtp
 
       - name: Fetch third-party deps (libdatachannel source + single headers)
         working-directory: desktop/desktop-qt
@@ -618,7 +619,7 @@ jobs:
           cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
           cmake --build build -j"$(nproc)"
 
-      - name: Package installer (windeployqt + NSIS)
+      - name: Package installer (windeployqt + 自制 mkpkg)
         working-directory: desktop/desktop-qt
         run: |
           set -e
@@ -678,134 +679,77 @@ jobs:
           # "packaged fine" never actually launched. Walk ldd over EVERY dll/exe already staged
           # (recursively, so plugin subdirs count) and copy every /mingw64 dependency next to the
           # exe (the exe dir is always on the DLL search path); repeat until a pass adds nothing.
-          echo "=== resolving full DLL closure ==="
-          while :; do
-            before=$(find "$STAGE" -maxdepth 1 -iname '*.dll' | wc -l)
-            while IFS= read -r bin; do
-              ldd "$bin" 2>/dev/null | awk '/=> \/mingw64\// { print $3 }'
-            done < <(find "$STAGE" -type f \( -iname '*.dll' -o -iname '*.exe' \)) \
-              | sort -u | while IFS= read -r dep; do
-                  base=$(basename "$dep")
-                  [ -f "$STAGE/$base" ] || cp "$dep" "$STAGE/"
-                done
-            after=$(find "$STAGE" -maxdepth 1 -iname '*.dll' | wc -l)
-            echo "  DLL closure pass: $before -> $after"
-            if [ "$before" = "$after" ]; then break; fi
-          done
+          # 做成函数:安装器界面进程(SChatSetupUI.exe)自己那棵引导部署树也要走同一遍闭包,
+          # 否则它从 %TEMP% 起不来 —— 表现为「双击安装包只闪一下启动图就没了」。
+          dll_closure() {
+            local d="$1"
+            echo "=== resolving full DLL closure in $d ==="
+            while :; do
+              before=$(find "$d" -maxdepth 1 -iname '*.dll' | wc -l)
+              while IFS= read -r bin; do
+                ldd "$bin" 2>/dev/null | awk '/=> \/mingw64\// { print $3 }'
+              done < <(find "$d" -type f \( -iname '*.dll' -o -iname '*.exe' \)) \
+                | sort -u | while IFS= read -r dep; do
+                    base=$(basename "$dep")
+                    [ -f "$d/$base" ] || cp "$dep" "$d/"
+                  done
+              after=$(find "$d" -maxdepth 1 -iname '*.dll' | wc -l)
+              echo "  DLL closure pass: $before -> $after"
+              if [ "$before" = "$after" ]; then break; fi
+            done
+          }
+          # 安装器的两个非 Qt 产物先进 $STAGE,好让闭包连它们的依赖一起解:
+          #   uninstall.exe    —— ARP 的 UninstallString 指向它,必须随应用装进安装目录
+          #   SChatSetupUI.exe —— 卸载界面复用安装目录里应用自带的 Qt(不额外占包体积)
+          cp build/installer/uninstall.exe build/installer/SChatSetupUI.exe "$STAGE/"
+          dll_closure "$STAGE"
           echo "staged top-level DLLs: $(find "$STAGE" -maxdepth 1 -iname '*.dll' | wc -l) (expect ~90)"
           # Fail loudly if the MinGW runtime trio is still missing — that trio absent == the
           # instant-exit bug is back and the package is DOA; better to fail the build than ship it.
           for must in libgcc_s_seh-1 libstdc++-6 libwinpthread-1 libsqlite3-0; do
             [ -f "$STAGE/$must.dll" ] || { echo "FATAL: $must.dll missing from package"; exit 1; }
           done
-          # ── Branded NSIS installer(mac 那条线的 dmg 有自定义 Finder 布局 +「双击运行」
-          # 背景图,Windows 这边此前一点品牌都没有:标题栏和 Setup.exe 上是 NSIS 的默认
-          # 图标、没有欢迎/完成页、没有页眉 logo)。资产与 dmg-background.png 同一套路 ——
-          # 放在源仓 desktop/desktop-qt/scripts/,由 make-nsis-assets.py 从 appicon 生成;
-          # 这里 best-effort 引用:老的源码 checkout 缺资产照样出一个能用的(只是没品牌的)
-          # 安装器,绝不因为缺图而让 Windows 腿失败。
-          : > branding.nsh
-          if [ -f app-qt/icons/appicon.ico ]; then
-            printf '%s\n' '!define MUI_ICON "app-qt\icons\appicon.ico"' >> branding.nsh
-            printf '%s\n' '!define MUI_UNICON "app-qt\icons\appicon.ico"' >> branding.nsh
+          # ── 自制安装器(源仓 desktop/desktop-qt/installer/,已取代 NSIS)────────────────
+          # 换掉 NSIS 的理由不是「不好看」而是**MUI2 DPI 不感知**:150% 缩放的机器上整窗被
+          # 系统位图拉伸,上一版精心生成的 164×314 侧栏被拉成 246×471,贴什么图都糊。
+          # 自制的这套:stub 与卸载器不链 Qt(静默升级路径因此不依赖任何 Qt 落地),界面是
+          # 一页式 QML,首帧前由 stub 画原生启动图顶着。细节见 docs/build_and_run.md。
+          #
+          # 「引导子集」= 对 SChatSetupUI.exe 单独跑一次 windeployqt 的产出目录整棵树。
+          # 刻意不手写 DLL 清单:那种清单每次 Qt 升级都会悄悄过期,漏一个就是安装器打不开。
+          BOOT="pkg/boot"
+          mkdir -p "$BOOT"
+          cp build/installer/SChatSetupUI.exe "$BOOT/"
+          if ! windeployqt --qmldir "$PWD/installer/ui/qml" --release --no-translations "$BOOT/SChatSetupUI.exe"; then
+            echo "windeployqt --qmldir failed for the setup UI → deploy core DLLs + copy QML modules manually"
+            windeployqt --release --no-translations "$BOOT/SChatSetupUI.exe" || true
+            mkdir -p "$BOOT/qml"
+            # Setup.qml 只 import QtQuick + QtQuick.Window(刻意不引 Controls,见该文件头注释)。
+            for m in QtQml QtQuick; do
+              [ -d "$QMLSRC/$m" ] && cp -r "$QMLSRC/$m" "$BOOT/qml/" || true
+            done
+            for d in Qt6QmlModels Qt6QmlWorkerScript Qt6QmlMeta Qt6OpenGL; do
+              [ -f "$QTBIN/$d.dll" ] && cp "$QTBIN/$d.dll" "$BOOT/" || true
+            done
+            printf '[Paths]\nPrefix = .\n' > "$BOOT/qt.conf"
           fi
-          if [ -f scripts/nsis-welcome.bmp ]; then
-            printf '%s\n' '!define MUI_WELCOMEFINISHPAGE_BITMAP "scripts\nsis-welcome.bmp"' >> branding.nsh
-            printf '%s\n' '!define MUI_UNWELCOMEFINISHPAGE_BITMAP "scripts\nsis-welcome.bmp"' >> branding.nsh
-          fi
-          if [ -f scripts/nsis-header.bmp ]; then
-            printf '%s\n' '!define MUI_HEADERIMAGE' >> branding.nsh
-            printf '%s\n' '!define MUI_HEADERIMAGE_BITMAP "scripts\nsis-header.bmp"' >> branding.nsh
-          fi
-          echo "branding.nsh:"; cat branding.nsh
-          # VIProductVersion 必须是 4 段;版本号是 x.y.z,补一个 .0(缺段按 0 归一)。
-          VIVER="$(echo "$VER" | awk -F. '{printf "%d.%d.%d.%d", $1+0, $2+0, $3+0, $4+0}')"
-          cat > installer.nsi <<'NSI'
-          Unicode true
-          SetCompressor /SOLID lzma
-          !include "MUI2.nsh"
-          !include "FileFunc.nsh"
-          !include "branding.nsh"
-          !ifndef APPVER
-            !define APPVER "0.0.0"
-          !endif
-          !ifndef VIVER
-            !define VIVER "0.0.0.0"
-          !endif
-          !define ARP "Software\Microsoft\Windows\CurrentVersion\Uninstall\SChat"
-          Name "SChat"
-          OutFile "SChat-Setup.exe"
-          InstallDir "$PROGRAMFILES64\SChat"
-          RequestExecutionLevel admin
-          BrandingText "SChat ${APPVER}"
-          VIProductVersion "${VIVER}"
-          VIAddVersionKey "ProductName" "SChat"
-          VIAddVersionKey "ProductVersion" "${APPVER}"
-          VIAddVersionKey "FileVersion" "${VIVER}"
-          VIAddVersionKey "FileDescription" "SChat 安装程序"
-          VIAddVersionKey "LegalCopyright" "SChat"
-          !define MUI_ABORTWARNING
-          ; 完成页「立即运行」经 explorer.exe 启动 —— 安装器自己是 admin 提权的,直接 Exec
-          ; 会让 SChat 以管理员身份跑,其后的一键自更新重启还会继承管理员票据(与更新器
-          ; 「重启不带管理员票据」的既定口径冲突);由未提权的 shell 代为创建即降回普通用户。
-          !define MUI_FINISHPAGE_RUN
-          !define MUI_FINISHPAGE_RUN_TEXT "立即运行 SChat"
-          !define MUI_FINISHPAGE_RUN_FUNCTION LaunchAsUser
-          !insertmacro MUI_PAGE_WELCOME
-          !insertmacro MUI_PAGE_DIRECTORY
-          !insertmacro MUI_PAGE_INSTFILES
-          !insertmacro MUI_PAGE_FINISH
-          !insertmacro MUI_UNPAGE_CONFIRM
-          !insertmacro MUI_UNPAGE_INSTFILES
-          ; 语言顺序不要动:第一条是无匹配时的兜底,且刻意不插 MUI_LANGDLL —— 语言选择
-          ; 对话框会破坏更新器依赖的 `/S /D=<dir>` 静默升级。
-          !insertmacro MUI_LANGUAGE "SimpChinese"
-          !insertmacro MUI_LANGUAGE "English"
-          Function LaunchAsUser
-            Exec '"$WINDIR\explorer.exe" "$INSTDIR\SChat.exe"'
-          FunctionEnd
-          Section "Install"
-            SetOutPath "$INSTDIR"
-            File /r "pkg\SChat\*.*"
-            CreateShortcut "$SMPROGRAMS\SChat.lnk" "$INSTDIR\SChat.exe"
-            CreateShortcut "$DESKTOP\SChat.lnk" "$INSTDIR\SChat.exe"
-            ; Windows Defender 防火墙放行(装机即通,P2P 通话的 ICE 入站 UDP 检查不再依赖
-            ; 用户在首启弹窗上点「允许」—— 点了「取消」的机器永远不再提示,表现为通话
-            ; 一直「连接中」到超时挂断)。安装器本身 admin 提权,netsh 可用。
-            nsExec::ExecToLog 'netsh advfirewall firewall delete rule name="SChat"'
-            nsExec::ExecToLog 'netsh advfirewall firewall add rule name="SChat" dir=in action=allow program="$INSTDIR\SChat.exe" enable=yes profile=any'
-            WriteUninstaller "$INSTDIR\uninstall.exe"
-            ; 「应用和功能」/控制面板里能看到并卸载 —— 此前只在安装目录里放了
-            ; uninstall.exe,系统卸载列表里根本不出现,用户没有正常的卸载入口。
-            WriteRegStr HKLM "${ARP}" "DisplayName" "SChat"
-            WriteRegStr HKLM "${ARP}" "DisplayIcon" "$INSTDIR\SChat.exe"
-            WriteRegStr HKLM "${ARP}" "DisplayVersion" "${APPVER}"
-            WriteRegStr HKLM "${ARP}" "Publisher" "SChat"
-            WriteRegStr HKLM "${ARP}" "InstallLocation" "$INSTDIR"
-            WriteRegStr HKLM "${ARP}" "UninstallString" '"$INSTDIR\uninstall.exe"'
-            WriteRegStr HKLM "${ARP}" "QuietUninstallString" '"$INSTDIR\uninstall.exe" /S'
-            WriteRegDWORD HKLM "${ARP}" "NoModify" 1
-            WriteRegDWORD HKLM "${ARP}" "NoRepair" 1
-            ${GetSize} "$INSTDIR" "/S=0K" $0 $1 $2
-            IntFmt $0 "0x%08X" $0
-            WriteRegDWORD HKLM "${ARP}" "EstimatedSize" "$0"
-          SectionEnd
-          Section "Uninstall"
-            nsExec::ExecToLog 'netsh advfirewall firewall delete rule name="SChat"'
-            Delete "$SMPROGRAMS\SChat.lnk"
-            Delete "$DESKTOP\SChat.lnk"
-            DeleteRegKey HKLM "${ARP}"
-            RMDir /r "$INSTDIR"
-          SectionEnd
-          NSI
-          # -INPUTCHARSET UTF8 不是可选项:这个脚本是 heredoc 写出来的 UTF-8(中文注释 +
-          # 中文界面串「立即运行 SChat」),而 makensis 默认按系统 ACP 读源码 —— 配上
-          # `Unicode true` 后遇到解不开的字节会直接 "Bad text encoding" 中止(makensis 3.10
-          # 本地实测)。NSIS 只在源文件带 BOM 时才自动认 UTF-8,heredoc 不产生 BOM;而
-          # `!encoding` 这个指令在 NSIS 里**不存在**(3.10 报 Invalid command)。
-          # 开关用 `-` 前缀不要用 `/`:MSYS2 会把 /INPUTCHARSET 当路径做转换。
-          makensis -INPUTCHARSET UTF8 -DAPPVER="$VER" -DVIVER="$VIVER" installer.nsi
-          mv SChat-Setup.exe "out/SChat-windows-${VER}-x64-setup.exe"
+          dll_closure "$BOOT"
+          # 引导子集起不来 = 交互安装直接瞎(静默升级不受影响,但用户手动装就没戏),
+          # 所以这三个缺一即让 Windows 腿失败,不要「best-effort」放过去。
+          for must in libgcc_s_seh-1 libstdc++-6 libwinpthread-1; do
+            [ -f "$BOOT/$must.dll" ] || { echo "FATAL: $must.dll missing from the setup-UI bootstrap set"; exit 1; }
+          done
+          echo "bootstrap set: $(find "$BOOT" -type f | wc -l) files, $(du -sh "$BOOT" | cut -f1)"
+
+          # mkpkg 求两棵树的并集:两边都有的 Qt DLL 只存一份(引导时解到 %TEMP%、安装时写进
+          # 安装目录),并把引导子集排到 solid LZMA 流的最前面,好让 stub 只解压前缀就能起界面。
+          mkdir -p out
+          build/installer/mkpkg.exe \
+            --stub build/installer/SChatSetup.exe \
+            --app "$STAGE" \
+            --boot "$BOOT" \
+            --out "out/SChat-windows-${VER}-x64-setup.exe" \
+            --version "$VER"
           ls -la out
 
       - uses: actions/upload-artifact@v4
