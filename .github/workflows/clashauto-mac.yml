@@ -22,8 +22,6 @@ on:
 env:
   QT_VERSION: 6.8.3
   BUILD_DIR: build-release
-  RUNTIME_RELEASE_TAG: v2.5.7
-  RUNTIME_LINUX_ASSET: clash-auto-amd64-2.5.7.zip
 
 jobs:
   clashauto-macos:
@@ -47,34 +45,6 @@ jobs:
           version="${major}.${minor}.$(git rev-list --count HEAD)"
           { echo "APP_VERSION=$version"; echo "RELEASE_TAG=v$version"; } >> "$GITHUB_ENV"
           echo "clashauto version: $version"
-
-      - name: Download runtime resources
-        shell: bash
-        run: |
-          set -euo pipefail
-          url="https://github.com/ClashrAuto/Clashr-Auto-Desktop/releases/download/${RUNTIME_RELEASE_TAG}/${RUNTIME_LINUX_ASSET}"
-          zip_path="${RUNNER_TEMP}/${RUNTIME_LINUX_ASSET}"
-          curl -L --fail --retry 3 -o "$zip_path" "$url"
-          rm -rf Clashr-Auto; mkdir -p Clashr-Auto
-          python3 - "$zip_path" <<'PY'
-          import pathlib, sys, zipfile
-          zip_path = pathlib.Path(sys.argv[1])
-          target_root = pathlib.Path("Clashr-Auto")
-          prefixes = ("config/", "language/")
-          with zipfile.ZipFile(zip_path) as archive:
-              for entry in archive.infolist():
-                  name = entry.filename.replace("\\", "/")
-                  if not (name == "version" or name.startswith(prefixes)):
-                      continue
-                  target = target_root / name
-                  if entry.is_dir():
-                      target.mkdir(parents=True, exist_ok=True); continue
-                  target.parent.mkdir(parents=True, exist_ok=True)
-                  with archive.open(entry) as src, target.open("wb") as dst:
-                      dst.write(src.read())
-          PY
-          mkdir -p Clashr-Auto/command/clash
-          test -f Clashr-Auto/config/config.yaml
 
       - name: Install build dependencies
         shell: bash
@@ -127,7 +97,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          bin="$BUILD_DIR/Clash Auto.app/Contents/MacOS/Clash Auto"
+          bin="$BUILD_DIR/Coast.app/Contents/MacOS/Coast"
           lipo -archs "$bin" | grep -q x86_64
           lipo -archs "$bin" | grep -q arm64
 
@@ -162,7 +132,7 @@ jobs:
           SIGN_IDENTITY: ${{ steps.signcert.outputs.identity }}
         run: |
           set -euo pipefail
-          APP="$BUILD_DIR/Clash Auto.app"
+          APP="$BUILD_DIR/Coast.app"
           # QML 前端：必须 -qmldir 指向 .qml 源目录，macdeployqt 才会把 Qt Quick 运行时
           # (Qt6Quick / QtQuick.Controls[Basic] / Layouts / Templates / Window 插件) 部署进 bundle，
           # 否则签名包因缺 QML 运行时无法启动。
@@ -170,26 +140,21 @@ jobs:
 
           # 重新嵌入特权 helper 与 launchd plist（macdeployqt 之后，避免被改）
           mkdir -p "$APP/Contents/Library/LaunchDaemons"
-          cp "$BUILD_DIR/com.yuehongsun.auto.helper" "$APP/Contents/MacOS/com.yuehongsun.auto.helper"
-          cp "clashauto-c++/helper/com.yuehongsun.auto.helper.plist" "$APP/Contents/Library/LaunchDaemons/"
-          lipo -archs "$APP/Contents/MacOS/com.yuehongsun.auto.helper"
+          cp "$BUILD_DIR/com.yuehongsun.coast.helper" "$APP/Contents/MacOS/com.yuehongsun.coast.helper"
+          cp "clashauto-c++/helper/com.yuehongsun.coast.helper.plist" "$APP/Contents/Library/LaunchDaemons/"
+          lipo -archs "$APP/Contents/MacOS/com.yuehongsun.coast.helper"
 
-          # 运行时资源进 bundle：Contents/Clashr-Auto
-          mkdir -p "$APP/Contents/Clashr-Auto"
-          for item in command config language version; do
-            [ -e "Clashr-Auto/$item" ] && cp -a "Clashr-Auto/$item" "$APP/Contents/Clashr-Auto/"
-          done
-          test -f "$APP/Contents/Clashr-Auto/config/config.yaml"
+          # 资源已内嵌 exe(qrc)，不再往 bundle 塞 Contents/Clashr-Auto —— app 自包含。
 
           # 签名（硬化运行时 + 时间戳，公证必需）。关键：helper 必须用显式 -i 指定
-          # identifier = com.yuehongsun.auto.helper（= launchd Label）。否则 codesign 会把可执行名
-          # com.yuehongsun.auto.helper 末尾的「.helper」当扩展名剥掉，得到 identifier=com.yuehongsun.auto，
+          # identifier = com.yuehongsun.coast.helper（= launchd Label）。否则 codesign 会把可执行名
+          # com.yuehongsun.coast.helper 末尾的「.helper」当扩展名剥掉，得到 identifier=com.yuehongsun.coast，
           # 与注册的 Label 不一致 → SMAppService daemon 一启动即被系统以 Launch Constraint Violation
           # 用 SIGKILL 杀掉，核心永远无法以 root 运行（应用侧 XPC 报「Couldn't communicate with a
           # helper application」并回退非 root）。
-          HELPER="$APP/Contents/MacOS/com.yuehongsun.auto.helper"
-          HELPER_ID="com.yuehongsun.auto.helper"
-          # 1) --deep 一把签全（含 Qt frameworks）——但它会把 helper 的 identifier 又剥回 com.yuehongsun.auto
+          HELPER="$APP/Contents/MacOS/com.yuehongsun.coast.helper"
+          HELPER_ID="com.yuehongsun.coast.helper"
+          # 1) --deep 一把签全（含 Qt frameworks）——但它会把 helper 的 identifier 又剥回 com.yuehongsun.coast
           codesign --force --deep --options runtime --timestamp --sign "$SIGN_IDENTITY" "$APP"
           # 2) 用显式 -i 单独重签 helper 纠正 identifier（这会改 helper 的 cdhash）
           codesign --force --options runtime --timestamp -i "$HELPER_ID" --sign "$SIGN_IDENTITY" "$HELPER"
@@ -197,7 +162,7 @@ jobs:
           codesign --force --options runtime --timestamp --sign "$SIGN_IDENTITY" "$APP"
           codesign --verify --deep --strict --verbose=2 "$APP" && echo "codesign verify OK"
           codesign --verify --strict --verbose=2 "$HELPER" && echo "helper codesign verify OK"
-          # 核对 helper 的 identifier 必须 = com.yuehongsun.auto.helper（= Label），否则仍会被 Launch Constraint 杀
+          # 核对 helper 的 identifier 必须 = com.yuehongsun.coast.helper（= Label），否则仍会被 Launch Constraint 杀
           echo "helper identity:"; codesign -dvv "$HELPER" 2>&1 | grep -Ei 'Identifier|TeamIdentifier'
           codesign -dvv "$APP" 2>&1 | grep -Ei 'Authority|TeamIdentifier' || true
 
@@ -210,10 +175,10 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p dist/dmgroot
-          ditto "$BUILD_DIR/Clash Auto.app" "dist/dmgroot/Clash Auto.app"
+          ditto "$BUILD_DIR/Coast.app" "dist/dmgroot/Coast.app"
           ln -s /Applications dist/dmgroot/Applications
           DMG="dist/ClashAuto-${APP_VERSION}-macos-universal.dmg"
-          hdiutil create -volname "Clash Auto" -srcfolder dist/dmgroot -ov -format UDZO "$DMG"
+          hdiutil create -volname "Coast" -srcfolder dist/dmgroot -ov -format UDZO "$DMG"
           if [ -z "${NOTARY_KEY:-}" ]; then
             echo "缺 notary 凭据，无法公证"; exit 1
           fi
