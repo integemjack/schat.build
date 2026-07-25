@@ -698,19 +698,72 @@ jobs:
           for must in libgcc_s_seh-1 libstdc++-6 libwinpthread-1 libsqlite3-0; do
             [ -f "$STAGE/$must.dll" ] || { echo "FATAL: $must.dll missing from package"; exit 1; }
           done
-          # Minimal NSIS installer: install to Program Files, Start-menu + desktop shortcut, uninstaller.
+          # ── Branded NSIS installer(mac 那条线的 dmg 有自定义 Finder 布局 +「双击运行」
+          # 背景图,Windows 这边此前一点品牌都没有:标题栏和 Setup.exe 上是 NSIS 的默认
+          # 图标、没有欢迎/完成页、没有页眉 logo)。资产与 dmg-background.png 同一套路 ——
+          # 放在源仓 desktop/desktop-qt/scripts/,由 make-nsis-assets.py 从 appicon 生成;
+          # 这里 best-effort 引用:老的源码 checkout 缺资产照样出一个能用的(只是没品牌的)
+          # 安装器,绝不因为缺图而让 Windows 腿失败。
+          : > branding.nsh
+          if [ -f app-qt/icons/appicon.ico ]; then
+            printf '%s\n' '!define MUI_ICON "app-qt\icons\appicon.ico"' >> branding.nsh
+            printf '%s\n' '!define MUI_UNICON "app-qt\icons\appicon.ico"' >> branding.nsh
+          fi
+          if [ -f scripts/nsis-welcome.bmp ]; then
+            printf '%s\n' '!define MUI_WELCOMEFINISHPAGE_BITMAP "scripts\nsis-welcome.bmp"' >> branding.nsh
+            printf '%s\n' '!define MUI_UNWELCOMEFINISHPAGE_BITMAP "scripts\nsis-welcome.bmp"' >> branding.nsh
+          fi
+          if [ -f scripts/nsis-header.bmp ]; then
+            printf '%s\n' '!define MUI_HEADERIMAGE' >> branding.nsh
+            printf '%s\n' '!define MUI_HEADERIMAGE_BITMAP "scripts\nsis-header.bmp"' >> branding.nsh
+          fi
+          echo "branding.nsh:"; cat branding.nsh
+          # VIProductVersion 必须是 4 段;版本号是 x.y.z,补一个 .0(缺段按 0 归一)。
+          VIVER="$(echo "$VER" | awk -F. '{printf "%d.%d.%d.%d", $1+0, $2+0, $3+0, $4+0}')"
           cat > installer.nsi <<'NSI'
+          Unicode true
+          SetCompressor /SOLID lzma
           !include "MUI2.nsh"
+          !include "FileFunc.nsh"
+          !include "branding.nsh"
+          !ifndef APPVER
+            !define APPVER "0.0.0"
+          !endif
+          !ifndef VIVER
+            !define VIVER "0.0.0.0"
+          !endif
+          !define ARP "Software\Microsoft\Windows\CurrentVersion\Uninstall\SChat"
           Name "SChat"
           OutFile "SChat-Setup.exe"
           InstallDir "$PROGRAMFILES64\SChat"
           RequestExecutionLevel admin
+          BrandingText "SChat ${APPVER}"
+          VIProductVersion "${VIVER}"
+          VIAddVersionKey "ProductName" "SChat"
+          VIAddVersionKey "ProductVersion" "${APPVER}"
+          VIAddVersionKey "FileVersion" "${VIVER}"
+          VIAddVersionKey "FileDescription" "SChat 安装程序"
+          VIAddVersionKey "LegalCopyright" "SChat"
+          !define MUI_ABORTWARNING
+          ; 完成页「立即运行」经 explorer.exe 启动 —— 安装器自己是 admin 提权的,直接 Exec
+          ; 会让 SChat 以管理员身份跑,其后的一键自更新重启还会继承管理员票据(与更新器
+          ; 「重启不带管理员票据」的既定口径冲突);由未提权的 shell 代为创建即降回普通用户。
+          !define MUI_FINISHPAGE_RUN
+          !define MUI_FINISHPAGE_RUN_TEXT "立即运行 SChat"
+          !define MUI_FINISHPAGE_RUN_FUNCTION LaunchAsUser
+          !insertmacro MUI_PAGE_WELCOME
           !insertmacro MUI_PAGE_DIRECTORY
           !insertmacro MUI_PAGE_INSTFILES
+          !insertmacro MUI_PAGE_FINISH
           !insertmacro MUI_UNPAGE_CONFIRM
           !insertmacro MUI_UNPAGE_INSTFILES
+          ; 语言顺序不要动:第一条是无匹配时的兜底,且刻意不插 MUI_LANGDLL —— 语言选择
+          ; 对话框会破坏更新器依赖的 `/S /D=<dir>` 静默升级。
           !insertmacro MUI_LANGUAGE "SimpChinese"
           !insertmacro MUI_LANGUAGE "English"
+          Function LaunchAsUser
+            Exec '"$WINDIR\explorer.exe" "$INSTDIR\SChat.exe"'
+          FunctionEnd
           Section "Install"
             SetOutPath "$INSTDIR"
             File /r "pkg\SChat\*.*"
@@ -722,15 +775,36 @@ jobs:
             nsExec::ExecToLog 'netsh advfirewall firewall delete rule name="SChat"'
             nsExec::ExecToLog 'netsh advfirewall firewall add rule name="SChat" dir=in action=allow program="$INSTDIR\SChat.exe" enable=yes profile=any'
             WriteUninstaller "$INSTDIR\uninstall.exe"
+            ; 「应用和功能」/控制面板里能看到并卸载 —— 此前只在安装目录里放了
+            ; uninstall.exe,系统卸载列表里根本不出现,用户没有正常的卸载入口。
+            WriteRegStr HKLM "${ARP}" "DisplayName" "SChat"
+            WriteRegStr HKLM "${ARP}" "DisplayIcon" "$INSTDIR\SChat.exe"
+            WriteRegStr HKLM "${ARP}" "DisplayVersion" "${APPVER}"
+            WriteRegStr HKLM "${ARP}" "Publisher" "SChat"
+            WriteRegStr HKLM "${ARP}" "InstallLocation" "$INSTDIR"
+            WriteRegStr HKLM "${ARP}" "UninstallString" '"$INSTDIR\uninstall.exe"'
+            WriteRegStr HKLM "${ARP}" "QuietUninstallString" '"$INSTDIR\uninstall.exe" /S'
+            WriteRegDWORD HKLM "${ARP}" "NoModify" 1
+            WriteRegDWORD HKLM "${ARP}" "NoRepair" 1
+            ${GetSize} "$INSTDIR" "/S=0K" $0 $1 $2
+            IntFmt $0 "0x%08X" $0
+            WriteRegDWORD HKLM "${ARP}" "EstimatedSize" "$0"
           SectionEnd
           Section "Uninstall"
             nsExec::ExecToLog 'netsh advfirewall firewall delete rule name="SChat"'
             Delete "$SMPROGRAMS\SChat.lnk"
             Delete "$DESKTOP\SChat.lnk"
+            DeleteRegKey HKLM "${ARP}"
             RMDir /r "$INSTDIR"
           SectionEnd
           NSI
-          makensis installer.nsi
+          # -INPUTCHARSET UTF8 不是可选项:这个脚本是 heredoc 写出来的 UTF-8(中文注释 +
+          # 中文界面串「立即运行 SChat」),而 makensis 默认按系统 ACP 读源码 —— 配上
+          # `Unicode true` 后遇到解不开的字节会直接 "Bad text encoding" 中止(makensis 3.10
+          # 本地实测)。NSIS 只在源文件带 BOM 时才自动认 UTF-8,heredoc 不产生 BOM;而
+          # `!encoding` 这个指令在 NSIS 里**不存在**(3.10 报 Invalid command)。
+          # 开关用 `-` 前缀不要用 `/`:MSYS2 会把 /INPUTCHARSET 当路径做转换。
+          makensis -INPUTCHARSET UTF8 -DAPPVER="$VER" -DVIVER="$VIVER" installer.nsi
           mv SChat-Setup.exe "out/SChat-windows-${VER}-x64-setup.exe"
           ls -la out
 
