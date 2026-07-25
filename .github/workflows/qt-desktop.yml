@@ -728,7 +728,13 @@ jobs:
           # 只在这个子 shell 里改 PATH:应用腿的部署路径是线上验证过的,不在这次改动里动它。
           QTLIBEXEC="$(qmake6 -query QT_INSTALL_LIBEXECS)"
           echo "QTLIBEXEC=$QTLIBEXEC"; ls "$QTLIBEXEC"/qmlimportscanner* 2>&1 | head -2 || true
-          if ! ( export PATH="$QTLIBEXEC:$PATH"; windeployqt --qmldir "$PWD/installer/ui/qml" --release --no-translations "$BOOT/SChatSetupUI.exe" ); then
+          # 两手都要:qmake6 吐的是 `D:/a/...` 这种 Windows 路径,**直接塞进 MSYS2 的冒号分隔
+          # PATH 会被 `D:` 的冒号劈成两段**(9.12.323 第一次修就栽在这,加了等于没加)——
+          # 所以先 cygpath -u 转成 /d/a/...;同时再把 qmlimportscanner 复制到 windeployqt 旁边,
+          # 覆盖「它其实是按自身目录找、根本不查 PATH」的另一种可能。两条都不成也不致命:
+          # 回退分支照样产出能用的包,只是引导子集大一些(首帧多约 1 秒)。
+          cp -n "$QTLIBEXEC"/qmlimportscanner* "$QTBIN"/ 2>/dev/null || true
+          if ! ( export PATH="$(cygpath -u "$QTLIBEXEC"):$PATH"; windeployqt --qmldir "$PWD/installer/ui/qml" --release --no-translations "$BOOT/SChatSetupUI.exe" ); then
             echo "windeployqt --qmldir failed for the setup UI → deploy core DLLs + copy QML modules manually"
             windeployqt --release --no-translations "$BOOT/SChatSetupUI.exe" || true
             mkdir -p "$BOOT/qml"
