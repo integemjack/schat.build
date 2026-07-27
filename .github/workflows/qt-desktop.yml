@@ -629,6 +629,29 @@ jobs:
           cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
           cmake --build build -j"$(nproc)"
 
+      # 安装器的三个非 Qt 产物必须**零第三方 DLL 依赖**。放松这一条的代价(源仓 qt 9.12.325
+      # 实证):setup.exe 动态依赖 libgcc_s_seh-1.dll,而更新器起它时的当前目录 = 安装目录
+      # (app 由快捷方式启动,CWD 一路继承),Windows 的 DLL 搜索顺序里当前目录排在 PATH 之
+      # 前 —— 安装器把「即将被覆盖的那个 DLL」映射进了自己进程,于是静默升级必然失败,bat
+      # 照常重启旧 exe:用户点了更新、重启后还是老版本。顺带,干净机器上双击安装包会直接
+      # 0xC0000135 起不来(开发机 PATH 上有 Git 的 mingw64\bin 兜着,看不出来)。
+      # 系统 DLL 没有 lib 前缀,MinGW 运行时全有 —— 判据就这么简单。
+      - name: Assert installer exes have no third-party DLL imports
+        working-directory: desktop/desktop-qt
+        run: |
+          set -e
+          fail=0
+          for f in build/installer/SChatSetup.exe build/installer/uninstall.exe build/installer/mkpkg.exe; do
+            bad=$(objdump -p "$f" | awk '/DLL Name:/ { print tolower($3) }' | grep -E '^lib' || true)
+            if [ -n "$bad" ]; then
+              echo "FATAL: $f 仍动态依赖: $bad(应静态链,见 installer/CMakeLists.txt 的 SCHAT_SETUP_STATIC_LINK)"
+              fail=1
+            else
+              echo "OK: $f 只导入系统 DLL"
+            fi
+          done
+          [ "$fail" = 0 ]
+
       - name: Package installer (windeployqt + 自制 mkpkg)
         working-directory: desktop/desktop-qt
         run: |
