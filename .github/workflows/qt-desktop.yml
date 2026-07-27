@@ -363,10 +363,20 @@ jobs:
       - name: Install universal Qt6 (official, via aqt)
         uses: jurplel/install-qt-action@v4
         with:
-          # 6.9+:ApplicationWindow 的 SafeArea/topPadding 与 ExpandedClientAreaHint 原生窗口
-          # 效果需要它(6.8 下 QML 已做运行时探测兼容,但 mac 端要完整 chrome)。Linux 包仍是
-          # Debian trixie 的 Qt 6.8 → QML 必须继续保持 6.8 兼容(勿用声明式 6.9+ 属性)。
-          version: "6.9.3"
+          # 用户口径 2026-07-27:**mac / Windows 用最新 Qt,Linux 留 6.8**。
+          # 三条腿的 Qt 来源本就不同,只有 mac 这条能自己选版本:
+          #   · mac  = aqt 装官方 Qt,包**自带** Qt(构建版本 = 用户机器上的运行版本)→ 钉最新;
+          #   · Win  = MSYS2 pacman 滚动仓库,本就恒为最新(2026-07 实测 qt6-base 6.11.1),
+          #            不钉版本 = 不需要动;
+          #   · Linux = **Debian trixie 容器的系统 Qt 6.8**,产物 .deb 走系统依赖分发,用户机器上
+          #            链的是他自己那份 6.8 —— 版本由发行版说了算,升不了。
+          # ⚠️ 因此 **QML 的兼容下限仍然是 6.8**(由 Linux 那条腿的运行时决定,与这里装什么无关):
+          #    绝不准声明式使用 6.9+ 属性,要用就 `if ("x" in win)` 运行时探测。9.12.159 的
+          #    `topPadding: 0` 就是这么把 mac dmg 与 trixie deb 一起干成「秒退且无崩溃报告」的。
+          version: "6.12.0"
+          # install-qt-action 自带的 aqtinstall 偏老,认不出新发布的版本目录(报 version not
+          # found)——钉一个能列出 6.12 的下限(本地 aqt 3.3.0 实测可列)。
+          aqtversion: ">=3.3.0"
           host: mac
           target: desktop
           arch: clang_64
