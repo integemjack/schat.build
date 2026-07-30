@@ -222,12 +222,18 @@ jobs:
           merge-multiple: true
       - name: List artifacts
         run: ls -laR dist || true
+      # 非 main 分支 = **测试版**:GitHub release 打 prerelease 标记,且绝不占用 "Latest"。
+      # 客户端据此分道:正式通道走 releases/latest(GitHub 定义上就排除 prerelease),
+      # 打开「接收测试版(Beta)」的客户端才去 /releases 列表里取最新的那条(含 prerelease)。
+      # 见 docs/update_distribution_plan.md 与三端的 beta 开关。
       - uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ env.SRC_REF }}-b${{ github.run_number }}
-          name: "SChat ${{ env.SRC_REF }} build ${{ github.run_number }}"
+          name: "SChat ${{ env.SRC_REF }} build ${{ github.run_number }}${{ env.SRC_REF == 'main' && '' || ' · 测试版' }}"
           body: ${{ steps.cl.outputs.body }}
           files: dist/**
+          prerelease: ${{ env.SRC_REF != 'main' }}
+          make_latest: ${{ env.SRC_REF == 'main' }}
 
       # ── Self-hosted update distribution (Step 2) — sign each desktop/android asset
       # with the official Ed25519 key, POST it to jiami.chat's release-upload endpoint,
@@ -254,7 +260,11 @@ jobs:
         continue-on-error: true
         env:
           RELEASE_SIGN_ED25519_KEY: ${{ secrets.RELEASE_SIGN_ED25519_KEY }}
-          RELEASE_UPLOAD_TOKEN: ${{ secrets.RELEASE_UPLOAD_TOKEN }}
+          # **非 main 分支不上传自建源**:jiami.chat 的 /desktop/releases/latest 只有一条「最新」,
+          # 把测试版推上去等于把所有正式用户直接升级到测试包。空 token = signer 跳过 HTTP 上传、
+          # 仍然签名并写出清单(下一步作为 GitHub 回退镜像附到 release 上,beta 通道就吃这份)。
+          RELEASE_UPLOAD_TOKEN: ${{ env.SRC_REF == 'main' && secrets.RELEASE_UPLOAD_TOKEN || '' }}
+          RELEASE_CHANNEL: ${{ env.SRC_REF == 'main' && 'stable' || 'beta' }}
           # The per-line changelog (same body attached to the GitHub release above). The signer
           # forwards it as the upload's `notes` field so the self-hosted manifest's notes/body is
           # populated — without this the desktop 更新说明 renders blank on the self-hosted path.
