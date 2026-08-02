@@ -39,7 +39,11 @@ jobs:
     # 只处理 Swift 版的触发提交（老式空提交/别的触发不抢这个 push）。
     # 手动 dispatch 没有提交说明，一律放行。
     if: "github.event_name == 'workflow_dispatch' || contains(github.event.head_commit.message, 'product: coast-swift')"
-    runs-on: macos-15
+    # ★ 必须是带 **SDK 26** 的镜像：2026-08 起 macos/Package.swift 的部署目标是 macOS 26
+    #   （整套界面建在 Liquid Glass 上）。镜像更旧的话 swift build 会在
+    #   「'v26' is unavailable / SDK 不支持」上失败。Select Xcode 一步会先当场喊出来。
+    #   装不了 26 的机器走 Qt 版（clashauto-mac-qt.yml，部署目标 13.0）。
+    runs-on: macos-26
     timeout-minutes: 90
     steps:
       - name: Parse trigger parameters
@@ -103,6 +107,15 @@ jobs:
           echo "使用 $latest"
           sudo xcode-select -s "$latest/Contents/Developer"
           swift --version
+          # ★ 部署目标是 macOS 26，SDK 不够新的话后面每一步都会以一堆看不懂的
+          #   「'v26' is unavailable」收场。在这里一句话说清，省得去翻编译日志。
+          sdk="$(xcrun --sdk macosx --show-sdk-version)"
+          echo "macOS SDK: $sdk"
+          case "$sdk" in
+            [1-9]|1[0-9]|2[0-5]|[1-9].*|1[0-9].*|2[0-5].*)
+              echo "::error::macOS SDK $sdk < 26 —— Package.swift 的部署目标是 macOS 26，换带 Xcode 26+ 的 runner 镜像"
+              exit 1;;
+          esac
 
       - name: Import Developer ID signing cert
         id: signcert
@@ -164,9 +177,12 @@ jobs:
           mkdir -p dist/dmgroot
           ditto "macos/Coast.app" "dist/dmgroot/Coast.app"
           ln -s /Applications dist/dmgroot/Applications
-          # ★ 文件名保持 ClashAuto-<ver>-macos-universal.dmg 一个字不动：
-          #   应用内更新按扩展名/文件名挑资源，改名会让所有老版本的一键更新失效。
-          DMG="dist/ClashAuto-${APP_VERSION}-macos-universal.dmg"
+          # ★ 名字里**不能**出现 qt：同一个 release 上还躺着 Qt 版的
+          #   Coast-<ver>-macos-universal-qt.dmg（macOS 13+ 兼容线），两条线的一键更新
+          #   全靠这个子串区分（Swift 侧 UpdateChecker.isQtLine 排除带 qt 的）。
+          #   2026-08 品牌串由 ClashAuto- 统一改成 Coast-；改前缀是安全的 —— 更新器按
+          #   平台/架构/扩展名挑资源，从不认前缀。
+          DMG="dist/Coast-${APP_VERSION}-macos-universal.dmg"
           hdiutil create -volname "Coast" -srcfolder dist/dmgroot -ov -format UDZO "$DMG"
           if [ -z "${NOTARY_KEY:-}" ]; then
             echo "缺 notary 凭据，无法公证"; exit 1
@@ -183,8 +199,8 @@ jobs:
       - name: Upload signed DMG artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ClashAuto-macos-universal-signed
-          path: dist/ClashAuto-*-macos-universal.dmg
+          name: Coast-macos-universal-signed
+          path: dist/Coast-*-macos-universal.dmg
 
       - name: Publish to clashauto release
         shell: bash
@@ -201,7 +217,7 @@ jobs:
             echo "触发方没指定 release-tag —— 跳过发布（DMG 已作为 artifact 上传）"
             exit 0
           fi
-          DMG="dist/ClashAuto-${APP_VERSION}-macos-universal.dmg"
+          DMG="dist/Coast-${APP_VERSION}-macos-universal.dmg"
           test -f "$DMG"
           shasum -a 256 "$DMG" | awk '{print $1}' > "$DMG.sha256"
           # 发布到触发方指定的 tag —— 正式版/beta 各回各家（早先只推空提交、这边只能猜
@@ -214,11 +230,11 @@ jobs:
           else
             if [ "$IS_PRERELEASE" = "true" ]; then
               gh release create "$RELEASE_TAG" -R ClashrAuto/clashauto \
-                --title "Clash Auto ${APP_VERSION} (beta · ${SRC_REF:-unknown})" --prerelease \
+                --title "Coast ${APP_VERSION} (beta · ${SRC_REF:-unknown})" --prerelease \
                 --notes "signed + notarized macOS build (built by schat.build)"
             else
               gh release create "$RELEASE_TAG" -R ClashrAuto/clashauto \
-                --title "Clash Auto ${APP_VERSION}" --latest \
+                --title "Coast ${APP_VERSION}" --latest \
                 --notes "signed + notarized macOS build (built by schat.build)"
             fi
           fi

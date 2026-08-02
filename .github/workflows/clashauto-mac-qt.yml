@@ -1,0 +1,351 @@
+# 在 schat.build（已配好 Developer ID 签名/公证 secret）里构建 ClashrAuto/clashauto 的
+# **Qt 版 macOS 包**，签名+公证后发布到 clashauto 仓库的 Release。
+#
+# 与同目录的 clashauto-mac.yml（Swift 版）是**并存的两条产品线**，同一个 release 上各占一个
+# 资源，靠文件名里的 -qt 区分：
+#   Swift → Coast-<ver>-macos-universal.dmg      —— 部署目标 macOS 26，整套界面建在 Liquid Glass 上
+#   Qt    → Coast-<ver>-macos-universal-qt.dmg   —— 部署目标 13.0，Intel + Apple Silicon 胖包
+# ★ 名字里的 -qt 是**刚性契约**：两边 app 的一键更新都按它区分资源（Swift 侧
+#   UpdateChecker.isQtLine 把带 qt 的排除，Qt 侧 UpdateController::recommendedIndex 反过来
+#   优先挑它）。改掉或去掉这个标记 = 让用户被静默换到另一条产品线上。
+#
+# 触发：clashauto 的 trigger-mac job 往本分支推一个空提交，参数写在**提交说明**里（一行一个）。
+# 那一个提交同时带 `product: coast-swift` 和 `product: coast-qt` 两行 —— 两个 workflow 各按
+# 自己那行认领（两条线各推各的提交会在同一分支上撞成非快进，故意合成一次）。
+#   source-sha: <要构建的 clashauto commit>
+#   source-ref: <来源分支名，beta 标题用>
+#   release-tag: <发布到的 tag，如 v1.0.520 或 v1.0.521-beta.abc1234>
+#   prerelease: true|false
+#   version: <纯数字版本，如 1.0.520>
+#   product: coast-qt
+# 手动 workflow_dispatch 时没有提交说明，一律放行。
+#
+# 构建步骤与 clashauto 自己 CI 里的 `macos` job **同源**（那边只做编译自检 + 未签名 artifact，
+# 不发布）。改动其中一边时另一边要跟着改，否则发布出去的包和 CI 验过的包不是一个东西。
+#
+# 需要的 secret（本仓库 integemjack/schat.build）：
+#   MACOS_CERT_P12 / MACOS_CERT_PW / MACOS_NOTARY_KEY / MACOS_NOTARY_KEY_ID / MACOS_NOTARY_ISSUER
+#   CLASHAUTO_RELEASE_TOKEN —— 对 ClashrAuto/clashauto 有 contents:write 的 PAT
+name: clashauto macOS Qt (signed)
+
+on:
+  push:
+    branches: [clashauto-mac]
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "要构建的 clashauto 分支/commit"
+        default: "master"
+        required: false
+      release_tag:
+        description: "上传到哪个 release tag（留空则不发布，只出 artifact）"
+        required: false
+
+env:
+  QT_VERSION: 6.8.3
+  BUILD_DIR: build-release
+
+jobs:
+  clashauto-macos-qt:
+    name: clashauto macOS universal Qt (signed + notarized)
+    # 只处理 Qt 版的触发提交（Swift 的触发/老式空提交不抢这个 push）。
+    if: "github.event_name == 'workflow_dispatch' || contains(github.event.head_commit.message, 'product: coast-qt')"
+    runs-on: macos-15
+    timeout-minutes: 90
+    steps:
+      - name: Parse trigger parameters
+        id: trig
+        shell: bash
+        env:
+          # 经 env 传入而不是内插进脚本：提交说明是外部输入，内插会被当 shell 源码执行
+          TRIGGER_MSG: ${{ github.event.head_commit.message }}
+          DISPATCH_REF: ${{ github.event.inputs.ref }}
+          DISPATCH_TAG: ${{ github.event.inputs.release_tag }}
+        run: |
+          set -euo pipefail
+          param() { printf '%s\n' "${TRIGGER_MSG:-}" | sed -nE "s/^$1: (.*)\$/\1/p" | head -n 1; }
+          sha="$(param source-sha)"
+          tag="$(param release-tag)"; [ -n "$tag" ] || tag="${DISPATCH_TAG:-}"
+          {
+            echo "ref=${sha:-${DISPATCH_REF:-master}}"
+            echo "tag=$tag"
+            echo "prerelease=$(param prerelease)"
+            echo "version=$(param version)"
+            echo "srcref=$(param source-ref)"
+          } >> "$GITHUB_OUTPUT"
+          echo "构建 ref=${sha:-${DISPATCH_REF:-master}}  目标 release=${tag:-（未指定，只出 artifact）}"
+
+      - name: Checkout clashauto
+        uses: actions/checkout@v4
+        with:
+          repository: ClashrAuto/clashauto
+          ref: ${{ steps.trig.outputs.ref }}
+          fetch-depth: 0
+
+      - name: Resolve version/tag
+        shell: bash
+        env:
+          IN_TAG: ${{ steps.trig.outputs.tag }}
+          IN_VER: ${{ steps.trig.outputs.version }}
+          IN_PRE: ${{ steps.trig.outputs.prerelease }}
+        run: |
+          set -euo pipefail
+          # 优先用触发参数（与 clashauto CI 建的 release 严丝合缝）；手动触发才现算。
+          version="$IN_VER"
+          if [ -z "$version" ]; then
+            base="$(sed -nE 's/.*project[[:space:]]*\([[:space:]]*[^ ]+[[:space:]]+VERSION[[:space:]]+([0-9]+(\.[0-9]+){1,3}).*/\1/p' clashauto-c++/CMakeLists.txt | head -n 1)"
+            [ -n "$base" ] || { echo "Cannot find project VERSION"; exit 1; }
+            major="$(echo "$base" | cut -d. -f1)"; minor="$(echo "$base" | cut -d. -f2)"; [ -n "$minor" ] || minor=0
+            version="${major}.${minor}.$(git rev-list --count HEAD)"
+          fi
+          {
+            echo "APP_VERSION=$version"
+            echo "RELEASE_TAG=${IN_TAG:-}"
+            echo "IS_PRERELEASE=${IN_PRE:-false}"
+          } >> "$GITHUB_ENV"
+          echo "version=$version tag=${IN_TAG:-（未指定，只出 artifact）} prerelease=${IN_PRE:-false}"
+
+      - name: Install build dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          brew install ninja
+          python3 -m pip install --user aqtinstall pillow \
+            || python3 -m pip install --user --break-system-packages aqtinstall pillow
+
+      - name: Install Qt (universal)
+        shell: bash
+        run: |
+          set -euo pipefail
+          # aqt 的 mac 官方构建即 x86_64+arm64 通用二进制
+          python3 -m aqt install-qt mac desktop "$QT_VERSION" clang_64 -O "$HOME/Qt"
+          echo "QT_ROOT=$HOME/Qt/$QT_VERSION/macos" >> "$GITHUB_ENV"
+
+      - name: Generate icon.icns
+        shell: bash
+        run: |
+          set -euo pipefail
+          # 从 assets/icon.ico 取最大帧生成 iconset → icns；CMake 检测到该文件即打进 Resources
+          python3 - <<'PY'
+          from PIL import Image
+          import pathlib
+
+          ico = Image.open("clashauto-c++/assets/icon.ico")
+          sizes = sorted(ico.info.get("sizes") or {ico.size})
+          ico.size = sizes[-1]
+          ico.load()
+          base = ico.convert("RGBA")
+          out = pathlib.Path("icon.iconset")
+          out.mkdir(exist_ok=True)
+          for s in (16, 32, 128, 256, 512):
+              base.resize((s, s), Image.LANCZOS).save(out / f"icon_{s}x{s}.png")
+              base.resize((s * 2, s * 2), Image.LANCZOS).save(out / f"icon_{s}x{s}@2x.png")
+          PY
+          iconutil -c icns -o clashauto-c++/assets/icon.icns icon.iconset
+
+      - name: Configure
+        shell: bash
+        run: |
+          # ★ 部署目标 13.0 是这条线存在的**全部理由**（Swift 那条要 macOS 26）。别往上抬。
+          cmake -S clashauto-c++ -B "$BUILD_DIR" -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DAPP_VERSION="$APP_VERSION" \
+            -DCMAKE_PREFIX_PATH="$QT_ROOT" \
+            -DCMAKE_OSX_ARCHITECTURES="x86_64;arm64" \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=13.0
+
+      - name: Build
+        shell: bash
+        run: cmake --build "$BUILD_DIR" --parallel
+
+      - name: Verify universal binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          bin="$BUILD_DIR/Coast.app/Contents/MacOS/Coast"
+          lipo -archs "$bin"
+          lipo -archs "$bin" | grep -q x86_64
+          lipo -archs "$bin" | grep -q arm64
+
+      - name: Bundle latest stable core
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # 与 clashauto CI 其余各平台同一套规则：/releases 全量列表（不能用 /releases/latest
+          # ——fork 从上游继承了一堆零资产空 tag）、跳过 draft/prerelease、必须真带本平台产物。
+          # 落到 Contents/Resources/core，首次运行由 CoreController::seedBundledCore() 落位到
+          # userDir/command/core（缺了才补，绝不覆盖）。
+          # ★ 必须**在签名之前**：往已签名的 .app 里塞文件会当场破坏封存。
+          curl -fsSL --retry 3 -H "Authorization: Bearer $GH_TOKEN" -H 'Accept: application/vnd.github+json' \
+            'https://api.github.com/repos/ClashrAuto/clash/releases?per_page=20' -o /tmp/core-releases.json
+          pick() {  # 参数 = 产物名前缀（按优先级），打印下载直链
+            python3 - /tmp/core-releases.json "$@" <<'PY'
+          import json, sys
+          releases = json.load(open(sys.argv[1]))
+          for release in releases:
+              if release.get("draft") or release.get("prerelease"):
+                  continue
+              for prefix in sys.argv[2:]:
+                  for asset in release.get("assets", []):
+                      name = asset.get("name", "")
+                      if name.startswith(prefix) and name.endswith(".gz"):
+                          print(asset["browser_download_url"])
+                          sys.exit(0)
+          sys.exit(1)
+          PY
+          }
+          fetch() {  # $1 = 输出文件，其余 = 前缀
+            local out="$1"; shift
+            local url
+            url="$(pick "$@")" || { echo "正式版通道里没有 $* 产物" >&2; return 1; }
+            echo "集成内核: $(basename "$url")"
+            # 下载直链不带 Authorization：它 302 到对象存储，多带一层凭据可能被拒
+            curl -fsSL --retry 3 "$url" | gunzip > "$out"
+            test -s "$out"
+          }
+          # amd64 优先 -compatible（v1 基线）：普通 amd64 产物是 GOAMD64=v3，老 Intel 机
+          # 直接非法指令崩 —— 与 CoreRelease.h / make_app.sh 的挑选顺序一字不差。
+          fetch /tmp/core-arm64 "coast-darwin-arm64-"
+          fetch /tmp/core-amd64 "coast-darwin-amd64-compatible-" "coast-darwin-amd64-v1-"
+          # Go 二进制可以直接 lipo —— 和 .app 的两架构对齐，哪半跑就用哪半。
+          mkdir -p "$BUILD_DIR/Coast.app/Contents/Resources"
+          lipo -create /tmp/core-arm64 /tmp/core-amd64 \
+            -output "$BUILD_DIR/Coast.app/Contents/Resources/core"
+          chmod 755 "$BUILD_DIR/Coast.app/Contents/Resources/core"
+          lipo -archs "$BUILD_DIR/Coast.app/Contents/Resources/core"
+
+      - name: Import Developer ID signing cert
+        id: signcert
+        shell: bash
+        env:
+          CERT_P12: ${{ secrets.MACOS_CERT_P12 }}
+          CERT_PW: ${{ secrets.MACOS_CERT_PW }}
+        run: |
+          set -euo pipefail
+          if [ -z "${CERT_P12:-}" ]; then
+            echo "MACOS_CERT_P12 未设置 — 无法签名（本工作流要求真签名）"; exit 1
+          fi
+          KC="$RUNNER_TEMP/sign.keychain-db"; KPW="$(openssl rand -base64 18)"
+          security create-keychain -p "$KPW" "$KC"
+          security set-keychain-settings -lut 21600 "$KC"
+          security unlock-keychain -p "$KPW" "$KC"
+          echo "$CERT_P12" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security import "$RUNNER_TEMP/cert.p12" -k "$KC" -P "${CERT_PW:-}" \
+            -T /usr/bin/codesign -T /usr/bin/security
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KPW" "$KC" >/dev/null
+          security list-keychains -d user -s "$KC" $(security list-keychains -d user | sed 's/"//g')
+          IDENTITY=$(security find-identity -v -p codesigning "$KC" | grep -m1 "Developer ID Application" | sed -E 's/.*"(.*)".*/\1/')
+          rm -f "$RUNNER_TEMP/cert.p12"
+          [ -n "$IDENTITY" ] || { echo "证书里没有 Developer ID Application 身份"; exit 1; }
+          echo "identity=$IDENTITY" >> "$GITHUB_OUTPUT"
+          echo "imported identity: $IDENTITY"
+
+      - name: Stage app bundle (macdeployqt + sign)
+        shell: bash
+        env:
+          SIGN_IDENTITY: ${{ steps.signcert.outputs.identity }}
+        run: |
+          set -euo pipefail
+          APP="$BUILD_DIR/Coast.app"
+          "$QT_ROOT/bin/macdeployqt" "$APP" -verbose=1
+
+          # 重新嵌入特权 helper 与其 launchd plist（macdeployqt 可能动过 Contents/MacOS）。
+          # helper 独立可执行由 CMake 构建在 $BUILD_DIR 根下（OUTPUT_NAME），universal。
+          mkdir -p "$APP/Contents/Library/LaunchDaemons"
+          cp "$BUILD_DIR/com.yuehongsun.coast.helper" "$APP/Contents/MacOS/com.yuehongsun.coast.helper"
+          cp "clashauto-c++/helper/com.yuehongsun.coast.helper.plist" "$APP/Contents/Library/LaunchDaemons/"
+          lipo -archs "$APP/Contents/MacOS/com.yuehongsun.coast.helper"
+
+          # 签名（公证必需硬化运行时 + 安全时间戳）。macdeployqt 之后再签：install_name_tool
+          # 改写会破坏更早的签名。
+          # 关键：helper 必须用显式 -i 指定 identifier = com.yuehongsun.coast.helper（= launchd Label）。
+          # 否则 codesign 把可执行名末尾的「.helper」当扩展名剥掉，identifier 变成 com.yuehongsun.coast，
+          # 与注册 Label 不一致 → SMAppService daemon 启动即被 Launch Constraint Violation SIGKILL，
+          # 核心无法 root。用 --deep 一把签全（含 frameworks）会把 helper identifier 又剥回去，
+          # 故末尾再单独 -i 重签 helper + 浅签 app 重新封存。
+          HELPER="$APP/Contents/MacOS/com.yuehongsun.coast.helper"
+          HELPER_ID="com.yuehongsun.coast.helper"
+          codesign --force --deep --options runtime --timestamp --sign "$SIGN_IDENTITY" "$APP"
+          codesign --force --options runtime --timestamp -i "$HELPER_ID" --sign "$SIGN_IDENTITY" "$HELPER"
+          codesign --force --options runtime --timestamp --sign "$SIGN_IDENTITY" "$APP"
+
+          # 结构自查：封存完整 + 内核在位（缺了要等用户首启才炸，CI 就该拦住）
+          codesign --verify --deep --strict --verbose=2 "$APP"
+          codesign --verify --strict --verbose=2 "$HELPER"
+          test -x "$APP/Contents/Resources/core"
+          test -f "$APP/Contents/Library/LaunchDaemons/com.yuehongsun.coast.helper.plist"
+          echo "helper identity:"; codesign -dvv "$HELPER" 2>&1 | grep -Ei 'Identifier|TeamIdentifier'
+
+      - name: Create DMG + notarize + staple
+        shell: bash
+        env:
+          NOTARY_KEY: ${{ secrets.MACOS_NOTARY_KEY }}
+          NOTARY_KEY_ID: ${{ secrets.MACOS_NOTARY_KEY_ID }}
+          NOTARY_ISSUER: ${{ secrets.MACOS_NOTARY_ISSUER }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist/dmgroot
+          ditto "$BUILD_DIR/Coast.app" "dist/dmgroot/Coast.app"
+          ln -s /Applications dist/dmgroot/Applications
+          # ★ 名字里的 -qt 是刚性契约，见文件头。去掉它，两条产品线的一键更新会互相串包。
+          DMG="dist/Coast-${APP_VERSION}-macos-universal-qt.dmg"
+          hdiutil create -volname "Coast" -srcfolder dist/dmgroot -ov -format UDZO "$DMG"
+          if [ -z "${NOTARY_KEY:-}" ]; then
+            echo "缺 notary 凭据，无法公证"; exit 1
+          fi
+          echo "$NOTARY_KEY" | base64 --decode > "$RUNNER_TEMP/nkey.p8"
+          xcrun notarytool submit "$DMG" \
+            --key "$RUNNER_TEMP/nkey.p8" --key-id "$NOTARY_KEY_ID" --issuer "$NOTARY_ISSUER" \
+            --wait --timeout 45m
+          xcrun stapler staple "$DMG"
+          xcrun stapler validate "$DMG" && echo "notarized + stapled OK"
+          rm -f "$RUNNER_TEMP/nkey.p8"
+
+      # 无论如何都把签名+公证的 DMG 作为本 run 的 artifact 上传（无需跨仓库 token，可直接下载测）
+      - name: Upload signed DMG artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Coast-macos-universal-qt-signed
+          path: dist/Coast-*-macos-universal-qt.dmg
+
+      - name: Publish to clashauto release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.CLASHAUTO_RELEASE_TOKEN }}
+          SRC_REF: ${{ steps.trig.outputs.srcref }}
+        run: |
+          set -euo pipefail
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo "未设置 CLASHAUTO_RELEASE_TOKEN —— 跳过发布（DMG 已作为 artifact 上传）"
+            exit 0
+          fi
+          if [ -z "${RELEASE_TAG:-}" ]; then
+            echo "触发方没指定 release-tag —— 跳过发布（DMG 已作为 artifact 上传）"
+            exit 0
+          fi
+          DMG="dist/Coast-${APP_VERSION}-macos-universal-qt.dmg"
+          test -f "$DMG"
+          shasum -a 256 "$DMG" | awk '{print $1}' > "$DMG.sha256"
+          # 发布到触发方指定的 tag —— 正式版/beta 各回各家。
+          # ★ prerelease 绝不能碰 latest：/releases/latest 是正式版通道。
+          # ★ 与 Swift 那条线传的是**不同文件名**（-qt），所以两边的 --clobber 各管各的，
+          #   不会互相覆盖 —— 这正是当初 Qt 版 mac 包被整个停掉的原因，别再让名字撞上。
+          if gh release view "$RELEASE_TAG" -R ClashrAuto/clashauto >/dev/null 2>&1; then
+            if [ "$IS_PRERELEASE" != "true" ]; then
+              gh release edit "$RELEASE_TAG" -R ClashrAuto/clashauto --latest >/dev/null 2>&1 || true
+            fi
+          else
+            if [ "$IS_PRERELEASE" = "true" ]; then
+              gh release create "$RELEASE_TAG" -R ClashrAuto/clashauto \
+                --title "Coast ${APP_VERSION} (beta · ${SRC_REF:-unknown})" --prerelease \
+                --notes "signed + notarized macOS build (built by schat.build)"
+            else
+              gh release create "$RELEASE_TAG" -R ClashrAuto/clashauto \
+                --title "Coast ${APP_VERSION}" --latest \
+                --notes "signed + notarized macOS build (built by schat.build)"
+            fi
+          fi
+          gh release upload "$RELEASE_TAG" "$DMG" "$DMG.sha256" --clobber -R ClashrAuto/clashauto
+          echo "uploaded $DMG → ${RELEASE_TAG} (prerelease=$IS_PRERELEASE)"
