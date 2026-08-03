@@ -273,13 +273,21 @@ jobs:
           #   notary 认不认全看运气 —— 实测公证结果就是 `status: Invalid`。
           #   改成照 Swift 线 `make_app.sh` 的做法**自底向上逐个签**。那边注释写得明白：
           #   「公证会扫到 bundle 里**每一个**可执行文件，漏签它整个 .app 都过不了 notarytool」。
-          # 1) 所有嵌套 Mach-O：Qt 插件、各种 dylib，以及内嵌的内核 Resources/core
+          # 1) 嵌套 Mach-O：Qt 插件、各种 dylib，以及内嵌的内核 Resources/core。
+          #    刨掉两处，都是「给 codesign 一个路径，它却去签别的东西」：
+          #    - Contents/MacOS/*：主可执行文件的路径会被解析成**整个 app bundle**，
+          #      此时 helper 还没签 → `code object is not signed at all / In subcomponent: …helper`。
+          #      主程序和 helper 都由后面第 4、5 步显式签。
+          #    - Contents/Frameworks/*.framework/*：framework 内部二进制同理会解析成整个
+          #      framework 包，交给第 2 步整包签。
           n=0
           while IFS= read -r -d '' f; do
             case "$(file -b "$f")" in *Mach-O*) ;; *) continue ;; esac
             sign "$f" >/dev/null
             n=$((n+1))
-          done < <(find "$APP/Contents" -type f \( -perm -u+x -o -name '*.dylib' -o -name '*.so' \) -print0)
+          done < <(find "$APP/Contents" -type f \( -perm -u+x -o -name '*.dylib' -o -name '*.so' \) \
+                        ! -path "$APP/Contents/MacOS/*" \
+                        ! -path "$APP/Contents/Frameworks/*.framework/*" -print0)
           echo "嵌套 Mach-O 已签 $n 个"
           # 2) framework 整包（重新封存内部结构）
           for fw in "$APP/Contents/Frameworks"/*.framework; do
