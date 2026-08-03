@@ -263,13 +263,34 @@ jobs:
           # 关键：helper 必须用显式 -i 指定 identifier = com.yuehongsun.coast.helper（= launchd Label）。
           # 否则 codesign 把可执行名末尾的「.helper」当扩展名剥掉，identifier 变成 com.yuehongsun.coast，
           # 与注册 Label 不一致 → SMAppService daemon 启动即被 Launch Constraint Violation SIGKILL，
-          # 核心无法 root。用 --deep 一把签全（含 frameworks）会把 helper identifier 又剥回去，
-          # 故末尾再单独 -i 重签 helper + 浅签 app 重新封存。
+          # 核心无法 root。所以 helper 那一签必须排在外层 app 之前、且带 -i。
           HELPER="$APP/Contents/MacOS/com.yuehongsun.coast.helper"
           HELPER_ID="com.yuehongsun.coast.helper"
-          codesign --force --deep --options runtime --timestamp --sign "$SIGN_IDENTITY" "$APP"
-          codesign --force --options runtime --timestamp -i "$HELPER_ID" --sign "$SIGN_IDENTITY" "$HELPER"
-          codesign --force --options runtime --timestamp --sign "$SIGN_IDENTITY" "$APP"
+          sign() { codesign --force --options runtime --timestamp --sign "$SIGN_IDENTITY" "$@"; }
+
+          # ★ **不用 `--deep`**（原来就是它一把梭的）。Apple 明说 --deep 不适合分发/公证：
+          #   它对嵌套代码套用同一套参数，Qt 打包出来的 framework/插件结构复杂，签出来的东西
+          #   notary 认不认全看运气 —— 实测公证结果就是 `status: Invalid`。
+          #   改成照 Swift 线 `make_app.sh` 的做法**自底向上逐个签**。那边注释写得明白：
+          #   「公证会扫到 bundle 里**每一个**可执行文件，漏签它整个 .app 都过不了 notarytool」。
+          # 1) 所有嵌套 Mach-O：Qt 插件、各种 dylib，以及内嵌的内核 Resources/core
+          n=0
+          while IFS= read -r -d '' f; do
+            case "$(file -b "$f")" in *Mach-O*) ;; *) continue ;; esac
+            sign "$f" >/dev/null
+            n=$((n+1))
+          done < <(find "$APP/Contents" -type f \( -perm -u+x -o -name '*.dylib' -o -name '*.so' \) -print0)
+          echo "嵌套 Mach-O 已签 $n 个"
+          # 2) framework 整包（重新封存内部结构）
+          for fw in "$APP/Contents/Frameworks"/*.framework; do
+            [ -d "$fw" ] && sign "$fw" >/dev/null
+          done
+          # 3) 内核给它自己的 identifier（与 Swift 线一致，便于事后辨认是谁签的）
+          [ -f "$APP/Contents/Resources/core" ] && sign -i com.yuehongsun.coast.core "$APP/Contents/Resources/core"
+          # 4) helper：identifier 必须显式给（理由见上面那段）
+          sign -i "$HELPER_ID" "$HELPER"
+          # 5) 最后签外层 app，重新封存
+          sign "$APP"
 
           # 结构自查：封存完整 + 内核在位（缺了要等用户首启才炸，CI 就该拦住）
           codesign --verify --deep --strict --verbose=2 "$APP"
@@ -296,9 +317,24 @@ jobs:
             echo "缺 notary 凭据，无法公证"; exit 1
           fi
           echo "$NOTARY_KEY" | base64 --decode > "$RUNNER_TEMP/nkey.p8"
-          xcrun notarytool submit "$DMG" \
+          # ★ `notarytool submit --wait` **被拒也返回 0** —— 只 `--wait` 不看结果的话，失败会以
+          #   「stapler staple 报 Error 65」的样子冒出来（票据根本不存在），而苹果给的**逐条
+          #   原因从头到尾没人取过**。这正是 Qt 版 DMG 一直传不上 release 的实情：
+          #   它压根没走到上传那一步，卡在公证被拒（status: Invalid）。
+          #   所以这里显式判状态，被拒就把 notarytool log 打出来再失败。
+          out="$(xcrun notarytool submit "$DMG" \
             --key "$RUNNER_TEMP/nkey.p8" --key-id "$NOTARY_KEY_ID" --issuer "$NOTARY_ISSUER" \
-            --wait --timeout 45m
+            --wait --timeout 45m --output-format json)"
+          echo "$out"
+          sub_id="$(printf '%s' "$out" | python3 -c 'import json,sys;print(json.load(sys.stdin).get("id",""))')"
+          status="$(printf '%s' "$out" | python3 -c 'import json,sys;print(json.load(sys.stdin).get("status",""))')"
+          if [ "$status" != "Accepted" ]; then
+            echo "::error::公证被拒（status=$status）。以下是苹果给出的逐条原因："
+            xcrun notarytool log "$sub_id" \
+              --key "$RUNNER_TEMP/nkey.p8" --key-id "$NOTARY_KEY_ID" --issuer "$NOTARY_ISSUER" || true
+            rm -f "$RUNNER_TEMP/nkey.p8"
+            exit 1
+          fi
           xcrun stapler staple "$DMG"
           xcrun stapler validate "$DMG" && echo "notarized + stapled OK"
           rm -f "$RUNNER_TEMP/nkey.p8"

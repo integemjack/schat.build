@@ -188,9 +188,21 @@ jobs:
             echo "缺 notary 凭据，无法公证"; exit 1
           fi
           echo "$NOTARY_KEY" | base64 --decode > "$RUNNER_TEMP/nkey.p8"
-          xcrun notarytool submit "$DMG" \
+          # ★ `notarytool submit --wait` **被拒也返回 0**：不判状态的话，失败会以
+          #   「stapler 报 Error 65」的样子冒出来，苹果给的原因一条都取不到（Qt 那条线就是
+          #   这么卡了很久没人看出来的）。这里显式判，被拒就打日志再失败。
+          out="$(xcrun notarytool submit "$DMG" \
             --key "$RUNNER_TEMP/nkey.p8" --key-id "$NOTARY_KEY_ID" --issuer "$NOTARY_ISSUER" \
-            --wait --timeout 45m
+            --wait --timeout 45m --output-format json)"
+          echo "$out"
+          sub_id="$(printf '%s' "$out" | python3 -c 'import json,sys;print(json.load(sys.stdin).get("id",""))')"
+          status="$(printf '%s' "$out" | python3 -c 'import json,sys;print(json.load(sys.stdin).get("status",""))')"
+          if [ "$status" != "Accepted" ]; then
+            echo "::error::公证被拒（status=$status）。以下是苹果给出的逐条原因："
+            xcrun notarytool log "$sub_id" \
+              --key "$RUNNER_TEMP/nkey.p8" --key-id "$NOTARY_KEY_ID" --issuer "$NOTARY_ISSUER" || true
+            exit 1
+          fi
           xcrun stapler staple "$DMG"
           xcrun stapler validate "$DMG" && echo "notarized + stapled OK"
           rm -f "$RUNNER_TEMP/nkey.p8"
