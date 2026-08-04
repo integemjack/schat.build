@@ -637,7 +637,8 @@ jobs:
             git curl
             mingw-w64-x86_64-gcc mingw-w64-x86_64-cmake mingw-w64-x86_64-ninja
             mingw-w64-x86_64-pkgconf
-            mingw-w64-x86_64-qt6-static mingw-w64-x86_64-qt6-base
+            mingw-w64-x86_64-qt6-static
+            mingw-w64-x86_64-qt6-base mingw-w64-x86_64-qt6-imageformats
             mingw-w64-x86_64-opus mingw-w64-x86_64-libsodium mingw-w64-x86_64-openh264
             mingw-w64-x86_64-openssl mingw-w64-x86_64-libsrtp
 
@@ -646,13 +647,18 @@ jobs:
       # 5compat/shadertools/websockets/imageformats/tools,前缀 /mingw64/qt6-static,约 2.7GB
       # 装完)。三条腿里只有这条能直接装现成的 —— mac / Linux 得走 qt-static.yml 自编。
       #
-      # ⚠️ **qt6-base(动态那套)也必须装,装的不是 Qt 而是它的第三方依赖闭包。**
-      # 静态 Qt 的 CMake 配置在**链接期**要求 WrapSystemPNG / WrapFreetype / WrapSystemHarfbuzz /
-      # WrapPCRE2 / WrapSystemMd4c / WrapZSTD / double-conversion / icu / sqlite3 … 全部可见;
-      # 动态时代这些是 Qt6Gui.dll 自己的事,与我们无关,静态之后变成我们的事。第一版把
-      # qt6-base 删掉了,结果 configure 直接 `Failed to find required Qt component "Gui"`
-      # (紧挨着的一行是 `Could NOT find WrapSystemPNG`,Build All run 30941213539 实证)。
-      # 用 qt6-base 的依赖闭包而不是手抄一份 Wrap* 清单:手抄的那种每次 Qt 升级都会悄悄过期。
+      # ⚠️ **动态的 qt6-base / qt6-imageformats 也必须装,装的不是 Qt 而是它们的第三方依赖闭包。**
+      # 静态 Qt 的 CMake 配置在**链接期**要求这些第三方全部可见:WrapSystemPNG / WrapFreetype /
+      # WrapSystemHarfbuzz / WrapPCRE2 / WrapSystemMd4c / WrapZSTD / double-conversion / icu /
+      # sqlite3(以上来自 qt6-base),以及 **TIFF / WrapWebP**(来自 qt6-imageformats —— Qt6Gui
+      # 在静态构建下会把 imageformats 插件全集链进来,qtiff/qwebp 于是把 libtiff/libwebp 变成
+      # 我们的链接期依赖)。动态时代这些统统是 Qt6Gui.dll 自己的事,与我们无关。
+      #
+      # 两次实证(都是 configure 直接 `Failed to find required Qt component "Gui"`,真正的原因
+      # 在紧挨着的上一行):Build All run 30941213539 = `Could NOT find WrapSystemPNG`(删了
+      # qt6-base);qt-desktop run 30942523400 = `Could NOT find TIFF` + `WrapWebP`(只补了
+      # qt6-base)。**规则:静态 kit 里我们会链到的每个模块,都要装它的动态同名包取依赖闭包。**
+      # 用依赖闭包而不是手抄一份 Wrap*/lib* 清单:手抄的那种每次 Qt 升级都会悄悄过期。
       #
       # 两套 Qt 同时在机器上的风险(find_package 命中哪一套)由两道闸挡住:
       #   ① configure 显式 `-DQt6_DIR=/mingw64/qt6-static/lib/cmake/Qt6` —— Qt6Config 找组件时
