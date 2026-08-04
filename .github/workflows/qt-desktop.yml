@@ -803,21 +803,23 @@ jobs:
           dll_closure "$STAGE"
           echo "staged top-level DLLs: $(find "$STAGE" -maxdepth 1 -iname '*.dll' | wc -l)"
           find "$STAGE" -maxdepth 1 -iname '*.dll' -printf '%f\n' | sort
-          # ⚠️ 判据**翻转了**:动态时代是「这三个必须在」,现在是「这三个一个都不许在」。
-          # 别看到旧注释里写着 `FATAL: libgcc_s_seh-1.dll missing` 就以为是退化 —— 安装目录里
-          # 只要重新出现它们,9.12.326 那条根因就原样复活(一键升级时 setup.exe 从安装目录把
-          # 它们映射进自己进程,覆盖正在映射的镜像被系统禁止 → 点了更新、重启后还是老版本)。
-          for forbidden in libgcc_s_seh-1 libstdc++-6 libwinpthread-1; do
-            if [ -f "$STAGE/$forbidden.dll" ]; then
-              echo "FATAL: 安装目录里出现了 $forbidden.dll —— 静态链没生效,一键升级会失败"
-              exit 1
-            fi
-          done
-          # Qt 也不该有任何一份落地
+          # ⚠️ **安装目录里出现 libgcc_s_seh-1 / libstdc++-6 / libwinpthread-1 是正常的,不要
+          # 为此加断言。** 曾经加过一条「这三个一个都不许在」,当场被闭包打脸(run 30945274179):
+          # MSYS2 的第三方 DLL(libpng/libfreetype/libharfbuzz…)**自己**动态依赖 MinGW 运行时,
+          # 只要还带着这些第三方,这三个就必然被闭包解出来。
+          #
+          # 那条断言错在**把 9.12.326 的根因记成了「目录里有这三个 DLL」**。真正的根因是
+          # **安装器自己动态依赖它们** —— setup.exe 由更新器从安装目录作为 CWD 启动,Windows
+          # 的 DLL 搜索顺序里当前目录排在 PATH 之前,于是它把「即将被自己覆盖的镜像」映射进了
+          # 自己的进程。守这条的是上面那个对 SChatSetup.exe/uninstall.exe/mkpkg.exe 跑 objdump
+          # 的断言(它们必须零第三方导入),**不是**目录内容。安装器静态链之后,目录里这些
+          # DLL 只被 SChat.exe 映射,而升级时 SChat.exe 已经退出,覆盖它们没有任何问题。
+          #
+          # 这里只留 Qt 这一条:Qt 落地任何一份 DLL 都说明静态化没生效。
           if find "$STAGE" -iname 'Qt6*.dll' | grep .; then
             echo "FATAL: 安装目录里有 Qt6*.dll —— Qt 没静态成"; exit 1
           fi
-          echo "OK: 无 MinGW 运行时三件套、无 Qt6*.dll"
+          echo "OK: 安装目录无 Qt6*.dll(Qt 已编进 exe)"
           # ── 自制安装器(源仓 desktop/desktop-qt/installer/,已取代 NSIS)────────────────
           # 换掉 NSIS 的理由不是「不好看」而是**MUI2 DPI 不感知**:150% 缩放的机器上整窗被
           # 系统位图拉伸,上一版精心生成的 164×314 侧栏被拉成 246×471,贴什么图都糊。
