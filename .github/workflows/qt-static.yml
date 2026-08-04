@@ -63,20 +63,47 @@ env:
   QT_SUBMODULES: "qtbase,qtshadertools,qtdeclarative,qtimageformats,qtwebsockets,qt5compat"
 
 jobs:
+  # 单腿重跑用(某个平台编挂了、修完只想重编它):release 按 tag **追加**资产,已经成功的
+  # 平台 tarball 留在原地不受影响,不必为了一条腿把三条全重来(每条 40~90 分钟)。
+  # ⚠️ 必须走「上游 job 产出矩阵」这条路 —— job 级的 `if:` **拿不到 matrix 上下文**
+  # (实测报 `Unrecognized named-value: 'matrix'`,连 dispatch 都会被 422 拒掉),
+  # 别再试图把过滤写成 `if: contains(inputs.platforms, matrix.plat)`。
+  plan:
+    name: 选平台
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.gen.outputs.matrix }}
+    steps:
+      - id: gen
+        env:
+          PLATS: ${{ inputs.platforms }}
+        run: |
+          python3 - >> "$GITHUB_OUTPUT" <<'PY'
+          import json, os
+          ALL = [
+            {"plat": "macos-universal", "runner": "macos-26"},
+            {"plat": "linux-x86_64",  "runner": "ubuntu-latest",    "image": "debian:trixie",         "platform": "linux/amd64"},
+            {"plat": "linux-aarch64", "runner": "ubuntu-24.04-arm", "image": "arm64v8/debian:trixie", "platform": "linux/arm64"},
+          ]
+          want = [p.strip() for p in os.environ.get("PLATS", "").split(",") if p.strip()]
+          bad = [p for p in want if p not in {m["plat"] for m in ALL}]
+          # 打错一个平台名的默认后果是「矩阵变空、workflow 秒绿、release 上什么都没多」——
+          # 那比编挂了还难发现,所以拼错直接失败。
+          if bad:
+              raise SystemExit(f"platforms 里有非法平台名: {bad}")
+          sel = [m for m in ALL if not want or m["plat"] in want]
+          print("matrix=" + json.dumps({"include": sel}))
+          PY
+          cat "$GITHUB_OUTPUT"
+
   build:
     name: static Qt ${{ inputs.qt_version || '6.8.4' }} · ${{ matrix.plat }}
+    needs: plan
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 300
-    # 单腿重跑用(某个平台编挂了、修完只想重编它):release 是按 tag 追加资产的,已经成功的
-    # 那几个平台的 tarball 留在原地不受影响。留空 = 三个全编。
-    if: ${{ inputs.platforms == '' || contains(inputs.platforms, matrix.plat) }}
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          - { plat: macos-universal, runner: macos-26 }
-          - { plat: linux-x86_64,    runner: ubuntu-latest,   image: "debian:trixie",        platform: linux/amd64 }
-          - { plat: linux-aarch64,   runner: ubuntu-24.04-arm, image: "arm64v8/debian:trixie", platform: linux/arm64 }
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
     steps:
       - name: Checkout source (依赖清单脚本)
         uses: actions/checkout@v4
