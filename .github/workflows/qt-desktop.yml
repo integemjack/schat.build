@@ -676,7 +676,8 @@ jobs:
           cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_PREFIX_PATH=/mingw64/qt6-static \
             -DQt6_DIR=/mingw64/qt6-static/lib/cmake/Qt6 \
-            -DOPENSSL_USE_STATIC_LIBS=TRUE
+            -DOPENSSL_USE_STATIC_LIBS=TRUE \
+            -DSCHAT_PREFER_STATIC_DEPS=ON
           cmake --build build -j"$(nproc)"
 
       # 「编出来了」不等于「静态成了」。判据直接查导入表,与安装器那三个 exe 的断言同款:
