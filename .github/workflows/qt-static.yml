@@ -139,15 +139,45 @@ jobs:
           brew install ninja
           PREFIX=/tmp/qt-static-out
           cd /tmp/qtsrc
-          # ⚠️ -Wno-error=implicit-function-declaration 不是「关警告图省事」,是绕 Qt 6.8.4 与
-          # Xcode 26 clang 的一处硬不兼容,**删掉它 macOS 腿必红**(run 30923530825 实证):
-          #   qtbase/src/corelib/thread/qyieldcpu.h:35 在 ARM 分支直接调 `__yield()`,却没有
-          #   include <arm_acle.h>。老 clang 对这种「已知库函数的隐式声明」只是警告,新 clang
-          #   默认提成 error,于是 universal 构建的 -arch arm64 那一遍在 Bootstrap 就炸
-          #   (x86_64 那遍走不到 ARM 分支,所以只在 universal/arm64 上出现)。
-          # 为什么是降级警告而不是补 include:`-include arm_acle.h` 会让 x86_64 那一遍找不到
-          # 头文件;而 clang 认识 `__yield` 这个 builtin,隐式声明后仍然发的是内建指令而非外部
-          # 调用 —— 这正是老 clang 上一直能编出正确产物的原因。Qt 升到修好这处的版本后可删。
+
+          # ── 补 Qt 6.8.4 × Xcode 26 clang 的一处硬不兼容(**删掉这段 macOS 腿必红**)──────
+          # qyieldcpu.h 的第一个分支是 `#if __has_builtin(__yield) → __yield();`。clang 在 arm64
+          # 上 __has_builtin(__yield) 恒真,但 `__yield` 是**库 builtin**(声明在 <arm_acle.h>),
+          # 不是编译器关键字 builtin —— 不 include 那个头就是「隐式声明库函数」,老 clang 只警告,
+          # 新 clang 默认提成 error。universal 的 -arch arm64 那一遍于是在 Bootstrap 就炸;
+          # x86_64 那一遍走 __builtin_ia32_pause 分支,所以只在 arm64 上出现。Linux/GCC 不受影响
+          # (GCC 的 __has_builtin(__yield) 为假,走 __builtin_arm_yield),故只在 mac 这条腿打。
+          #
+          # ⚠️ **别再试 `-DCMAKE_C_FLAGS=-Wno-error=...`**(run 30924782042 实证无效):flag 确实
+          # 进了 CMake 缓存,但 **Qt 自己的构建系统会覆盖 CMAKE_CXX_FLAGS**,编译命令行上只剩
+          # Qt 自己的 -Wall -Wextra,那条根本没到编译器。也别用 `-include arm_acle.h`:universal
+          # 的 x86_64 那一遍找不到这个头。只有改源码这一条路走得通。
+          YH=qtbase/src/corelib/thread/qyieldcpu.h
+          if grep -q 'arm_acle.h' "$YH"; then
+            echo "qyieldcpu.h 已含 arm_acle.h —— Qt 大概修好了这处,可以考虑删掉这段补丁"
+          else
+            # 锚点/用法任一对不上就失败:补丁静默 no-op 比补丁不存在更糟(下一步才炸,而且
+            # 报错指向的是编译器不是这里)。
+            grep -q '__yield();' "$YH" || { echo "FATAL: $YH 里已经没有 __yield() —— 请重新评估这段补丁"; exit 1; }
+            python3 - "$YH" <<'PY'
+          import sys
+          p = sys.argv[1]
+          s = open(p).read()
+          anchor = "#include <QtCore/qtconfigmacros.h>\n"
+          if anchor not in s:
+              raise SystemExit("FATAL: qyieldcpu.h 的 include 锚点不在了,补丁无法安全插入")
+          patch = (anchor + "\n"
+                   "// schat.build/qt-static.yml: __yield() 是声明在 <arm_acle.h> 里的库 builtin,\n"
+                   "// 不 include 它在新 clang 上是 error 而非 warning。\n"
+                   "#if defined(Q_PROCESSOR_ARM) && defined(Q_CC_CLANG)\n"
+                   "#  include <arm_acle.h>\n"
+                   "#endif\n")
+          open(p, "w").write(s.replace(anchor, patch, 1))
+          print("patched:", p)
+          PY
+            grep -n 'arm_acle' "$YH"
+          fi
+
           ./configure -static -release -opensource -confirm-license \
             -prefix "$PREFIX" \
             -nomake examples -nomake tests \
@@ -156,8 +186,6 @@ jobs:
             -- \
             -DCMAKE_OSX_ARCHITECTURES="x86_64;arm64" \
             -DCMAKE_OSX_DEPLOYMENT_TARGET=12.0 \
-            -DCMAKE_C_FLAGS="-Wno-error=implicit-function-declaration" \
-            -DCMAKE_CXX_FLAGS="-Wno-error=implicit-function-declaration" \
             -DOPENSSL_ROOT_DIR="$(brew --prefix openssl@3)"
           cmake --build . --parallel
           cmake --install .
