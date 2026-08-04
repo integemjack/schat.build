@@ -34,6 +34,10 @@ on:
         description: "Ireoo/Secret-Chat 的分支或标签(只用来取依赖清单脚本)"
         required: false
         default: "main"
+      platforms:
+        description: "只编这几个(逗号分隔:macos-universal,linux-x86_64,linux-aarch64);留空=全编"
+        required: false
+        default: ""
 
 permissions:
   contents: write
@@ -63,6 +67,9 @@ jobs:
     name: static Qt ${{ inputs.qt_version || '6.8.4' }} · ${{ matrix.plat }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 300
+    # 单腿重跑用(某个平台编挂了、修完只想重编它):release 是按 tag 追加资产的,已经成功的
+    # 那几个平台的 tarball 留在原地不受影响。留空 = 三个全编。
+    if: ${{ inputs.platforms == '' || contains(inputs.platforms, matrix.plat) }}
     strategy:
       fail-fast: false
       matrix:
@@ -105,6 +112,15 @@ jobs:
           brew install ninja
           PREFIX=/tmp/qt-static-out
           cd /tmp/qtsrc
+          # ⚠️ -Wno-error=implicit-function-declaration 不是「关警告图省事」,是绕 Qt 6.8.4 与
+          # Xcode 26 clang 的一处硬不兼容,**删掉它 macOS 腿必红**(run 30923530825 实证):
+          #   qtbase/src/corelib/thread/qyieldcpu.h:35 在 ARM 分支直接调 `__yield()`,却没有
+          #   include <arm_acle.h>。老 clang 对这种「已知库函数的隐式声明」只是警告,新 clang
+          #   默认提成 error,于是 universal 构建的 -arch arm64 那一遍在 Bootstrap 就炸
+          #   (x86_64 那遍走不到 ARM 分支,所以只在 universal/arm64 上出现)。
+          # 为什么是降级警告而不是补 include:`-include arm_acle.h` 会让 x86_64 那一遍找不到
+          # 头文件;而 clang 认识 `__yield` 这个 builtin,隐式声明后仍然发的是内建指令而非外部
+          # 调用 —— 这正是老 clang 上一直能编出正确产物的原因。Qt 升到修好这处的版本后可删。
           ./configure -static -release -opensource -confirm-license \
             -prefix "$PREFIX" \
             -nomake examples -nomake tests \
@@ -113,6 +129,8 @@ jobs:
             -- \
             -DCMAKE_OSX_ARCHITECTURES="x86_64;arm64" \
             -DCMAKE_OSX_DEPLOYMENT_TARGET=12.0 \
+            -DCMAKE_C_FLAGS="-Wno-error=implicit-function-declaration" \
+            -DCMAKE_CXX_FLAGS="-Wno-error=implicit-function-declaration" \
             -DOPENSSL_ROOT_DIR="$(brew --prefix openssl@3)"
           cmake --build . --parallel
           cmake --install .
