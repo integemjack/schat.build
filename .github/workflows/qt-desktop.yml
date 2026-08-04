@@ -488,11 +488,22 @@ jobs:
           # (「签名必须在 macdeployqt 之后」那条约束已随 macdeployqt 一起作废 —— 现在没有任何
           #  install_name_tool 重写会破坏签名。)
           sign_nested() {   # "$@" = codesign flags (identity etc.) — signs all nested Mach-Os
-            find "$APP/Contents/Frameworks" "$APP/Contents/PlugIns" "$APP/Contents/Resources" \
-                 \( -name '*.dylib' -o -name '*.so' \) -type f 2>/dev/null | while read -r f; do
+            # ⚠️ 只把**存在的**目录交给 find。静态 Qt 之后 `Contents/PlugIns` 不再存在(它本来
+            # 就是 macdeployqt 建的),而 `find` 对不存在的路径返回 1 —— 这个 step 跑在
+            # `-e -o pipefail` 下,于是整步失败。`2>/dev/null` 吞掉了报错文字**却吞不掉退出码**,
+            # 现场只剩两行 "replacing existing signature" 后面直接 exit 1,极难看出原因
+            # (run 30946563117 实证)。别把 2>/dev/null 当成「这条命令失败也没关系」。
+            local dirs=()
+            for d in "$APP/Contents/Frameworks" "$APP/Contents/PlugIns" "$APP/Contents/Resources"; do
+              [ -d "$d" ] && dirs+=("$d")
+            done
+            [ ${#dirs[@]} -gt 0 ] || return 0
+            find "${dirs[@]}" \( -name '*.dylib' -o -name '*.so' \) -type f | while read -r f; do
               codesign --force "$@" "$f"
             done
-            find "$APP/Contents/Frameworks" -maxdepth 1 -name '*.framework' -type d 2>/dev/null | while read -r f; do
+            # 同上:Frameworks/ 现在只有 libssl/libcrypto 两个 dylib,没有 .framework 了,
+            # 但目录本身由上面的 mkdir -p 保证存在,所以这条 find 不会因为路径缺失而返回 1。
+            find "$APP/Contents/Frameworks" -maxdepth 1 -name '*.framework' -type d | while read -r f; do
               codesign --force "$@" "$f"
             done
           }
