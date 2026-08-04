@@ -1,0 +1,207 @@
+name: Qt Static (prebuild)
+
+# 从官方源码编**静态 Qt**,产物打成 tarball 挂到本仓库的 release 上,供 qt-desktop.yml 的
+# mac / Linux 两条打包腿下载(desktop/desktop-qt/scripts/fetch-static-qt.sh)。
+#
+# 为什么要有这条独立工作流(2026-08-04,源仓 qt 9.14.344「Qt 全静态化」):
+#   官方**不提供**静态 Qt 二进制(aqt 装的是动态 kit),Debian 也没有静态 Qt 包。三条腿里只有
+#   Windows 能直接 `pacman -S mingw-w64-x86_64-qt6-static` 拿到现成的,mac / Linux 只能自编,
+#   单份 40~90 分钟。挂进每条打包腿 = 每次发版多等一两个小时,所以拆出来**手动触发一次**、
+#   产物复用,Qt 升版时才重跑。
+#
+# ⚠️ Qt 版本的选择不是「越新越好」,两条硬约束把它钉在 6.8 LTS:
+#   ① **macOS 12**。mac-qt 这条腿的存在理由就是「minos 12.0,跑 macOS 12/13+ 与 Intel」
+#      (qt-desktop.yml 的 macos-qt 注释)。Qt 6.9+ 官方最低支持已抬到 macOS 13 —— 用 6.11/6.12
+#      编出来的东西再怎么设 CMAKE_OSX_DEPLOYMENT_TARGET=12.0 也只是嘴上说支持。6.8 LTS 官方
+#      支持 macOS 12。
+#   ② **QML 兼容下限 6.8**。这条下限本来由「Linux 用 trixie 的系统 Qt 6.8」决定,现在 Linux
+#      改成自带静态 Qt,如果顺手升到 6.11,下限就悄悄抬走了 —— 而源仓所有 QML 都是按 6.8 写
+#      的,且 Windows 那条腿仍是 MSYS2 的滚动版本。保持 6.8 = 这条铁律继续成立、三条腿的行为
+#      不因为静态化而改变。**升版前先读 docs/build_and_run.md 里那段 6.9+ 属性会让下载包秒退
+#      的记录。**
+#
+# 手动改 qt_version 时记得同步 desktop/desktop-qt/scripts/fetch-static-qt.sh 的默认值,
+# 以及 qt-desktop.yml 的 SCHAT_QT_STATIC_VER。
+
+on:
+  workflow_dispatch:
+    inputs:
+      qt_version:
+        description: "Qt 版本(必须在 download.qt.io/archive/qt 里有 single/ 源码包)"
+        required: false
+        default: "6.8.4"
+      ref:
+        description: "Ireoo/Secret-Chat 的分支或标签(只用来取依赖清单脚本)"
+        required: false
+        default: "main"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: qt-static-${{ github.ref }}
+  cancel-in-progress: false   # 编 Qt 很贵,别互相取消
+
+env:
+  QT_VER: ${{ inputs.qt_version || '6.8.4' }}
+  SRC_REPO: Ireoo/Secret-Chat
+  SRC_REF: ${{ inputs.ref || 'main' }}
+  # 这一批 submodule 就是源仓真正用到的全部(逐条对应):
+  #   qtbase        Core/Gui/Widgets/Network/Sql/**Test**(presence_test / auth_expired_test 链 Qt6::Test,
+  #                 少了它 SCHAT_BUILD_APP=ON 的 configure 直接失败)
+  #   qtshadertools QtQuick.Effects 与 Qt5Compat 的 graphicaleffectsprivate 插件都链它
+  #   qtdeclarative Qml/Quick/Controls2/Layouts/Shapes/Dialogs2/Effects
+  #   qtimageformats 头像等非 png/jpg 格式
+  #   qtwebsockets  QtTransport 的 bare-WS
+  #   qt5compat     Main.qml 的 Qt5Compat.GraphicalEffects(模糊)
+  # **刻意不含 qtsvg / qtmultimedia**:全仓没有一处 import 或链接(图标是 QtQuick.Shapes 画的
+  # 路径不是 .svg 文件;语音走 miniaudio + MF/ffmpeg)。动态时代 CI 顺手装了它俩,是历史包袱。
+  QT_SUBMODULES: "qtbase,qtshadertools,qtdeclarative,qtimageformats,qtwebsockets,qt5compat"
+
+jobs:
+  build:
+    name: static Qt ${{ inputs.qt_version || '6.8.4' }} · ${{ matrix.plat }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 300
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { plat: macos-universal, runner: macos-26 }
+          - { plat: linux-x86_64,    runner: ubuntu-latest,   image: "debian:trixie",        platform: linux/amd64 }
+          - { plat: linux-aarch64,   runner: ubuntu-24.04-arm, image: "arm64v8/debian:trixie", platform: linux/arm64 }
+    steps:
+      - name: Checkout source (依赖清单脚本)
+        uses: actions/checkout@v4
+        with:
+          repository: Ireoo/Secret-Chat
+          ref: ${{ env.SRC_REF }}
+          token: ${{ secrets.SRC_REPO_TOKEN }}
+
+      - name: Download Qt source
+        run: |
+          set -euo pipefail
+          MINOR="$(echo "$QT_VER" | cut -d. -f1-2)"
+          # 6.8 起官方源码包名带 -opensource-;更老的是 qt-everywhere-src-。两个都试。
+          BASE="https://download.qt.io/archive/qt/${MINOR}/${QT_VER}/single"
+          mkdir -p /tmp/qtsrc
+          ok=0
+          for n in "qt-everywhere-opensource-src-${QT_VER}.tar.xz" "qt-everywhere-src-${QT_VER}.tar.xz"; do
+            if curl -fsSL "$BASE/$n" -o /tmp/qt.tar.xz; then echo "got $n"; ok=1; break; fi
+          done
+          [ "$ok" = 1 ] || { echo "FATAL: $BASE 下没有可用的源码包"; exit 1; }
+          tar -xJf /tmp/qt.tar.xz -C /tmp/qtsrc --strip-components=1
+          ls /tmp/qtsrc | head
+
+      # ── macOS: 一次 configure 出 Universal2(x86_64 + arm64)────────────────────────
+      # Qt 6.2+ 原生支持 universal:CMAKE_OSX_ARCHITECTURES 给两个架构即可,**不要**编两遍再
+      # lipo —— Qt 的 CMake 包里记着一堆绝对路径与架构相关的配置,lipo 只合并 .a 不合并那些,
+      # 拼出来的 kit 会在 find_package 阶段就自相矛盾。(与源仓 brew 依赖那条「两架构 bottle
+      # 须统一 install_name 再 lipo」不是一回事:那说的是第三方 dylib。)
+      - name: Build static Qt (macOS universal)
+        if: matrix.plat == 'macos-universal'
+        run: |
+          set -euo pipefail
+          brew install ninja
+          PREFIX=/tmp/qt-static-out
+          cd /tmp/qtsrc
+          ./configure -static -release -opensource -confirm-license \
+            -prefix "$PREFIX" \
+            -nomake examples -nomake tests \
+            -submodules "$QT_SUBMODULES" \
+            -openssl-runtime \
+            -- \
+            -DCMAKE_OSX_ARCHITECTURES="x86_64;arm64" \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=12.0 \
+            -DOPENSSL_ROOT_DIR="$(brew --prefix openssl@3)"
+          cmake --build . --parallel
+          cmake --install .
+
+      # ── Linux: 在 Debian trixie 容器里编,glibc 与打包腿完全一致 ────────────────────
+      # 依赖清单来自源仓 scripts/linux-static-qt-deps.sh —— **编 Qt 与链 Qt 必须同一份**,
+      # 否则会出现「Qt 编进了 xcb 支持、打包机上却没有 libxcb-dev」这种链接期才炸的漂移。
+      - name: Build static Qt (Linux ${{ matrix.plat }})
+        if: matrix.plat != 'macos-universal'
+        run: |
+          set -euo pipefail
+          docker run --rm --platform ${{ matrix.platform }} \
+            -v /tmp/qtsrc:/qtsrc -v /tmp:/out -v "$PWD:/src" \
+            -e QT_SUBMODULES \
+            ${{ matrix.image }} bash -euxc '
+              export DEBIAN_FRONTEND=noninteractive
+              apt-get update
+              . /src/desktop/desktop-qt/scripts/linux-static-qt-deps.sh
+              apt-get install -y --no-install-recommends \
+                build-essential cmake ninja-build python3 perl pkg-config file \
+                $SCHAT_QT_STATIC_APT $SCHAT_APP_APT
+              cd /qtsrc
+              ./configure -static -release -opensource -confirm-license \
+                -prefix /out/qt-static-out \
+                -nomake examples -nomake tests \
+                -submodules "$QT_SUBMODULES" \
+                -xcb -bundled-xcb-xinput \
+                -openssl-runtime
+              cmake --build . --parallel "$(nproc)"
+              cmake --install .
+            '
+
+      # 「编出来了」不等于「是静态的」:configure 的 -static 若因为某个依赖被悄悄降级,
+      # 后果是三个月后才有人发现发布包里少了 Qt 运行时。就地验,不留给下游。
+      - name: Verify it really is a static kit
+        run: |
+          set -euo pipefail
+          P=/tmp/qt-static-out
+          [ -f "$P/lib/cmake/Qt6/Qt6Config.cmake" ] || { echo "FATAL: 没有 Qt6Config.cmake"; exit 1; }
+          # ⚠️ 断言里别写 `grep … | grep -q`:pipefail 下两段 grep 的退出码会互相掩盖,
+          # 出来的是假阴性(源仓 macos-x86_64 那次交叉构建就栽在这个写法上)。落成中间文件再判。
+          grep -rhs "QT6_IS_SHARED_LIBS_BUILD" "$P/lib/cmake/Qt6/" > /tmp/sharedflag.txt || true
+          cat /tmp/sharedflag.txt
+          if grep -iE '"(on|true|1)"' /tmp/sharedflag.txt; then
+            echo "FATAL: 这是动态 kit"; exit 1
+          fi
+          # 静态 kit 里必须有 libQt6Core.a,且不该有 libQt6Core.so / .dylib
+          ls "$P/lib/libQt6Core.a"
+          if ls "$P"/lib/libQt6Core.so* "$P"/lib/libQt6Core*.dylib 2>/dev/null; then
+            echo "FATAL: 同时存在共享库"; exit 1
+          fi
+          if [ "${{ matrix.plat }}" = "macos-universal" ]; then
+            # 两个架构都得在 —— 少一个的表现是 Intel Mac 用户下载到一个打不开的包。
+            lipo -info "$P/lib/libQt6Core.a" | tee /tmp/lipo.txt
+            grep -q x86_64 /tmp/lipo.txt || { echo "FATAL: 缺 x86_64 slice"; exit 1; }
+            grep -q arm64  /tmp/lipo.txt || { echo "FATAL: 缺 arm64 slice"; exit 1; }
+          fi
+          echo "OK: 静态 kit"
+
+      - name: Pack tarball
+        run: |
+          set -euo pipefail
+          ASSET="qt-static-${QT_VER}-${{ matrix.plat }}.tar.xz"
+          mkdir -p /tmp/assets
+          # --strip-components=1 在解压侧,所以这里必须**带一层顶层目录**打包。
+          tar -C /tmp -cJf "/tmp/assets/$ASSET" qt-static-out
+          if command -v sha256sum >/dev/null; then
+            (cd /tmp/assets && sha256sum "$ASSET" > "$ASSET.sha256")
+          else
+            (cd /tmp/assets && shasum -a 256 "$ASSET" > "$ASSET.sha256")
+          fi
+          ls -la /tmp/assets
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: qt-static-${{ env.QT_VER }}
+          name: Static Qt ${{ env.QT_VER }}
+          # 这是构建依赖不是产品发布,标成 prerelease 免得混进「最新版本」的判定里
+          # (源仓的更新器按 /releases 列表挑资产,latest 的定义会跳过 prerelease)。
+          prerelease: true
+          body: |
+            预编译**静态 Qt ${{ env.QT_VER }}**,给 `qt-desktop.yml` 的 mac / Linux 打包腿用。
+            由 `desktop/desktop-qt/scripts/fetch-static-qt.sh` 下载校验。
+
+            submodules: `${{ env.QT_SUBMODULES }}`
+            (不含 qtsvg / qtmultimedia —— 源仓没有任何一处 import 或链接它们)
+
+            Windows 不在这里:那条腿用 MSYS2 的 `mingw-w64-x86_64-qt6-static` 包。
+          files: |
+            /tmp/assets/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

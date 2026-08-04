@@ -9,10 +9,17 @@ name: Qt Desktop
 #     · macos-qt = Qt/QML 通用兼容版 (desktop/desktop-qt, arm64 + x86_64) — minos 12.0,跑
 #                  macOS 12/13+ 与 Intel(Qt 不碰系统新 API,解决「macOS 13 装不上」)。资产名带
 #                  `qt` 标记,Swift 更新器 pickAsset 按 -qt/qt- 排除它 → 两条线自动更新永不串包。
-#   Windows : x64 (MSYS2/MINGW64) Qt6/QML          — 自制安装器 (windeployqt + installer/mkpkg)
+#   Windows : x64 (MSYS2/MINGW64) Qt6/QML          — 自制安装器 (installer/mkpkg)
 #             (arm64 needs an MSVC port of the vendored MinGW deps — not covered yet)
 #   Linux   : x86_64 + aarch64 (Debian trixie containers) Qt6/QML — .deb (both arches)
-#             + a self-contained AppImage on x86_64 (linuxdeploy + plugin-qt)
+#             + a self-contained AppImage on x86_64 (linuxdeploy)
+#
+# ⚠️ **Qt 三条腿全部静态链接**(源仓 qt 9.14.344)。来源不同,判据相同 —— 每条腿都有一条
+# 「产物里不许出现 Qt 动态库」的断言,别为了让某条腿变绿把断言放松:
+#   · Windows = MSYS2 `mingw-w64-x86_64-qt6-static`(现成的整包静态 Qt)
+#   · mac / Linux = qt-static.yml 预编译的 tarball(官方不提供静态二进制,只能自编)
+# 随之整段消失的:windeployqt / macdeployqt / linuxdeploy-plugin-qt / ~90 个 DLL 的递归闭包 /
+# deb 的 qml6-module-* 依赖串。**这些都不是「顺手删的」,而是静态之后它们的工作对象不存在了。**
 #
 # The macOS SwiftUI leg mirrors desktop/macos/scripts/{build-core,package-app}.sh (本地实测
 # 流程) + qt 线沉淀的 inside-out 签名/公证;Windows/Linux legs are proven by this workflow.
@@ -52,6 +59,11 @@ env:
   # that third_party/fetch_deps.sh defaults to.
   SCHAT_GH_MIRROR: https://github.com
   SCHAT_RAW_MIRROR: https://raw.githubusercontent.com
+  # 预编译静态 Qt 的版本(mac / Linux 两条腿)。改这里 = 换 kit,必须先用 qt-static.yml
+  # 把对应版本编出来并发成 release `qt-static-<ver>`,否则 fetch-static-qt.sh 404 直接失败。
+  # 与源仓 desktop/desktop-qt/scripts/fetch-static-qt.sh 的默认值保持一致。
+  # ⚠️ 6.8 LTS 不是随手挑的 —— 见 macos-qt 那条腿里「版本回到 6.8 LTS 是有意的」那段。
+  SCHAT_QT_STATIC_VER: "6.8.4"
 
 jobs:
   # ── macOS: 原生 SwiftUI 客户端(desktop/macos)。流程 = 本地脚本原样上 CI:
@@ -360,49 +372,56 @@ jobs:
           echo "=== universal dep archives (must all list arm64 + x86_64) ==="
           for f in libopus libopenh264 libsodium libssl libcrypto; do lipo -info "$UNI/lib/$f.a"; done
 
-      - name: Install universal Qt6 (official, via aqt)
-        uses: jurplel/install-qt-action@v4
-        with:
-          # 用户口径 2026-07-27:**mac / Windows 用最新 Qt,Linux 留 6.8**。
-          # 三条腿的 Qt 来源本就不同,只有 mac 这条能自己选版本:
-          #   · mac  = aqt 装官方 Qt,包**自带** Qt(构建版本 = 用户机器上的运行版本)→ 钉最新;
-          #   · Win  = MSYS2 pacman 滚动仓库,本就恒为最新(2026-07 实测 qt6-base 6.11.1),
-          #            不钉版本 = 不需要动;
-          #   · Linux = **Debian trixie 容器的系统 Qt 6.8**,产物 .deb 走系统依赖分发,用户机器上
-          #            链的是他自己那份 6.8 —— 版本由发行版说了算,升不了。
-          # ⚠️ 因此 **QML 的兼容下限仍然是 6.8**(由 Linux 那条腿的运行时决定,与这里装什么无关):
-          #    绝不准声明式使用 6.9+ 属性,要用就 `if ("x" in win)` 运行时探测。9.12.159 的
-          #    `topPadding: 0` 就是这么把 mac dmg 与 trixie deb 一起干成「秒退且无崩溃报告」的。
-          version: "6.12.0"
-          # install-qt-action 自带的 aqtinstall 偏老,认不出新发布的版本目录(报 version not
-          # found)——钉一个能列出 6.12 的下限(本地 aqt 3.3.0 实测可列)。
-          aqtversion: ">=3.3.0"
-          host: mac
-          target: desktop
-          arch: clang_64
-          # qt5compat = the Qt6 port of Qt5's GraphicalEffects (Main.qml imports
-          # Qt5Compat.GraphicalEffects for the blur effects). It's a RUNTIME QML module — the
-          # build/link never needs it, so omitting it built green but the app died on launch with
-          # `module "Qt5Compat.GraphicalEffects" is not installed`. qtshadertools is required too:
-          # the GraphicalEffects *private* plugin links QtShaderTools.framework, so without it the
-          # app dies one step later on `Cannot load ...graphicaleffectsprivateplugin: QtShaderTools
-          # not loaded`. macdeployqt bundles both once aqt installs them.
-          modules: "qtmultimedia qtwebsockets qtimageformats qt5compat qtshadertools"
+      # ── 静态 Qt(源仓 qt 9.14.344;aqt / install-qt-action 已移除)────────────────────
+      # 官方**不提供**静态 Qt 二进制,aqt 装的一律是动态 kit —— 所以这条腿改成下载
+      # schat.build 自己预编译的静态 Qt(qt-static.yml 手动触发产出,tarball 挂在
+      # release `qt-static-<ver>` 上)。下载 + 校验 + 解压由源仓的
+      # desktop/desktop-qt/scripts/fetch-static-qt.sh 负责(sha256 不符即失败)。
+      #
+      # ⚠️ **版本回到 6.8 LTS 是有意的,别顺手升回 6.12。** 两条硬约束:
+      #   ① 这条腿的存在理由是「minos 12.0,跑 macOS 12/13+ 与 Intel」,而 Qt 6.9+ 官方最低
+      #      支持已抬到 macOS 13 —— 用 6.11/6.12 编,CMAKE_OSX_DEPLOYMENT_TARGET=12.0 就只是
+      #      嘴上说支持。6.8 LTS 官方支持 macOS 12。
+      #   ② **QML 兼容下限 6.8** 这条铁律要继续成立:绝不准声明式使用 6.9+ 属性,要用就
+      #      `if ("x" in win)` 运行时探测。9.12.159 的 `topPadding: 0` 就是这么把 mac dmg 与
+      #      trixie deb 一起干成「秒退且无崩溃报告」的。
+      # (Windows 那条腿仍是 MSYS2 滚动的 qt6-static 6.11.x —— 版本不统一是既有状态,不是这次
+      #  引入的;下限由最低的那条腿决定,也就是 6.8。)
+      - name: Fetch prebuilt static Qt (universal)
+        working-directory: desktop/desktop-qt
+        run: |
+          set -euo pipefail
+          QT_PREFIX="$(bash scripts/fetch-static-qt.sh | tail -1)"
+          echo "QT_PREFIX=$QT_PREFIX" >> "$GITHUB_ENV"
+          echo "QT_PREFIX=$QT_PREFIX"
 
       - name: Fetch third-party deps (libdatachannel source + single headers)
         working-directory: desktop/desktop-qt
         run: bash third_party/fetch_deps.sh
 
-      - name: Configure + build (Universal2 Release)
+      - name: Configure + build (Universal2 Release, static Qt)
         working-directory: desktop/desktop-qt
         run: |
           set -euo pipefail
           cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_OSX_ARCHITECTURES="arm64;x86_64" \
-            -DCMAKE_PREFIX_PATH="$QT_ROOT_DIR" \
+            -DCMAKE_PREFIX_PATH="$QT_PREFIX" \
             -DSCHAT_MAC_DEP_PREFIX=/tmp/uni \
             -DOPENSSL_ROOT_DIR=/tmp/uni -DOPENSSL_USE_STATIC_LIBS=TRUE
           cmake --build build -j"$(sysctl -n hw.ncpu)"
+
+      # 「编出来了」不等于「静态成了」——CMake 找错 kit(机器上还有 brew 的动态 Qt)照样编得过,
+      # 产物却在用户机上找不到 Qt。直接查 Mach-O 的加载命令。
+      - name: Assert 二进制不依赖任何 Qt 框架/动态库
+        working-directory: desktop/desktop-qt
+        run: |
+          set -euo pipefail
+          otool -L build/app-qt/SChat.app/Contents/MacOS/SChat > /tmp/otool.txt
+          cat /tmp/otool.txt
+          if grep -E 'QtCore|QtQuick|QtGui|libQt' /tmp/otool.txt; then
+            echo "FATAL: 仍链接着动态 Qt(CMAKE_PREFIX_PATH 没指到静态 kit?)"; exit 1
+          fi
+          echo "OK: 无动态 Qt 依赖"
 
       # Import the Developer ID cert into a throwaway keychain (only if the secret is set —
       # otherwise the package step falls back to ad-hoc signing so forks still build).
@@ -432,7 +451,7 @@ jobs:
           echo "identity=$IDENTITY" >> "$GITHUB_OUTPUT"
           echo "imported identity: $IDENTITY"
 
-      - name: Package .dmg (macdeployqt -dmg)
+      - name: Package .dmg (静态 Qt,无 macdeployqt)
         shell: bash
         working-directory: desktop/desktop-qt
         env:
@@ -446,24 +465,28 @@ jobs:
           APP="build/app-qt/SChat.app"
           echo "=== app binary archs (must be arm64 + x86_64) ==="
           lipo -info "$APP/Contents/MacOS/SChat" || true
-          # Deploy Qt frameworks/plugins/QML FIRST (this rewrites Mach-O install names via
-          # install_name_tool). NOTE: no -dmg here on purpose.
-          "$QT_ROOT_DIR/bin/macdeployqt" "$APP" -qmldir=app-qt/qml
+          # ── macdeployqt 已移除(源仓 qt 9.14.344)────────────────────────────────────
+          # Qt 静态之后它无事可做:bundle 里没有 Qt framework 要拷、没有 PlugIns 要挑、没有
+          # Resources/qml 要部署,也就没有 install_name_tool 的重写 —— 「签名必须在 macdeployqt
+          # 之后」那条顺序约束的成因随之消失(不过下面仍然保持「先签嵌套、后签外壳」的
+          # inside-out 顺序:OpenSSL 那两个 dylib 还在,--deep 依旧会漏签它们)。
+          # **别因为「历史上一直跑」把它加回来**:对静态 kit 跑 macdeployqt 只会报错或空跑。
+          mkdir -p "$APP/Contents/Frameworks"
           # Bundle the universal OpenSSL dylibs so Qt's openssl TLS backend can dlopen them at
-          # runtime (macdeployqt doesn't bundle OpenSSL; without these every https/wss dies at
-          # http=0). Frameworks/ is on the backend's dlopen search path; install names were
-          # already fixed to @rpath / @loader_path in the deps step.
+          # runtime — 这一条**不因为 Qt 静态而改变**:TLS 后端是运行期 dlopen libssl/libcrypto 的,
+          # 缺了就是每一次 https/wss 在登录前静默失败。Frameworks/ 在后端的 dlopen 搜索路径上;
+          # install name 已在 deps 步骤里修成 @rpath / @loader_path。
           cp /tmp/uni/lib/libssl.3.dylib /tmp/uni/lib/libcrypto.3.dylib "$APP/Contents/Frameworks/"
           lipo -info "$APP/Contents/Frameworks/libssl.3.dylib" "$APP/Contents/Frameworks/libcrypto.3.dylib"
           # Product name = SChat everywhere: CMake OUTPUT_NAME=SChat now builds SChat.app with inner
           # binary SChat (CFBundleExecutable=SChat) directly — no post-build rename needed anymore.
-          # Sign AFTER macdeployqt. Signing BEFORE it (the old order) leaves an invalid signature —
-          # install_name_tool's rewrites break the seal — and Apple Silicon SIGKILLs the app on
-          # launch with "Code Signature Invalid".
-          # INSIDE-OUT signing (not `--deep`): --deep skips the QML plugin dylibs macdeployqt puts
-          # under Contents/Resources/qml — hardened-runtime library validation then kills the app
-          # the moment such a plugin loads ("打开就闪退" with a valid-looking outer signature).
-          # Sign every nested Mach-O first, then the outer bundle.
+          # INSIDE-OUT signing (not `--deep`),先签嵌套再签外壳。历史成因是 macdeployqt 会往
+          # Contents/Resources/qml 放一堆 QML 插件 dylib 而 --deep 恰好跳过它们(hardened
+          # runtime 的 library validation 在插件加载那一刻杀掉进程 = 「打开就闪退」,外层签名
+          # 却看着完好)。Qt 静态之后那些 dylib 不存在了,**但这个顺序仍然必须保持**:
+          # Frameworks/ 下还有 libssl/libcrypto 两个 dylib,--deep 对它们是同一种漏法。
+          # (「签名必须在 macdeployqt 之后」那条约束已随 macdeployqt 一起作废 —— 现在没有任何
+          #  install_name_tool 重写会破坏签名。)
           sign_nested() {   # "$@" = codesign flags (identity etc.) — signs all nested Mach-Os
             find "$APP/Contents/Frameworks" "$APP/Contents/PlugIns" "$APP/Contents/Resources" \
                  \( -name '*.dylib' -o -name '*.so' \) -type f 2>/dev/null | while read -r f; do
@@ -586,10 +609,10 @@ jobs:
           name: qt-macos-universal
           path: desktop/desktop-qt/out/*
 
-  # ── Windows: x64 via MSYS2/MINGW64. pacman provides gcc + Qt6 + OpenSSL + opus/libsodium/
-  # openh264/libsrtp (all with pkg-config), so libdatachannel's DTLS finds OpenSSL and the core
-  # links the codecs via pkg-config (the CMake MSYS2 branch). windeployqt bundles the Qt DLLs;
-  # 源仓 desktop/desktop-qt/installer/ 的自制安装器把这一切压成一个自解压 setup.exe
+  # ── Windows: x64 via MSYS2/MINGW64. pacman provides gcc + **静态 Qt6**(qt6-static)+ OpenSSL
+  # + opus/libsodium/openh264/libsrtp (all with pkg-config), so libdatachannel's DTLS finds
+  # OpenSSL and the core links the codecs via pkg-config (the CMake MSYS2 branch). Qt 编进 exe,
+  # 不再有 windeployqt / DLL 闭包;源仓 desktop/desktop-qt/installer/ 的自制安装器把它压成一个自解压 setup.exe
   # (2026-07-26 起取代 NSIS —— MUI2 DPI 不感知,高缩放机器上整窗被拉伸)。─────────────
   windows:
     name: Windows Qt (x64, MSYS2 → installer)
@@ -613,21 +636,55 @@ jobs:
           install: >-
             git curl
             mingw-w64-x86_64-gcc mingw-w64-x86_64-cmake mingw-w64-x86_64-ninja
-            mingw-w64-x86_64-pkgconf mingw-w64-x86_64-qt6-base mingw-w64-x86_64-qt6-declarative
-            mingw-w64-x86_64-qt6-multimedia mingw-w64-x86_64-qt6-websockets mingw-w64-x86_64-qt6-tools
-            mingw-w64-x86_64-qt6-5compat mingw-w64-x86_64-qt6-shadertools
+            mingw-w64-x86_64-pkgconf
+            mingw-w64-x86_64-qt6-static
             mingw-w64-x86_64-opus mingw-w64-x86_64-libsodium mingw-w64-x86_64-openh264
             mingw-w64-x86_64-openssl mingw-w64-x86_64-libsrtp
+
+      # ── Windows 的 Qt 是**静态**的(源仓 qt 9.14.344)────────────────────────────────
+      # `mingw-w64-x86_64-qt6-static` 是 MSYS2 打好的整包静态 Qt(单包含 base/declarative/
+      # 5compat/shadertools/websockets/imageformats/tools,前缀 /mingw64/qt6-static,约 2.7GB
+      # 装完)。三条腿里只有这条能直接装现成的 —— mac / Linux 得走 qt-static.yml 自编。
+      # **刻意不再装动态的 qt6-base 等**:两套 Qt 同时在,find_package 命中哪一套取决于
+      # CMAKE_PREFIX_PATH 的顺序,一旦搞错就是「编得过、发出去的包缺 DLL」。只留一套。
 
       - name: Fetch third-party deps (libdatachannel source + single headers)
         working-directory: desktop/desktop-qt
         run: bash third_party/fetch_deps.sh
 
-      - name: Configure + build (Release)
+      - name: Configure + build (Release, static Qt)
         working-directory: desktop/desktop-qt
         run: |
-          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+          set -e
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_PREFIX_PATH=/mingw64/qt6-static \
+            -DOPENSSL_USE_STATIC_LIBS=TRUE
           cmake --build build -j"$(nproc)"
+
+      # 「编出来了」不等于「静态成了」。判据直接查导入表,与安装器那三个 exe 的断言同款:
+      # 系统 DLL 没有 lib 前缀、Qt DLL 一律 Qt6*.dll —— 两类都不该出现在 SChat.exe 里。
+      # 放松这条的代价与源仓 9.12.325 那次一模一样:安装目录里重新躺回一堆 DLL,一键升级
+      # 覆盖正在映射的镜像失败 → 「点了更新、重启后还是老版本」。
+      #
+      # ⚠️ **libssl/libcrypto 是唯一的例外,而且不能靠 OPENSSL_USE_STATIC_LIBS 消掉。**
+      # 那个开关只管 libdatachannel 的 DTLS(它是编译期链接,已改成静态);Qt 的 TLS 后端
+      # 是**运行期 dlopen**,与链接方式无关 —— 装目录里必须躺着这两个 DLL,否则每一次
+      # https/wss 都在登录前静默失败。所以它们出现在导入表里也是可接受的(视 MSYS2 的
+      # openssl 包有没有提供 .a 而定),但除它俩之外一个都不许有。
+      - name: Assert SChat.exe 零 Qt/MinGW 运行时 DLL 依赖
+        working-directory: desktop/desktop-qt
+        run: |
+          set -e
+          objdump -p build/app-qt/SChat.exe | awk '/DLL Name:/ { print tolower($3) }' | sort -u > /tmp/imports.txt
+          cat /tmp/imports.txt
+          bad=$(grep -E '^(lib|qt6)' /tmp/imports.txt | grep -vE '^lib(ssl|crypto)-' || true)
+          if [ -n "$bad" ]; then
+            echo "FATAL: SChat.exe 仍动态依赖: $bad"
+            echo "       (CMAKE_PREFIX_PATH 没指到 /mingw64/qt6-static?或 app-qt/CMakeLists.txt 的"
+            echo "        SCHAT_QT_STATIC 分支没生效 —— 那三个 -static 开关必须同时在)"
+            exit 1
+          fi
+          echo "OK: SChat.exe 除 OpenSSL 外零第三方 DLL"
 
       # 安装器的三个非 Qt 产物必须**零第三方 DLL 依赖**。放松这一条的代价(源仓 qt 9.12.325
       # 实证):setup.exe 动态依赖 libgcc_s_seh-1.dll,而更新器起它时的当前目录 = 安装目录
@@ -652,7 +709,7 @@ jobs:
           done
           [ "$fail" = 0 ]
 
-      - name: Package installer (windeployqt + 自制 mkpkg)
+      - name: Package installer (静态 Qt + 自制 mkpkg)
         working-directory: desktop/desktop-qt
         run: |
           set -e
@@ -660,34 +717,18 @@ jobs:
           STAGE="pkg/SChat"
           mkdir -p "$STAGE" out
           cp build/app-qt/SChat.exe "$STAGE/"
-          QTBIN="$(qmake6 -query QT_INSTALL_BINS)"; QMLSRC="$(qmake6 -query QT_INSTALL_QML)"
-          export PATH="$QTBIN:$PATH"
-          echo "QTBIN=$QTBIN"; ls "$QTBIN"/qmlimportscanner* "$QTBIN"/windeployqt* 2>&1 | head || true
-          # windeployqt's --qmldir scan (qmlimportscanner) is flaky on MSYS2; fall back to a
-          # manual QML deploy if it fails so the installer is still complete + self-contained.
-          if ! windeployqt --qmldir "$PWD/app-qt/qml" --release --no-translations "$STAGE/SChat.exe"; then
-            echo "windeployqt --qmldir failed → deploy core DLLs + copy QML modules manually"
-            windeployqt --release --no-translations "$STAGE/SChat.exe" || true
-            mkdir -p "$STAGE/qml"
-            # Top-level module dirs are copied recursively, so their submodules (QtQuick/Controls,
-            # Qt5Compat/GraphicalEffects, …) come along. Qt5Compat = the blur effects Main.qml imports.
-            for m in Qt QtCore QtQml QtQuick QtMultimedia Qt5Compat; do
-              [ -d "$QMLSRC/$m" ] && cp -r "$QMLSRC/$m" "$STAGE/qml/" || true
-            done
-            # Qt6ShaderTools = linked by the Qt5Compat GraphicalEffects private plugin; without it
-            # the app dies on launch with "Cannot load ...graphicaleffectsprivateplugin".
-            for d in Qt6QuickControls2 Qt6QuickControls2Impl Qt6QuickControls2Basic \
-                     Qt6QuickTemplates2 Qt6QuickLayouts Qt6QuickDialogs2 Qt6QuickDialogs2QuickImpl \
-                     Qt6QuickDialogs2Utils Qt6QmlModels Qt6QuickShapes Qt6LabsQmlModels \
-                     Qt6QuickEffects Qt6QmlWorkerScript Qt6ShaderTools; do
-              [ -f "$QTBIN/$d.dll" ] && cp "$QTBIN/$d.dll" "$STAGE/" || true
-            done
-            printf '[Paths]\nPrefix = .\n' > "$STAGE/qt.conf"
-          fi
-          # Qt's openssl TLS backend needs the actual OpenSSL DLLs at runtime — windeployqt bundles
-          # the backend plugin (tls/qopensslbackend.dll) but NOT libssl/libcrypto themselves, so
-          # without these every https/wss dies before login (same class of bug as macOS). Copy the
-          # MSYS2 openssl-3 DLLs into the install dir next to the exe.
+          # ── windeployqt 已整段移除(源仓 qt 9.14.344)────────────────────────────────
+          # Qt 静态之后它无事可做:没有 Qt6*.dll 要拷、没有 qml/ 目录要部署、没有 plugins/ 要
+          # 挑,连那行救过命的 qt.conf 也失去意义(QML 模块与插件都编进了 exe,引擎不再按
+          # 相对路径去磁盘上找)。**别因为「历史上一直有」把它加回来**:对静态 exe 跑
+          # windeployqt 要么报错要么空跑,只会让日志看起来像成功了。
+          # 与之一起消失的:qmlimportscanner 的 PATH/cygpath 那套绕行、--qmldir 扫描失败的手工
+          # 回退清单、Qt6QuickControls2 等十几个 DLL 的手抄名单。qmlimportscanner 现在由 CMake
+          # 在链接期调用(qt_import_qml_plugins),漏扫的表现从「运行期缺模块」提前成了链接错误。
+          #
+          # OpenSSL 的 DLL 仍然要拷:MSYS2 的静态 Qt 与官方一样用 -openssl-runtime,TLS 后端是
+          # **运行期 dlopen** libssl/libcrypto 的 —— 这部分不因为 Qt 静态而改变,缺了就是所有
+          # https/wss 在登录前静默失败(与 macOS 那条同源)。
           for d in libssl-3-x64 libcrypto-3-x64 libssl-3 libcrypto-3; do
             [ -f "/mingw64/bin/$d.dll" ] && cp "/mingw64/bin/$d.dll" "$STAGE/" || true
           done
@@ -700,130 +741,68 @@ jobs:
           mkdir -p /tmp/sherpa && tar -xf /tmp/sherpa.tar.bz2 -C /tmp/sherpa --strip-components=1
           cp /tmp/sherpa/lib/*.dll "$STAGE/"
           ls "$STAGE"/sherpa-onnx-c-api.dll "$STAGE"/onnxruntime.dll
-          # ── Full runtime DLL closure (THE fix for the "downloaded package instant-exits" bug) ──
-          # windeployqt bundles Qt6*.dll + the plugin/QML DLLs, but NOT the ~30 non-Qt runtime DLLs
-          # they pull in: the MinGW runtime (libgcc_s_seh-1/libstdc++-6/libwinpthread-1), ICU
-          # (libicu*78), Qt's transitive deps (harfbuzz/freetype/pcre2/glib/brotli/zlib/png/md4c/…),
-          # the codecs (libopus-0/libopenh264-7/libsodium-26), AND — invisible to a static ldd on
-          # the exe because they're LoadLibrary'd — the plugin DLLs' OWN deps (sqldrivers/qsqlite →
-          # libsqlite3-0, imageformats/qjpeg → libjpeg-8, the glib-linked plugins → libgio/gobject/
-          # gmodule/ffi). Missing ANY of them makes the packaged app exit immediately with empty
-          # stderr on a clean (non-dev) machine — the whole reason a CI-built installer that
-          # "packaged fine" never actually launched. Walk ldd over EVERY dll/exe already staged
-          # (recursively, so plugin subdirs count) and copy every /mingw64 dependency next to the
-          # exe (the exe dir is always on the DLL search path); repeat until a pass adds nothing.
-          # 做成函数:安装器界面进程(SChatSetupUI.exe)自己那棵引导部署树也要走同一遍闭包,
-          # 否则它从 %TEMP% 起不来 —— 表现为「双击安装包只闪一下启动图就没了」。
-          dll_closure() {
-            local d="$1"
-            echo "=== resolving full DLL closure in $d ==="
-            while :; do
-              before=$(find "$d" -maxdepth 1 -iname '*.dll' | wc -l)
-              while IFS= read -r bin; do
-                ldd "$bin" 2>/dev/null | awk '/=> \/mingw64\// { print $3 }'
-              done < <(find "$d" -type f \( -iname '*.dll' -o -iname '*.exe' \)) \
-                | sort -u | while IFS= read -r dep; do
-                    base=$(basename "$dep")
-                    [ -f "$d/$base" ] || cp "$dep" "$d/"
-                  done
-              after=$(find "$d" -maxdepth 1 -iname '*.dll' | wc -l)
-              echo "  DLL closure pass: $before -> $after"
-              if [ "$before" = "$after" ]; then break; fi
-            done
-          }
-          # 安装器的两个非 Qt 产物先进 $STAGE,好让闭包连它们的依赖一起解:
-          #   uninstall.exe    —— ARP 的 UninstallString 指向它,必须随应用装进安装目录
-          #   SChatSetupUI.exe —— 卸载界面复用安装目录里应用自带的 Qt(不额外占包体积)
+          # ── DLL 闭包已整段移除,判据**反过来了**(源仓 qt 9.14.344)────────────────────
+          # 动态时代这里要把 ~90 个 /mingw64 运行时 DLL 递归解全(MinGW 运行时三件套、ICU、
+          # harfbuzz/freetype/pcre2/glib/brotli/zlib/png/md4c、codec、以及只在 LoadLibrary 时才
+          # 出现的插件自身依赖如 sqldrivers→libsqlite3-0),漏一个 = 干净机器上启动即退、stderr
+          # 全空。静态之后这批依赖**整体不存在**:Qt、ICU、codec、sqlite 全编进 exe,MinGW
+          # 运行时由 -static 收进去。
+          #
+          # 于是断言从「这三个 DLL 必须在」翻转成「一个 lib*.dll 都不许在」——
+          # ⚠️ **这个翻转是有意的,别看到旧注释里写着 `FATAL: libgcc_s_seh-1.dll missing` 就以为
+          # 是退化。** 保留一条断言而不是干脆不检查,是因为安装目录里只要重新出现这几个 DLL,
+          # 9.12.326 那条根因就会原样复活:一键升级时 setup.exe 从安装目录把它们映射进自己进程,
+          # 覆盖正在映射的镜像被系统禁止 → 用户点了更新、重启后还是老版本。
           cp build/installer/uninstall.exe build/installer/SChatSetupUI.exe "$STAGE/"
-          dll_closure "$STAGE"
-          echo "staged top-level DLLs: $(find "$STAGE" -maxdepth 1 -iname '*.dll' | wc -l) (expect ~90)"
-          # Fail loudly if the MinGW runtime trio is still missing — that trio absent == the
-          # instant-exit bug is back and the package is DOA; better to fail the build than ship it.
-          for must in libgcc_s_seh-1 libstdc++-6 libwinpthread-1 libsqlite3-0; do
-            [ -f "$STAGE/$must.dll" ] || { echo "FATAL: $must.dll missing from package"; exit 1; }
-          done
+          echo "staged files: $(find "$STAGE" -type f | wc -l)"
+          find "$STAGE" -type f | sort
+          # 允许存在的非系统 DLL 只有两类:OpenSSL(Qt TLS 后端运行期 dlopen)与 sherpa/onnxruntime
+          # (AsrEngine 运行期 LoadLibrary,官方 MSVC 预编译、MT 静态 CRT,与 MinGW 无关)。
+          bad=$(find "$STAGE" -maxdepth 1 -iname 'lib*.dll' \
+                  ! -iname 'libssl-*.dll' ! -iname 'libcrypto-*.dll' -printf '%f\n' || true)
+          if [ -n "$bad" ]; then
+            echo "FATAL: 安装目录里出现了不该有的 MinGW/Qt 运行时 DLL:"
+            echo "$bad"
+            echo "       静态链没生效 —— 见 app-qt/CMakeLists.txt 与 installer/CMakeLists.txt 的"
+            echo "       -static -static-libgcc -static-libstdc++,以及 CMAKE_PREFIX_PATH。"
+            exit 1
+          fi
+          echo "OK: 安装目录零 MinGW/Qt 运行时 DLL"
           # ── 自制安装器(源仓 desktop/desktop-qt/installer/,已取代 NSIS)────────────────
           # 换掉 NSIS 的理由不是「不好看」而是**MUI2 DPI 不感知**:150% 缩放的机器上整窗被
           # 系统位图拉伸,上一版精心生成的 164×314 侧栏被拉成 246×471,贴什么图都糊。
           # 自制的这套:stub 与卸载器不链 Qt(静默升级路径因此不依赖任何 Qt 落地),界面是
           # 一页式 QML,首帧前由 stub 画原生启动图顶着。细节见 docs/build_and_run.md。
           #
-          # 「引导子集」= 对 SChatSetupUI.exe 单独跑一次 windeployqt 的产出目录整棵树。
-          # 刻意不手写 DLL 清单:那种清单每次 Qt 升级都会悄悄过期,漏一个就是安装器打不开。
+          # ── 「引导子集」现在就是一个文件(源仓 qt 9.14.344)──────────────────────────
+          # 它原本的定义是「把 SChatSetupUI.exe 起得来所需的那批 Qt DLL 挑出来,排在 solid 流
+          # 最前面,好让 stub 只解压前缀就能起界面」。静态 Qt 之后 SChatSetupUI.exe 自足,引导
+          # 子集 = 它自己,scan/blunt 两条造法与那套 qmlimportscanner / cygpath / qt.conf 绕行
+          # 全部随之作废(它们解决的问题是「部署布局里 QML 模块放哪」,而现在 QML 编进了 exe)。
+          # 首帧因此更快:引导阶段只需解压一个 ~40MB 的文件,而不是 77~1653 个小文件。
           #
-          # 两种造法,**都用 --selftest 验过才算数**(实测教训:9.12.323 那次扫描成功、子集从
-          # 1653 文件/127M 瘦到 76 文件/93M,结果那套精简集根本加载不起 QML —— 是 selftest
-          # 把它拦在了 CI 里,没发出去):
-          #   scan  = windeployqt --qmldir 扫描,只带真正 import 到的模块。小,首帧快。
-          #   blunt = 手工把 QtQml/QtQuick 整棵 QML 模块树拷进来。大约一倍体积,但一直能跑。
-          # 先试 scan,不过就退回 blunt;两个都不过才让 Windows 腿失败。
+          # **--selftest 保留,而且比以前更重要。** 它验的是「这套东西真能把 QML 加载起来」,
+          # 静态构建同样会漏:qmlimportscanner 在链接期漏扫一个模块,exe 照样编得出来,运行时
+          # 才报 `module "X" is not installed`。存在性检查(文件在不在)从来挡不住这类问题,
+          # 9.12.323 那次 76 文件精简集就是被 selftest 拦下的 —— 换成没有它的世界,发出去的是
+          # 一个双击打不开的安装器,而 CI 全绿。
           BOOT="pkg/boot"
-          QTLIBEXEC="$(qmake6 -query QT_INSTALL_LIBEXECS)"
-          echo "QTLIBEXEC=$QTLIBEXEC"; ls "$QTLIBEXEC"/qmlimportscanner* 2>&1 | head -2 || true
-          # qmlimportscanner 不在 QT_INSTALL_BINS。两手都要:qmake6 吐的是 `D:/a/...` 这种
-          # Windows 路径,**直接塞进 MSYS2 的冒号分隔 PATH 会被 `D:` 的冒号劈成两段**(等于
-          # 没加),所以先 cygpath -u;同时再把它复制到 windeployqt 旁边,覆盖「按自身目录找、
-          # 根本不查 PATH」的另一种可能。
-          cp -n "$QTLIBEXEC"/qmlimportscanner* "$QTBIN"/ 2>/dev/null || true
-
-          build_boot() {   # $1 = scan | blunt;返回 0 = 这套引导集真能把 QML 跑起来
-            rm -rf "$BOOT"; mkdir -p "$BOOT"
-            cp build/installer/SChatSetupUI.exe "$BOOT/"
-            if [ "$1" = scan ]; then
-              ( export PATH="$(cygpath -u "$QTLIBEXEC"):$PATH"
-                windeployqt --qmldir "$PWD/installer/ui/qml" --release --no-translations "$BOOT/SChatSetupUI.exe" ) || return 1
-              # windeployqt 从不写 qt.conf,而 QML 引擎按 Qt6Core 里编死的相对路径找模块。
-              # 官方 Qt 编死的恰好是 `qml`(与 windeployqt 的部署布局一致,所以本机自打包
-              # 侥幸能跑);MSYS2 的 Qt 编死的是 `share/qt6/qml`,引擎在用户机上去找
-              # boot/share/qt6/qml → "module QtQuick.Window is not installed" —— 9.12.323 那次
-              # 76 文件精简集 selftest 失败的**全部**原因(2026-07-26 本机三组对照实验证实:
-              # 好集把 qml/ 改名即复现同款报错,qt.conf 桥接后复活)。qt.conf 存在时未指定项
-              # 回落到硬编码默认 Qml2Imports=qml(而非构建期路径),恰好就是部署布局 ——
-              # 与 blunt 同款的一行 Prefix 即可。留 [ -f ] 守卫:未来 windeployqt 若自己写了
-              # qt.conf,以它的为准。
-              [ -f "$BOOT/qt.conf" ] || printf '[Paths]\nPrefix = .\n' > "$BOOT/qt.conf"
-            else
-              windeployqt --release --no-translations "$BOOT/SChatSetupUI.exe" || true
-              mkdir -p "$BOOT/qml"
-              # Setup.qml 只 import QtQuick + QtQuick.Window(刻意不引 Controls,见该文件头注释),
-              # 但整棵拷是为了不去猜 Qt 内部的模块依赖 —— 这条分支的职责是「一定能跑」。
-              for m in QtQml QtQuick; do
-                [ -d "$QMLSRC/$m" ] && cp -r "$QMLSRC/$m" "$BOOT/qml/" || true
-              done
-              for d in Qt6QmlModels Qt6QmlWorkerScript Qt6QmlMeta Qt6OpenGL; do
-                [ -f "$QTBIN/$d.dll" ] && cp "$QTBIN/$d.dll" "$BOOT/" || true
-              done
-              printf '[Paths]\nPrefix = .\n' > "$BOOT/qt.conf"
-            fi
-            dll_closure "$BOOT"
-            # 「三个 MinGW 运行时 DLL 在不在」这类存在性检查挡不住「QtQuick 的 qml 模块没进来」,
-            # 而后者的表现是用户双击安装包、启动图闪一下就没了。所以只认 --selftest 的退出码:
-            # 拿这套文件真把 QML 加载一遍(不弹窗)。
-            for must in libgcc_s_seh-1 libstdc++-6 libwinpthread-1; do
-              [ -f "$BOOT/$must.dll" ] || { echo "  [$1] 缺 $must.dll"; return 1; }
-            done
-            # GUI 子系统进程的 Qt 日志默认走 OutputDebugString,CI 日志里什么都看不见 ——
-            # QT_ASSUME_STDERR_HAS_CONSOLE=1 让失败原因(QQmlApplicationEngine 的 warnings,
-            # 比如 "module X is not installed")落进 stderr;失败时再带 QML_IMPORT_TRACE 复跑
-            # 一遍,把 import 解析现场也打出来,别再让 selftest 静默失败逼人盲猜。
-            ( cd "$BOOT" && QT_ASSUME_STDERR_HAS_CONSOLE=1 ./SChatSetupUI.exe --selftest ) || {
-              echo "  [$1] selftest 失败,带 QML_IMPORT_TRACE 复跑拿现场:"
-              ( cd "$BOOT" && QT_ASSUME_STDERR_HAS_CONSOLE=1 QML_IMPORT_TRACE=1 \
-                  ./SChatSetupUI.exe --selftest 2>&1 | tail -n 40 ) || true
-              return 1
-            }
-            echo "  [$1] selftest OK: $(find "$BOOT" -type f | wc -l) files, $(du -sh "$BOOT" | cut -f1)"
+          rm -rf "$BOOT"; mkdir -p "$BOOT"
+          cp build/installer/SChatSetupUI.exe "$BOOT/"
+          # GUI 子系统进程的 Qt 日志默认走 OutputDebugString,CI 日志里什么都看不见 ——
+          # QT_ASSUME_STDERR_HAS_CONSOLE=1 让失败原因(QQmlApplicationEngine 的 warnings,
+          # 比如 "module X is not installed")落进 stderr;失败时再带 QML_IMPORT_TRACE 复跑
+          # 一遍,把 import 解析现场也打出来,别再让 selftest 静默失败逼人盲猜。
+          ( cd "$BOOT" && QT_ASSUME_STDERR_HAS_CONSOLE=1 ./SChatSetupUI.exe --selftest ) || {
+            echo "selftest 失败,带 QML_IMPORT_TRACE 复跑拿现场:"
+            ( cd "$BOOT" && QT_ASSUME_STDERR_HAS_CONSOLE=1 QML_IMPORT_TRACE=1 \
+                ./SChatSetupUI.exe --selftest 2>&1 | tail -n 40 ) || true
+            echo "FATAL: 安装界面加载不起 QML(用户机上会双击打不开)"
+            exit 1
           }
+          echo "selftest OK: $(find "$BOOT" -type f | wc -l) files, $(du -sh "$BOOT" | cut -f1)"
 
-          if build_boot scan; then
-            echo "引导子集 = 最小集(windeployqt --qmldir)"
-          else
-            echo "最小集不可用 → 回退到全量 QML 模块树"
-            build_boot blunt || { echo "FATAL: 两种引导子集都跑不起 QML(安装界面在用户机上会打不开)"; exit 1; }
-            echo "引导子集 = 全量树(回退)"
-          fi
-
-          # mkpkg 求两棵树的并集:两边都有的 Qt DLL 只存一份(引导时解到 %TEMP%、安装时写进
+          # mkpkg 求两棵树的并集:两边都有的文件只存一份(引导时解到 %TEMP%、安装时写进
           # 安装目录),并把引导子集排到 solid LZMA 流的最前面,好让 stub 只解压前缀就能起界面。
           mkdir -p out
           build/installer/mkpkg.exe \
@@ -839,8 +818,9 @@ jobs:
           name: qt-windows-x64
           path: desktop/desktop-qt/out/*
 
-  # ── Linux: x86_64 + aarch64, built + packaged in Debian trixie containers (trixie ships
-  # Qt 6.8 + libsodium ≥1.0.19 + codecs). Produces a .deb (both arches) and, on x86_64, a
+  # ── Linux: x86_64 + aarch64, built + packaged in Debian trixie containers.
+  # Qt 不再来自 trixie 的系统包,而是 qt-static.yml 预编译的静态 kit(容器仍是 trixie,
+  # glibc 与编 Qt 那一侧一致)。Produces a .deb (both arches) and, on x86_64, a
   # self-contained AppImage — via scripts/ci-linux-pkg.sh in the source repo. Both arches run
   # natively on matching runners. (armhf/QEMU dropped 2026-07-15 — 每次多拖 ~1h 且无真实用户。)
   linux:
@@ -864,7 +844,7 @@ jobs:
       - name: Build + package (.deb + AppImage) in Debian trixie (${{ matrix.arch }})
         run: |
           docker run --rm --platform ${{ matrix.platform }} \
-            -e SCHAT_GH_MIRROR -e SCHAT_RAW_MIRROR -e ARCH=${{ matrix.arch }} \
+            -e SCHAT_GH_MIRROR -e SCHAT_RAW_MIRROR -e SCHAT_QT_STATIC_VER -e ARCH=${{ matrix.arch }} \
             -v "$PWD:/src" -w /src/desktop/desktop-qt \
             ${{ matrix.image }} bash scripts/ci-linux-pkg.sh
 
