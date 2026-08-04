@@ -637,7 +637,7 @@ jobs:
             git curl
             mingw-w64-x86_64-gcc mingw-w64-x86_64-cmake mingw-w64-x86_64-ninja
             mingw-w64-x86_64-pkgconf
-            mingw-w64-x86_64-qt6-static
+            mingw-w64-x86_64-qt6-static mingw-w64-x86_64-qt6-base
             mingw-w64-x86_64-opus mingw-w64-x86_64-libsodium mingw-w64-x86_64-openh264
             mingw-w64-x86_64-openssl mingw-w64-x86_64-libsrtp
 
@@ -645,8 +645,19 @@ jobs:
       # `mingw-w64-x86_64-qt6-static` 是 MSYS2 打好的整包静态 Qt(单包含 base/declarative/
       # 5compat/shadertools/websockets/imageformats/tools,前缀 /mingw64/qt6-static,约 2.7GB
       # 装完)。三条腿里只有这条能直接装现成的 —— mac / Linux 得走 qt-static.yml 自编。
-      # **刻意不再装动态的 qt6-base 等**:两套 Qt 同时在,find_package 命中哪一套取决于
-      # CMAKE_PREFIX_PATH 的顺序,一旦搞错就是「编得过、发出去的包缺 DLL」。只留一套。
+      #
+      # ⚠️ **qt6-base(动态那套)也必须装,装的不是 Qt 而是它的第三方依赖闭包。**
+      # 静态 Qt 的 CMake 配置在**链接期**要求 WrapSystemPNG / WrapFreetype / WrapSystemHarfbuzz /
+      # WrapPCRE2 / WrapSystemMd4c / WrapZSTD / double-conversion / icu / sqlite3 … 全部可见;
+      # 动态时代这些是 Qt6Gui.dll 自己的事,与我们无关,静态之后变成我们的事。第一版把
+      # qt6-base 删掉了,结果 configure 直接 `Failed to find required Qt component "Gui"`
+      # (紧挨着的一行是 `Could NOT find WrapSystemPNG`,Build All run 30941213539 实证)。
+      # 用 qt6-base 的依赖闭包而不是手抄一份 Wrap* 清单:手抄的那种每次 Qt 升级都会悄悄过期。
+      #
+      # 两套 Qt 同时在机器上的风险(find_package 命中哪一套)由两道闸挡住:
+      #   ① configure 显式 `-DQt6_DIR=/mingw64/qt6-static/lib/cmake/Qt6` —— Qt6Config 找组件时
+      #      是 `NO_DEFAULT_PATH` 地在自己那棵树里找,Qt6 本体定死了,组件就不可能跨树;
+      #   ② 构建后那条「SChat.exe 导入表里不许有 qt6*.dll」的断言,真串了也发不出去。
 
       - name: Fetch third-party deps (libdatachannel source + single headers)
         working-directory: desktop/desktop-qt
@@ -658,6 +669,7 @@ jobs:
           set -e
           cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_PREFIX_PATH=/mingw64/qt6-static \
+            -DQt6_DIR=/mingw64/qt6-static/lib/cmake/Qt6 \
             -DOPENSSL_USE_STATIC_LIBS=TRUE
           cmake --build build -j"$(nproc)"
 

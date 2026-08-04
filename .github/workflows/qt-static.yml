@@ -81,7 +81,13 @@ jobs:
           python3 - >> "$GITHUB_OUTPUT" <<'PY'
           import json, os
           ALL = [
-            {"plat": "macos-universal", "runner": "macos-26"},
+            # ⚠️ **runner 必须与 qt-desktop.yml 的 macos-qt 腿一致(现为 macos-14)。**
+            # 静态 kit 会把「构建时 SDK 里有哪些符号」**烘焙进 .a**:在 macos-26(Xcode 26 SDK)
+            # 编出来的 libqsecuretransportbackend.a 引用了 `_kSecImportToMemoryOnly`,而消费端
+            # 跑 macos-14(Xcode 15.4 SDK)根本没有这个符号 → 链接期 undefined symbol
+            # (Build All run 30941213539 实证,mac Qt 腿全红)。动态链接时这条耦合不存在,
+            # 是静态化引入的新约束。改动任何一边的 runner,另一边必须同步改。
+            {"plat": "macos-universal", "runner": "macos-14"},
             {"plat": "linux-x86_64",  "runner": "ubuntu-latest",    "image": "debian:trixie",         "platform": "linux/amd64"},
             {"plat": "linux-aarch64", "runner": "ubuntu-24.04-arm", "image": "arm64v8/debian:trixie", "platform": "linux/arm64"},
           ]
