@@ -676,8 +676,7 @@ jobs:
           cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_PREFIX_PATH=/mingw64/qt6-static \
             -DQt6_DIR=/mingw64/qt6-static/lib/cmake/Qt6 \
-            -DOPENSSL_USE_STATIC_LIBS=TRUE \
-            -DSCHAT_PREFER_STATIC_DEPS=ON
+            -DOPENSSL_USE_STATIC_LIBS=TRUE
           cmake --build build -j"$(nproc)"
 
       # 「编出来了」不等于「静态成了」。判据直接查导入表,与安装器那三个 exe 的断言同款:
@@ -685,25 +684,33 @@ jobs:
       # 放松这条的代价与源仓 9.12.325 那次一模一样:安装目录里重新躺回一堆 DLL,一键升级
       # 覆盖正在映射的镜像失败 → 「点了更新、重启后还是老版本」。
       #
-      # ⚠️ **libssl/libcrypto 是唯一的例外,而且不能靠 OPENSSL_USE_STATIC_LIBS 消掉。**
-      # 那个开关只管 libdatachannel 的 DTLS(它是编译期链接,已改成静态);Qt 的 TLS 后端
-      # 是**运行期 dlopen**,与链接方式无关 —— 装目录里必须躺着这两个 DLL,否则每一次
-      # https/wss 都在登录前静默失败。所以它们出现在导入表里也是可接受的(视 MSYS2 的
-      # openssl 包有没有提供 .a 而定),但除它俩之外一个都不许有。
-      - name: Assert SChat.exe 零 Qt/MinGW 运行时 DLL 依赖
+      # ⚠️ **断言只守两条性质,不是「零 DLL」——这个范围是量出来的,别随手收紧。**
+      #   ① 没有任何 qt6*.dll  = 用户要的「Qt 静态化」,也是这次改动的全部目的;
+      #   ② 没有 MinGW 运行时三件套(libgcc_s_seh-1/libstdc++-6/libwinpthread-1)
+      #      = 9.12.326「点了更新、重启后还是老版本」那条根因,安装目录里一旦重新出现
+      #      它们,安装器就会在静默升级时把自己即将覆盖的镜像映射进自己的进程。
+      # **Qt 的第三方依赖(libpng/libfreetype/libharfbuzz/libpcre2/libjpeg/libtiff/libwebp/
+      # zlib1/libb2/libbrotli)保持动态,由下面的 dll_closure 随包带上。** 试过让它们也静态
+      # (源仓 SCHAT_PREFER_STATIC_DEPS,qt-desktop run 30944162648):find_library 确实改选了
+      # .a,然后死在传递依赖上 —— MSYS2 的 libfreetype.a 引用 BZ2_*、libtiff.a 引用
+      # jbg_*/jpeg12_*,静态链接要求消费方逐个补齐,而 libtiff 的可选编解码器集合取决于
+      # MSYS2 的打包配置,补一次不等于一劳永逸。详见源仓 CMakeLists.txt 那个开关的注释。
+      # libssl/libcrypto 同理留着:Qt 的 TLS 后端是**运行期 dlopen**,与链接方式无关。
+      - name: Assert SChat.exe 不依赖 Qt 与 MinGW 运行时 DLL
         working-directory: desktop/desktop-qt
         run: |
           set -e
           objdump -p build/app-qt/SChat.exe | awk '/DLL Name:/ { print tolower($3) }' | sort -u > /tmp/imports.txt
-          cat /tmp/imports.txt
-          bad=$(grep -E '^(lib|qt6)' /tmp/imports.txt | grep -vE '^lib(ssl|crypto)-' || true)
+          echo "=== SChat.exe 导入表 ==="; cat /tmp/imports.txt
+          bad=$(grep -E '^(qt6|libgcc_s_seh-1|libstdc\+\+-6|libwinpthread-1)' /tmp/imports.txt || true)
           if [ -n "$bad" ]; then
-            echo "FATAL: SChat.exe 仍动态依赖: $bad"
-            echo "       (CMAKE_PREFIX_PATH 没指到 /mingw64/qt6-static?或 app-qt/CMakeLists.txt 的"
-            echo "        SCHAT_QT_STATIC 分支没生效 —— 那三个 -static 开关必须同时在)"
+            echo "FATAL: SChat.exe 仍动态依赖 Qt / MinGW 运行时: $bad"
+            echo "       Qt6*.dll 出现 = CMAKE_PREFIX_PATH 没指到 /mingw64/qt6-static;"
+            echo "       MinGW 三件套出现 = app-qt/CMakeLists.txt 的 SCHAT_QT_STATIC 分支没生效"
+            echo "       (那三个 -static 开关必须同时在)。"
             exit 1
           fi
-          echo "OK: SChat.exe 除 OpenSSL 外零第三方 DLL"
+          echo "OK: 无 Qt6*.dll、无 MinGW 运行时依赖"
 
       # 安装器的三个非 Qt 产物必须**零第三方 DLL 依赖**。放松这一条的代价(源仓 qt 9.12.325
       # 实证):setup.exe 动态依赖 libgcc_s_seh-1.dll,而更新器起它时的当前目录 = 安装目录
@@ -760,45 +767,69 @@ jobs:
           mkdir -p /tmp/sherpa && tar -xf /tmp/sherpa.tar.bz2 -C /tmp/sherpa --strip-components=1
           cp /tmp/sherpa/lib/*.dll "$STAGE/"
           ls "$STAGE"/sherpa-onnx-c-api.dll "$STAGE"/onnxruntime.dll
-          # ── DLL 闭包已整段移除,判据**反过来了**(源仓 qt 9.14.344)────────────────────
-          # 动态时代这里要把 ~90 个 /mingw64 运行时 DLL 递归解全(MinGW 运行时三件套、ICU、
-          # harfbuzz/freetype/pcre2/glib/brotli/zlib/png/md4c、codec、以及只在 LoadLibrary 时才
-          # 出现的插件自身依赖如 sqldrivers→libsqlite3-0),漏一个 = 干净机器上启动即退、stderr
-          # 全空。静态之后这批依赖**整体不存在**:Qt、ICU、codec、sqlite 全编进 exe,MinGW
-          # 运行时由 -static 收进去。
+          # ── DLL 闭包(保留,但规模从 ~90 降到十几个)─────────────────────────────────
+          # 动态 Qt 时代这里要递归解全 ~90 个 /mingw64 DLL(Qt6*.dll、MinGW 运行时三件套、
+          # ICU、harfbuzz/freetype/pcre2/glib/brotli/zlib/png/md4c、codec,以及只在 LoadLibrary
+          # 时才出现的插件自身依赖如 sqldrivers→libsqlite3-0),漏一个 = 干净机器上启动即退、
+          # stderr 全空。Qt 静态化(9.14.344)之后 Qt6*.dll、MinGW 运行时、sqlite、ICU 全部
+          # 消失,**但 Qt 的第三方依赖仍是动态的**(libpng/freetype/harfbuzz/pcre2/jpeg/tiff/
+          # webp/zlib1/libb2/brotli)—— 让它们也静态试过、死在传递依赖上,见上面 Assert 步骤
+          # 的注释。所以闭包必须留着,只是现在解出来的是十几个而不是九十个。
           #
-          # 于是断言从「这三个 DLL 必须在」翻转成「一个 lib*.dll 都不许在」——
-          # ⚠️ **这个翻转是有意的,别看到旧注释里写着 `FATAL: libgcc_s_seh-1.dll missing` 就以为
-          # 是退化。** 保留一条断言而不是干脆不检查,是因为安装目录里只要重新出现这几个 DLL,
-          # 9.12.326 那条根因就会原样复活:一键升级时 setup.exe 从安装目录把它们映射进自己进程,
-          # 覆盖正在映射的镜像被系统禁止 → 用户点了更新、重启后还是老版本。
+          # 闭包对 $STAGE 和 $BOOT 都要跑:SChatSetupUI.exe 虽然 Qt 静态,但它链 Qt Gui/Quick,
+          # 同样拖着 freetype/png/harfbuzz —— 少了它们,安装器在用户机上表现为「双击只闪一下
+          # 启动图就没了」。
+          dll_closure() {
+            local d="$1"
+            echo "=== resolving DLL closure in $d ==="
+            while :; do
+              before=$(find "$d" -maxdepth 1 -iname '*.dll' | wc -l)
+              while IFS= read -r bin; do
+                ldd "$bin" 2>/dev/null | awk '/=> \/mingw64\// { print $3 }'
+              done < <(find "$d" -type f \( -iname '*.dll' -o -iname '*.exe' \)) \
+                | sort -u | while IFS= read -r dep; do
+                    base=$(basename "$dep")
+                    [ -f "$d/$base" ] || cp "$dep" "$d/"
+                  done
+              after=$(find "$d" -maxdepth 1 -iname '*.dll' | wc -l)
+              echo "  DLL closure pass: $before -> $after"
+              if [ "$before" = "$after" ]; then break; fi
+            done
+          }
+          # uninstall.exe 与 SChatSetupUI.exe 先进 $STAGE,好让闭包连它们的依赖一起解:
+          #   uninstall.exe    —— ARP 的 UninstallString 指向它,必须随应用装进安装目录
+          #   SChatSetupUI.exe —— 卸载界面
           cp build/installer/uninstall.exe build/installer/SChatSetupUI.exe "$STAGE/"
-          echo "staged files: $(find "$STAGE" -type f | wc -l)"
-          find "$STAGE" -type f | sort
-          # 允许存在的非系统 DLL 只有两类:OpenSSL(Qt TLS 后端运行期 dlopen)与 sherpa/onnxruntime
-          # (AsrEngine 运行期 LoadLibrary,官方 MSVC 预编译、MT 静态 CRT,与 MinGW 无关)。
-          bad=$(find "$STAGE" -maxdepth 1 -iname 'lib*.dll' \
-                  ! -iname 'libssl-*.dll' ! -iname 'libcrypto-*.dll' -printf '%f\n' || true)
-          if [ -n "$bad" ]; then
-            echo "FATAL: 安装目录里出现了不该有的 MinGW/Qt 运行时 DLL:"
-            echo "$bad"
-            echo "       静态链没生效 —— 见 app-qt/CMakeLists.txt 与 installer/CMakeLists.txt 的"
-            echo "       -static -static-libgcc -static-libstdc++,以及 CMAKE_PREFIX_PATH。"
-            exit 1
+          dll_closure "$STAGE"
+          echo "staged top-level DLLs: $(find "$STAGE" -maxdepth 1 -iname '*.dll' | wc -l)"
+          find "$STAGE" -maxdepth 1 -iname '*.dll' -printf '%f\n' | sort
+          # ⚠️ 判据**翻转了**:动态时代是「这三个必须在」,现在是「这三个一个都不许在」。
+          # 别看到旧注释里写着 `FATAL: libgcc_s_seh-1.dll missing` 就以为是退化 —— 安装目录里
+          # 只要重新出现它们,9.12.326 那条根因就原样复活(一键升级时 setup.exe 从安装目录把
+          # 它们映射进自己进程,覆盖正在映射的镜像被系统禁止 → 点了更新、重启后还是老版本)。
+          for forbidden in libgcc_s_seh-1 libstdc++-6 libwinpthread-1; do
+            if [ -f "$STAGE/$forbidden.dll" ]; then
+              echo "FATAL: 安装目录里出现了 $forbidden.dll —— 静态链没生效,一键升级会失败"
+              exit 1
+            fi
+          done
+          # Qt 也不该有任何一份落地
+          if find "$STAGE" -iname 'Qt6*.dll' | grep .; then
+            echo "FATAL: 安装目录里有 Qt6*.dll —— Qt 没静态成"; exit 1
           fi
-          echo "OK: 安装目录零 MinGW/Qt 运行时 DLL"
+          echo "OK: 无 MinGW 运行时三件套、无 Qt6*.dll"
           # ── 自制安装器(源仓 desktop/desktop-qt/installer/,已取代 NSIS)────────────────
           # 换掉 NSIS 的理由不是「不好看」而是**MUI2 DPI 不感知**:150% 缩放的机器上整窗被
           # 系统位图拉伸,上一版精心生成的 164×314 侧栏被拉成 246×471,贴什么图都糊。
           # 自制的这套:stub 与卸载器不链 Qt(静默升级路径因此不依赖任何 Qt 落地),界面是
           # 一页式 QML,首帧前由 stub 画原生启动图顶着。细节见 docs/build_and_run.md。
           #
-          # ── 「引导子集」现在就是一个文件(源仓 qt 9.14.344)──────────────────────────
+          # ── 「引导子集」现在只有 exe + 十几个第三方 DLL(源仓 qt 9.14.344/346)──────────
           # 它原本的定义是「把 SChatSetupUI.exe 起得来所需的那批 Qt DLL 挑出来,排在 solid 流
-          # 最前面,好让 stub 只解压前缀就能起界面」。静态 Qt 之后 SChatSetupUI.exe 自足,引导
-          # 子集 = 它自己,scan/blunt 两条造法与那套 qmlimportscanner / cygpath / qt.conf 绕行
-          # 全部随之作废(它们解决的问题是「部署布局里 QML 模块放哪」,而现在 QML 编进了 exe)。
-          # 首帧因此更快:引导阶段只需解压一个 ~40MB 的文件,而不是 77~1653 个小文件。
+          # 最前面,好让 stub 只解压前缀就能起界面」。静态 Qt 之后 QML 与 Qt 本体都编进了 exe,
+          # scan/blunt 两条造法与那套 qmlimportscanner / cygpath / qt.conf 绕行全部作废
+          # (它们解决的是「部署布局里 QML 模块放哪」这个已经不存在的问题);剩下的只有闭包
+          # 解出来的那十几个第三方 DLL。首帧因此快得多:文件个数从 77~1653 降到十几个。
           #
           # **--selftest 保留,而且比以前更重要。** 它验的是「这套东西真能把 QML 加载起来」,
           # 静态构建同样会漏:qmlimportscanner 在链接期漏扫一个模块,exe 照样编得出来,运行时
@@ -808,6 +839,10 @@ jobs:
           BOOT="pkg/boot"
           rm -rf "$BOOT"; mkdir -p "$BOOT"
           cp build/installer/SChatSetupUI.exe "$BOOT/"
+          # 界面进程虽然 Qt 静态,但它链 Qt Gui/Quick,照样拖着 freetype/png/harfbuzz 那几个
+          # 第三方 DLL。少了它们,用户机上的表现是「双击安装包只闪一下启动图就没了」——
+          # 与动态时代同一种故障,只是数量从几十个降到几个。
+          dll_closure "$BOOT"
           # GUI 子系统进程的 Qt 日志默认走 OutputDebugString,CI 日志里什么都看不见 ——
           # QT_ASSUME_STDERR_HAS_CONSOLE=1 让失败原因(QQmlApplicationEngine 的 warnings,
           # 比如 "module X is not installed")落进 stderr;失败时再带 QML_IMPORT_TRACE 复跑
