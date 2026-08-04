@@ -232,14 +232,33 @@ jobs:
           if grep -iE '"(on|true|1)"' /tmp/sharedflag.txt; then
             echo "FATAL: 这是动态 kit"; exit 1
           fi
-          # 静态 kit 里必须有 libQt6Core.a,且不该有 libQt6Core.so / .dylib
-          ls "$P/lib/libQt6Core.a"
-          if ls "$P"/lib/libQt6Core.so* "$P"/lib/libQt6Core*.dylib 2>/dev/null; then
-            echo "FATAL: 同时存在共享库"; exit 1
+          # 失败时要有完整现场,别再为了看一眼目录长什么样重编 70 分钟。
+          echo "=== $P/lib 顶层 ==="; ls "$P/lib" | head -40
+
+          # ⚠️ **别按文件名判断**(run 30928889131 就是这么挂的):macOS 上 Qt 即使静态构建
+          # 也按 **framework 布局**安装,产物是 lib/QtCore.framework/Versions/A/QtCore 而不是
+          # lib/libQt6Core.a —— 写死 Linux 的文件名,mac 腿在 Qt 编了 70 分钟之后才因为一条
+          # `ls` 失败。判据改成查**真实属性**:那个文件是不是静态归档(ar archive)。
+          CORE=""
+          for c in "$P/lib/libQt6Core.a" \
+                   "$P/lib/QtCore.framework/Versions/A/QtCore" \
+                   "$P/lib/QtCore.framework/QtCore"; do
+            [ -f "$c" ] && { CORE="$c"; break; }
+          done
+          [ -n "$CORE" ] || { echo "FATAL: 找不到 QtCore 产物(上面的目录列表是现场)"; exit 1; }
+          echo "QtCore = $CORE"
+          file "$CORE" > /tmp/corefile.txt; cat /tmp/corefile.txt
+          # 静态 = ar archive;动态 = "dynamically linked shared library"。这条才是真判据。
+          if grep -qi "shared library\|dynamically linked" /tmp/corefile.txt; then
+            echo "FATAL: QtCore 是动态库,不是静态归档"; exit 1
           fi
+          grep -qi "archive" /tmp/corefile.txt || { echo "FATAL: QtCore 不是 ar 归档,形态不对"; exit 1; }
+          # 整个 kit 里都不该出现 Qt 的共享库(mac 的 .dylib / Linux 的 .so)。
+          find "$P/lib" \( -name 'libQt6*.so*' -o -name 'libQt6*.dylib' \) -print > /tmp/shared.txt
+          if [ -s /tmp/shared.txt ]; then echo "FATAL: kit 里有 Qt 共享库:"; cat /tmp/shared.txt; exit 1; fi
           if [ "${{ matrix.plat }}" = "macos-universal" ]; then
             # 两个架构都得在 —— 少一个的表现是 Intel Mac 用户下载到一个打不开的包。
-            lipo -info "$P/lib/libQt6Core.a" | tee /tmp/lipo.txt
+            lipo -info "$CORE" > /tmp/lipo.txt; cat /tmp/lipo.txt
             grep -q x86_64 /tmp/lipo.txt || { echo "FATAL: 缺 x86_64 slice"; exit 1; }
             grep -q arm64  /tmp/lipo.txt || { echo "FATAL: 缺 arm64 slice"; exit 1; }
           fi
