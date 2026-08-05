@@ -229,7 +229,12 @@ jobs:
       - uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ env.SRC_REF }}-b${{ github.run_number }}
-          name: "SChat ${{ env.SRC_REF }} build ${{ github.run_number }}${{ env.SRC_REF == 'main' && '' || ' · 测试版' }}"
+          # ⚠️ GHA 的 `A && B || C` 三元里,**B 绝不能是空串/false** —— `true && ''` 求值成 `''`
+          # 本身是 falsy,于是 `'' || C` 又落回 C:条件为真也照样拿到 C。原写法
+          # `SRC_REF == 'main' && '' || ' · 测试版'` 因此让**从 main 打的正式版标题也带「测试版」**
+          # (main-b184 实证;prerelease/make_latest 是直接比较,一直是对的,只有标题错)。
+          # 规避法只有一条:把非空的那个值放进 B,条件取反。
+          name: "SChat ${{ env.SRC_REF }} build ${{ github.run_number }}${{ env.SRC_REF != 'main' && ' · 测试版' || '' }}"
           body: ${{ steps.cl.outputs.body }}
           files: dist/**
           prerelease: ${{ env.SRC_REF != 'main' }}
