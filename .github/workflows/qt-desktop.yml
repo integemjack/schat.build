@@ -710,6 +710,17 @@ jobs:
       # 还要把**静态归档的传递依赖**摆上链接行(bz2/jbig/lzma/zstd/Lerc/deflate,外加把 jpeg
       # 重新摆到末尾解 jpeg12_* 的顺序问题)。DLL 自带导入表、静态归档没有,这是两者最根本的
       # 差别 —— 详见源仓 CMakeLists.txt 里那张表(48 个未定义符号 / 7 个库,逐个归类得来)。
+      # 「某个第三方为什么还是动态的」——链接行是唯一的直接证据,靠猜 Qt 的 Find 模块实现
+      # 已经白烧过好几轮 CI。ninja -t commands 能把真实链接命令打出来。非致命,只为留证据。
+      - name: Dump 链接行里的第三方(诊断)
+        working-directory: desktop/desktop-qt
+        continue-on-error: true
+        run: |
+          ninja -C build -t commands app-qt/SChat.exe 2>/dev/null | tail -1 \
+            | tr ' ' '\n' \
+            | grep -iE "harfbuzz|freetype|png|jpeg|tiff|webp|brotli|pcre|zstd|zlib|b2|lzma|jbig|lerc|deflate|graphite" \
+            | sort -u || echo "(链接行里没有第三方条目,或 ninja -t commands 失败)"
+
       - name: Assert SChat.exe 是单文件(零第三方 DLL 依赖)
         working-directory: desktop/desktop-qt
         run: |
