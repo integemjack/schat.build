@@ -265,10 +265,13 @@ jobs:
         continue-on-error: true
         env:
           RELEASE_SIGN_ED25519_KEY: ${{ secrets.RELEASE_SIGN_ED25519_KEY }}
-          # **非 main 分支不上传自建源**:jiami.chat 的 /desktop/releases/latest 只有一条「最新」,
-          # 把测试版推上去等于把所有正式用户直接升级到测试包。空 token = signer 跳过 HTTP 上传、
-          # 仍然签名并写出清单(下一步作为 GitHub 回退镜像附到 release 上,beta 通道就吃这份)。
-          RELEASE_UPLOAD_TOKEN: ${{ env.SRC_REF == 'main' && secrets.RELEASE_UPLOAD_TOKEN || '' }}
+          # 非 main 分支**也上传自建源**,以 channel=beta 落库(chatserver 9.14.x 起
+          # /desktop/releases/latest 支持 ?channel=,正式通道严格只看 stable、beta 取
+          # {beta,stable} 里较新的那个;retention 也按通道各留各的)。
+          # 历史:在服务端支持通道之前,这里把 token 置空来「不上传」—— 因为那时
+          # GetLatestRelease 不分通道,传上去等于把所有正式用户升级到测试包。那个洞已修,
+          # 这里恒传 secret。**若要回退,连同服务端一起回退**,只改这里会重现该事故。
+          RELEASE_UPLOAD_TOKEN: ${{ secrets.RELEASE_UPLOAD_TOKEN }}
           RELEASE_CHANNEL: ${{ env.SRC_REF == 'main' && 'stable' || 'beta' }}
           # The per-line changelog (same body attached to the GitHub release above). The signer
           # forwards it as the upload's `notes` field so the self-hosted manifest's notes/body is
