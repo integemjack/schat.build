@@ -687,7 +687,8 @@ jobs:
           cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_PREFIX_PATH=/mingw64/qt6-static \
             -DQt6_DIR=/mingw64/qt6-static/lib/cmake/Qt6 \
-            -DOPENSSL_USE_STATIC_LIBS=TRUE
+            -DOPENSSL_USE_STATIC_LIBS=TRUE \
+            -DSCHAT_PREFER_STATIC_DEPS=ON
           cmake --build build -j"$(nproc)"
 
       # 「编出来了」不等于「静态成了」。判据直接查导入表,与安装器那三个 exe 的断言同款:
@@ -700,28 +701,30 @@ jobs:
       #   ② 没有 MinGW 运行时三件套(libgcc_s_seh-1/libstdc++-6/libwinpthread-1)
       #      = 9.12.326「点了更新、重启后还是老版本」那条根因,安装目录里一旦重新出现
       #      它们,安装器就会在静默升级时把自己即将覆盖的镜像映射进自己的进程。
-      # **Qt 的第三方依赖(libpng/libfreetype/libharfbuzz/libpcre2/libjpeg/libtiff/libwebp/
-      # zlib1/libb2/libbrotli)保持动态,由下面的 dll_closure 随包带上。** 试过让它们也静态
-      # (源仓 SCHAT_PREFER_STATIC_DEPS,qt-desktop run 30944162648):find_library 确实改选了
-      # .a,然后死在传递依赖上 —— MSYS2 的 libfreetype.a 引用 BZ2_*、libtiff.a 引用
-      # jbg_*/jpeg12_*,静态链接要求消费方逐个补齐,而 libtiff 的可选编解码器集合取决于
-      # MSYS2 的打包配置,补一次不等于一劳永逸。详见源仓 CMakeLists.txt 那个开关的注释。
-      # libssl/libcrypto 同理留着:Qt 的 TLS 后端是**运行期 dlopen**,与链接方式无关。
-      - name: Assert SChat.exe 不依赖 Qt 与 MinGW 运行时 DLL
+      # ⚠️ **判据是「一个 lib*.dll 都不许有」——真·单文件 exe(qt 9.14.347)。**
+      # 唯一例外是 OpenSSL:Qt 的 TLS 后端**运行期 dlopen** libssl/libcrypto,与链接方式无关,
+      # 那两个 DLL 必须随包(缺了就是每一次 https/wss 在登录前静默失败)。它们**不该**出现在
+      # 导入表里(OPENSSL_USE_STATIC_LIBS 让编译期链接走静态),但即便出现也不算错,所以放行。
+      #
+      # 达成这一步靠源仓的 SCHAT_PREFER_STATIC_DEPS:除了把 find_library 的后缀改成 .a 优先,
+      # 还要把**静态归档的传递依赖**摆上链接行(bz2/jbig/lzma/zstd/Lerc/deflate,外加把 jpeg
+      # 重新摆到末尾解 jpeg12_* 的顺序问题)。DLL 自带导入表、静态归档没有,这是两者最根本的
+      # 差别 —— 详见源仓 CMakeLists.txt 里那张表(48 个未定义符号 / 7 个库,逐个归类得来)。
+      - name: Assert SChat.exe 是单文件(零第三方 DLL 依赖)
         working-directory: desktop/desktop-qt
         run: |
           set -e
           objdump -p build/app-qt/SChat.exe | awk '/DLL Name:/ { print tolower($3) }' | sort -u > /tmp/imports.txt
           echo "=== SChat.exe 导入表 ==="; cat /tmp/imports.txt
-          bad=$(grep -E '^(qt6|libgcc_s_seh-1|libstdc\+\+-6|libwinpthread-1)' /tmp/imports.txt || true)
+          bad=$(grep -E '^(lib|qt6)' /tmp/imports.txt | grep -vE '^lib(ssl|crypto)-' || true)
           if [ -n "$bad" ]; then
-            echo "FATAL: SChat.exe 仍动态依赖 Qt / MinGW 运行时: $bad"
-            echo "       Qt6*.dll 出现 = CMAKE_PREFIX_PATH 没指到 /mingw64/qt6-static;"
-            echo "       MinGW 三件套出现 = app-qt/CMakeLists.txt 的 SCHAT_QT_STATIC 分支没生效"
-            echo "       (那三个 -static 开关必须同时在)。"
+            echo "FATAL: SChat.exe 仍动态依赖: $bad"
+            echo "       qt6*.dll         = CMAKE_PREFIX_PATH 没指到 /mingw64/qt6-static"
+            echo "       libgcc/stdc++/winpthread = app-qt/CMakeLists.txt 的 SCHAT_QT_STATIC 分支没生效"
+            echo "       其它 lib*.dll    = SCHAT_PREFER_STATIC_DEPS 没生效,或该库在 MSYS2 里没有 .a"
             exit 1
           fi
-          echo "OK: 无 Qt6*.dll、无 MinGW 运行时依赖"
+          echo "OK: SChat.exe 零第三方 DLL(单文件)"
 
       # 安装器的三个非 Qt 产物必须**零第三方 DLL 依赖**。放松这一条的代价(源仓 qt 9.12.325
       # 实证):setup.exe 动态依赖 libgcc_s_seh-1.dll,而更新器起它时的当前目录 = 安装目录
@@ -814,23 +817,28 @@ jobs:
           dll_closure "$STAGE"
           echo "staged top-level DLLs: $(find "$STAGE" -maxdepth 1 -iname '*.dll' | wc -l)"
           find "$STAGE" -maxdepth 1 -iname '*.dll' -printf '%f\n' | sort
-          # ⚠️ **安装目录里出现 libgcc_s_seh-1 / libstdc++-6 / libwinpthread-1 是正常的,不要
-          # 为此加断言。** 曾经加过一条「这三个一个都不许在」,当场被闭包打脸(run 30945274179):
-          # MSYS2 的第三方 DLL(libpng/libfreetype/libharfbuzz…)**自己**动态依赖 MinGW 运行时,
-          # 只要还带着这些第三方,这三个就必然被闭包解出来。
+          # 9.14.347 起全静态,安装目录里应当**只剩** OpenSSL(运行期 dlopen)与 sherpa/
+          # onnxruntime(运行期 LoadLibrary,官方 MSVC 预编译)这两类 DLL。
           #
-          # 那条断言错在**把 9.12.326 的根因记成了「目录里有这三个 DLL」**。真正的根因是
-          # **安装器自己动态依赖它们** —— setup.exe 由更新器从安装目录作为 CWD 启动,Windows
-          # 的 DLL 搜索顺序里当前目录排在 PATH 之前,于是它把「即将被自己覆盖的镜像」映射进了
-          # 自己的进程。守这条的是上面那个对 SChatSetup.exe/uninstall.exe/mkpkg.exe 跑 objdump
-          # 的断言(它们必须零第三方导入),**不是**目录内容。安装器静态链之后,目录里这些
-          # DLL 只被 SChat.exe 映射,而升级时 SChat.exe 已经退出,覆盖它们没有任何问题。
-          #
-          # 这里只留 Qt 这一条:Qt 落地任何一份 DLL 都说明静态化没生效。
-          if find "$STAGE" -iname 'Qt6*.dll' | grep .; then
-            echo "FATAL: 安装目录里有 Qt6*.dll —— Qt 没静态成"; exit 1
+          # ⚠️ 历史教训别重演:**曾经加过一条「libgcc_s_seh-1/libstdc++-6/libwinpthread-1
+          # 一个都不许在」,当场被 DLL 闭包打脸**(run 30945274179)—— 当时第三方还是动态的,
+          # 而 MSYS2 的 libpng/libfreetype 自己就依赖 MinGW 运行时,闭包必然把它们解出来。
+          # 那条断言错在把 9.12.326 的根因记成「目录里有这三个 DLL」;真正的根因是**安装器
+          # 自己动态依赖它们**(setup.exe 以安装目录为 CWD 启动,当前目录排在 PATH 之前,于是
+          # 把即将被自己覆盖的镜像映射进了自己进程),守这条的是上面那个对
+          # SChatSetup.exe/uninstall.exe/mkpkg.exe 跑 objdump 的断言,**不是目录内容**。
+          # 现在全静态之后目录里确实没有它们了,但**判据仍然按「白名单之外都不许有」写**,
+          # 而不是回头去点名那三个 —— 点名的写法在依赖形态变一次就会错一次。
+          bad=$(find "$STAGE" -maxdepth 1 -iname '*.dll' \
+                  ! -iname 'libssl-*.dll' ! -iname 'libcrypto-*.dll' \
+                  ! -iname 'sherpa-onnx-*.dll' ! -iname 'onnxruntime*.dll' -printf '%f\n' || true)
+          if [ -n "$bad" ]; then
+            echo "FATAL: 安装目录里出现了预期之外的 DLL:"; echo "$bad"
+            echo "       全静态之后这里只该有 OpenSSL(Qt TLS 运行期 dlopen)与 sherpa/onnxruntime"
+            echo "       (AsrEngine 运行期 LoadLibrary)。"
+            exit 1
           fi
-          echo "OK: 安装目录无 Qt6*.dll(Qt 已编进 exe)"
+          echo "OK: 安装目录只有 OpenSSL + sherpa 运行库"
           # ── 自制安装器(源仓 desktop/desktop-qt/installer/,已取代 NSIS)────────────────
           # 换掉 NSIS 的理由不是「不好看」而是**MUI2 DPI 不感知**:150% 缩放的机器上整窗被
           # 系统位图拉伸,上一版精心生成的 164×314 侧栏被拉成 246×471,贴什么图都糊。
