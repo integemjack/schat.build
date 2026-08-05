@@ -760,6 +760,18 @@ jobs:
           done
           [ "$fail" = 0 ]
 
+      # 快捷方式子系统的回归门禁(源仓 installer/tools/shortcut_test.cpp,qt 9.14.355)。
+      # 挡的是「装完了,桌面没有快捷方式、开始菜单里也没有」这条用户 bug:交互安装把
+      # runInstall 丢在 Qt 的工作线程上跑,而 **COM 是按线程初始化的** —— 那条线程从没
+      # CoInitializeEx 过,CoCreateInstance(CLSID_ShellLink) 直接 CO_E_NOTINITIALIZED,
+      # createShortcut 静默返回 false,安装器照常报「安装完成」。静默安装(/S,更新器走的
+      # 那条)在 WinMain 里初始化过 COM,所以本机怎么试都是好的 —— 与 --selftest 挡的
+      # 「QML 模块加载不起来」同一类:存在性检查(exe 在不在、DLL 全不全)一个都挡不住,
+      # 只有真在裸线程上建一次 .lnk 才挡得住。全程只写 %TEMP%,不碰 runner 的桌面。
+      - name: Installer shortcut regression (COM-per-thread + 公用落点)
+        working-directory: desktop/desktop-qt
+        run: ./build/installer/installer_shortcut_test.exe
+
       - name: Package installer (静态 Qt + 自制 mkpkg)
         working-directory: desktop/desktop-qt
         run: |
