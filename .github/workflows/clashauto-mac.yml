@@ -3,7 +3,7 @@
 #
 # ★ 2026-08-01 起构建 **Swift 版**（macos/ 下的 Coast.app）—— macOS 只发 Swift 版，
 #   Qt 版流程见本文件的 git 历史。打包逻辑完全复用 clashauto 仓库自己的
-#   macos/scripts/make_app.sh（universal + 默认集成最新正式版内核 + 先内层后外层签名），
+#   macos/scripts/make_app.sh（arm64 + 默认集成最新正式版内核 + 先内层后外层签名），
 #   本文件只做四件事：取触发参数 → 调 make_app.sh → 公证 → 发布到指定 release。
 #
 # 触发：clashauto 的 macos-swift job 往本分支推提交，参数写在**提交说明**里（一行一个）：
@@ -35,7 +35,7 @@ on:
 
 jobs:
   clashauto-macos:
-    name: clashauto macOS universal (Swift, signed + notarized)
+    name: clashauto macOS arm64 (Swift, signed + notarized)
     # 只处理 Swift 版的触发提交（老式空提交/别的触发不抢这个 push）。
     # 手动 dispatch 没有提交说明，一律放行。
     if: "github.event_name == 'workflow_dispatch' || contains(github.event.head_commit.message, 'product: coast-swift')"
@@ -153,12 +153,20 @@ jobs:
           SIGN_IDENTITY: ${{ steps.signcert.outputs.identity }}
         run: |
           set -euo pipefail
-          # 打包（universal + 集成内核 + helper/内核/app 先内层后外层签名 + entitlements）
+          # 打包（arm64 + 集成内核 + helper/内核/app 先内层后外层签名 + entitlements）
           # 全在 clashauto 仓库的 make_app.sh 里 —— 两边共用一份逻辑，不再各自漂移。
-          bash scripts/make_app.sh --version "$APP_VERSION" --universal --sign "$SIGN_IDENTITY"
-          # 结构自查：两架构、封存、内核/种子在位（缺了要等用户首启才炸）
-          lipo -archs Coast.app/Contents/MacOS/Coast | grep -q x86_64
+          #
+          # ★ **不带 --universal**：这条线 2026-08 起只发 arm64。部署目标本来就是 macOS 26、
+          #   整套 UI 建在 Liquid Glass 上，给 Intel 再编一半只是把包撑大一倍。装不了 26 的
+          #   机器走 Qt 线（-qt.dmg，13.0+、universal），那才是兼容腿。
+          #   与 clashauto 仓库 release.yml 的 macos-swift job **必须保持一致**。
+          bash scripts/make_app.sh --version "$APP_VERSION" --sign "$SIGN_IDENTITY"
+          # 结构自查：架构、封存、内核/种子在位（缺了要等用户首启才炸）
           lipo -archs Coast.app/Contents/MacOS/Coast | grep -q arm64
+          # ★ 反向断言。不带 --universal 时 make_app.sh 按**主机架构**编 —— runner 是
+          #   macos-26（Apple Silicon）所以是 arm64；哪天 runs-on 被换成 Intel 镜像，产出
+          #   就会是个叫 arm64 的 x86_64 包，装到用户机上直接打不开。这里当场拦住。
+          ! lipo -archs Coast.app/Contents/MacOS/Coast | grep -q x86_64
           lipo -archs Coast.app/Contents/MacOS/com.yuehongsun.coast.helper | grep -q arm64
           codesign --verify --deep --strict Coast.app
           test -x Coast.app/Contents/Resources/core
@@ -182,7 +190,7 @@ jobs:
           #   全靠这个子串区分（Swift 侧 UpdateChecker.isQtLine 排除带 qt 的）。
           #   2026-08 品牌串由 ClashAuto- 统一改成 Coast-；改前缀是安全的 —— 更新器按
           #   平台/架构/扩展名挑资源，从不认前缀。
-          DMG="dist/Coast-${APP_VERSION}-macos-universal.dmg"
+          DMG="dist/Coast-${APP_VERSION}-macos-arm64.dmg"
           hdiutil create -volname "Coast" -srcfolder dist/dmgroot -ov -format UDZO "$DMG"
           if [ -z "${NOTARY_KEY:-}" ]; then
             echo "缺 notary 凭据，无法公证"; exit 1
@@ -211,8 +219,8 @@ jobs:
       - name: Upload signed DMG artifact
         uses: actions/upload-artifact@v4
         with:
-          name: Coast-macos-universal-signed
-          path: dist/Coast-*-macos-universal.dmg
+          name: Coast-macos-arm64-signed
+          path: dist/Coast-*-macos-arm64.dmg
 
       - name: Publish to clashauto release
         shell: bash
@@ -229,7 +237,7 @@ jobs:
             echo "触发方没指定 release-tag —— 跳过发布（DMG 已作为 artifact 上传）"
             exit 0
           fi
-          DMG="dist/Coast-${APP_VERSION}-macos-universal.dmg"
+          DMG="dist/Coast-${APP_VERSION}-macos-arm64.dmg"
           test -f "$DMG"
           shasum -a 256 "$DMG" | awk '{print $1}' > "$DMG.sha256"
           # 发布到触发方指定的 tag —— 正式版/beta 各回各家（早先只推空提交、这边只能猜
