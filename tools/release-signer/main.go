@@ -1,21 +1,27 @@
-// release-signer — Step 2 of the self-hosted update distribution channel.
+// release-signer — signs each release asset and maintains the **version index**.
 //
-// Contract: docs/update_distribution_plan.md (LOCKED 2026-07-22) in the source
-// repo Ireoo/Secret-Chat. Byte anchor: docs/fixtures/update_distribution/vectors.json
-// (generator tools/gen_vectors.go). This program's canonicalBytes() is a VERBATIM
-// port of gen_vectors.go's canonicalBytes() so the CI signer, the chatserver
-// upload re-verify, and the three client verifiers all agree byte-for-byte.
+// Contract: docs/update_index_refactor_plan.md (定稿 2026-08-07) in the source repo
+// Ireoo/Secret-Chat, which supersedes the *取包链路* of docs/update_distribution_plan.md.
+// The SIGNING contract (§3 of the old plan) is unchanged and still authoritative;
+// byte anchor: docs/fixtures/update_distribution/vectors.json (generator
+// tools/gen_vectors.go). This program's canonicalBytes() is a VERBATIM port of
+// gen_vectors.go's canonicalBytes() so the CI signer and the three client verifiers
+// all agree byte-for-byte.
 //
 // What it does, over a flattened release-asset directory (dist/**):
-//  1. maps each filename → (line, os, arch-KEY, format, version) per §6 of the plan
+//  1. maps each filename → (line, os, arch-KEY, format, version) per the §6 table
 //     (parse "-qt-" BEFORE the generic "SChat-macos-" prefix; exclude
 //     SChat-android-debug.apk / SChat-server-* / SChat-m5core2-*);
-//  2. computes sha256, builds the §3.1 canonical bytes, Ed25519-signs with the
-//     official private key from RELEASE_SIGN_ED25519_KEY;
-//  3. POSTs each asset multipart to $UPDATE_UPLOAD_URL
-//     (default https://jiami.chat/desktop/releases/upload) with a Bearer token;
-//  4. writes a combined signed manifest JSON (decision #11) for the GitHub-release
-//     mirror so the fallback path stays signature-verified.
+//  2. computes sha256, builds the canonical bytes, Ed25519-signs with the official
+//     private key from RELEASE_SIGN_ED25519_KEY;
+//  3. writes the per-release combined manifest (`-manifest`) — this build, this
+//     channel — which CI attaches to THIS GitHub release (老客户端的回退源);
+//  4. fetches the existing version index from the fixed `version` tag, merges this
+//     build's entries in by (line,os,arch,channel), and writes it back (`-index`)
+//     + a stable-only schema-1 mirror (`-index-manifest`) for the same fixed tag.
+//
+// The self-hosted upload leg (jiami.chat) is RETIRED — clients now read the index
+// off GitHub directly and pull bytes from the release assets.
 //
 // Uses ONLY the Go standard library (no go.sum, hermetic `go run .`).
 //
@@ -29,14 +35,12 @@ package main
 import (
 	"crypto/ed25519"
 	"crypto/sha256"
-	"crypto/tls"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
-	"mime/multipart"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -48,7 +52,7 @@ import (
 )
 
 // ─────────────────────────────────────────────────────────────────────────────
-// §3.1 canonical bytes — VERBATIM port of docs/fixtures/.../gen_vectors.go.
+// canonical bytes — VERBATIM port of docs/fixtures/.../gen_vectors.go.
 // Change here ⇒ change there ⇒ regenerate vectors.json. Do not "improve" it.
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -77,8 +81,8 @@ type Asset struct {
 	path string `json:"-"`
 }
 
-// canonicalBytes builds the §3.1 signing input: the fixed field order, joined by
-// LF (0x0A), NO trailing newline. Reference impl is gen_vectors.go; ported verbatim.
+// canonicalBytes builds the signing input: the fixed field order, joined by LF
+// (0x0A), NO trailing newline. Reference impl is gen_vectors.go; ported verbatim.
 func canonicalBytes(a Asset) []byte {
 	lines := []string{
 		"schat-release/1",
@@ -218,72 +222,6 @@ func sha256File(path string) (string, int64, error) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// upload one asset (multipart) to the release upload endpoint.
-// ─────────────────────────────────────────────────────────────────────────────
-
-func uploadAsset(client *http.Client, endpoint, token, notes string, a Asset) error {
-	f, err := os.Open(a.path)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-
-	pr, pw := io.Pipe()
-	mw := multipart.NewWriter(pw)
-	go func() {
-		var werr error
-		defer func() { _ = pw.CloseWithError(werr) }()
-		fields := [][2]string{
-			// task-required set:
-			{"line", a.Line}, {"os", a.OS}, {"arch", a.Arch},
-			{"version", a.Version}, {"format", a.Format},
-			{"sha256", a.SHA256}, {"sig", a.Sig}, {"sigKey", a.SigKey},
-			{"channel", a.Channel},
-			// needed so the server can reconstruct §3.1 canonical bytes and re-verify:
-			{"publishedAt", strconv.FormatInt(a.PublishedAt, 10)},
-			{"mandatory", strconv.Itoa(a.Mandatory)},
-			{"minVersion", a.MinVersion},
-			// UNSIGNED display mirror (NOT in §3.1 canonical bytes) — the per-line changelog the
-			// server stores + echoes back as the manifest's notes/body. Omitting it left the
-			// self-hosted manifest's notes empty ⇒ clients showed a blank 更新说明 (the GitHub
-			// fallback mirror was unaffected — it's built separately via buildCombined).
-			{"notes", notes},
-		}
-		for _, kv := range fields {
-			if werr = mw.WriteField(kv[0], kv[1]); werr != nil {
-				return
-			}
-		}
-		var part io.Writer
-		if part, werr = mw.CreateFormFile("file", a.Name); werr != nil {
-			return
-		}
-		if _, werr = io.Copy(part, f); werr != nil {
-			return
-		}
-		werr = mw.Close()
-	}()
-
-	req, err := http.NewRequest(http.MethodPost, endpoint, pr)
-	if err != nil {
-		return err
-	}
-	req.Header.Set("Content-Type", mw.FormDataContentType())
-	req.Header.Set("Authorization", "Bearer "+token)
-
-	resp, err := client.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, 8192))
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
-	}
-	return nil
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
 // version comparison (x.y.z, numeric) for picking the newest per (line,os,arch).
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -305,10 +243,13 @@ func verLess(a, b string) bool {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// combined manifest — an array of §1-shaped manifests (one per (line,os,arch)),
-// each carrying only its newest version's assets. This is the GitHub-release
-// fallback mirror (decision #11): every asset keeps its signed sha256/sig/url so
-// a client verifies regardless of which host served the bytes.
+// manifest shapes.
+//
+//	lineManifest    — one (line,os,arch[,channel]) group at one version.
+//	combinedManifest— schema 1, single-channel: attached to THIS release; the
+//	                  retired-but-still-read fallback for old clients.
+//	versionIndex    — schema 2, ALL channels: the fixed `version` tag's version.json,
+//	                  the only thing new clients read.
 // ─────────────────────────────────────────────────────────────────────────────
 
 type lineManifest struct {
@@ -317,7 +258,8 @@ type lineManifest struct {
 	OS          string  `json:"os"`
 	Arch        string  `json:"arch"`
 	Version     string  `json:"version"`
-	TagName     string  `json:"tag_name"`
+	TagName     string  `json:"tag_name"` // = Version (alias; old parsers fall back to parseVer(tag_name))
+	BuildTag    string  `json:"buildTag"` // the GitHub release tag the bytes live under (diagnostics)
 	Channel     string  `json:"channel"`
 	Official    bool    `json:"official"`
 	Mandatory   bool    `json:"mandatory"`
@@ -335,22 +277,207 @@ type combinedManifest struct {
 	Manifests   []lineManifest `json:"manifests"`
 }
 
+type versionIndex struct {
+	Schema      int            `json:"schema"`
+	GeneratedAt int64          `json:"generatedAt"`
+	Releases    []lineManifest `json:"releases"`
+}
+
+const (
+	indexSchema    = 2
+	indexTag       = "version"      // the FIXED tag the index lives under — never changes
+	indexAssetName = "version.json" // the FIXED asset name
+)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// fetch the existing index off the fixed tag.
+//
+// Authenticated API first (authoritative + no CDN cache), public download URL as
+// the fallback. A 404 (first ever run / asset missing) ⇒ empty index. ANY OTHER
+// failure ⇒ fatal, deliberately: starting from an empty index would drop every
+// (line,os,arch,channel) that this build didn't produce — i.e. a network hiccup
+// would silently stop updates for whichever legs weren't built this run. Failing
+// the (continue-on-error) step instead leaves the previous index in place, which
+// is the safe direction.
+// ─────────────────────────────────────────────────────────────────────────────
+
+func fetchExistingIndex(client *http.Client, repo, token string) versionIndex {
+	empty := versionIndex{Schema: indexSchema, Releases: nil}
+
+	if token != "" {
+		body, status, err := httpGet(client, fmt.Sprintf("https://api.github.com/repos/%s/releases/tags/%s", repo, indexTag),
+			map[string]string{"Accept": "application/vnd.github+json", "Authorization": "Bearer " + token})
+		switch {
+		case err != nil:
+			fatal("fetch index release (api): %v — refusing to publish an index built from nothing", err)
+		case status == http.StatusNotFound:
+			fmt.Printf("[release-signer] no `%s` release yet — starting a fresh index\n", indexTag)
+			return empty
+		case status != http.StatusOK:
+			fatal("fetch index release (api): HTTP %d — refusing to publish an index built from nothing", status)
+		}
+		var rel struct {
+			Assets []struct {
+				Name string `json:"name"`
+				URL  string `json:"url"` // API asset URL (octet-stream), not CDN
+			} `json:"assets"`
+		}
+		if err := json.Unmarshal(body, &rel); err != nil {
+			fatal("parse index release json: %v", err)
+		}
+		for _, a := range rel.Assets {
+			if a.Name != indexAssetName {
+				continue
+			}
+			raw, st, err := httpGet(client, a.URL,
+				map[string]string{"Accept": "application/octet-stream", "Authorization": "Bearer " + token})
+			if err != nil || st != http.StatusOK {
+				fatal("download %s: err=%v status=%d — refusing to publish an index built from nothing", indexAssetName, err, st)
+			}
+			return parseIndex(raw)
+		}
+		fmt.Printf("[release-signer] `%s` release has no %s asset — starting a fresh index\n", indexTag, indexAssetName)
+		return empty
+	}
+
+	// tokenless fallback (local runs): public CDN URL.
+	raw, status, err := httpGet(client, fmt.Sprintf("https://github.com/%s/releases/download/%s/%s", repo, indexTag, indexAssetName), nil)
+	switch {
+	case err != nil:
+		fatal("fetch %s: %v — refusing to publish an index built from nothing", indexAssetName, err)
+	case status == http.StatusNotFound:
+		fmt.Printf("[release-signer] %s not published yet — starting a fresh index\n", indexAssetName)
+		return empty
+	case status != http.StatusOK:
+		fatal("fetch %s: HTTP %d — refusing to publish an index built from nothing", indexAssetName, status)
+	}
+	return parseIndex(raw)
+}
+
+func parseIndex(raw []byte) versionIndex {
+	var idx versionIndex
+	if err := json.Unmarshal(raw, &idx); err != nil {
+		fatal("parse %s: %v — refusing to overwrite an index we cannot read", indexAssetName, err)
+	}
+	fmt.Printf("[release-signer] existing index: schema=%d entries=%d\n", idx.Schema, len(idx.Releases))
+	return idx
+}
+
+func httpGet(client *http.Client, url string, headers map[string]string) ([]byte, int, error) {
+	req, err := http.NewRequest(http.MethodGet, url, nil)
+	if err != nil {
+		return nil, 0, err
+	}
+	req.Header.Set("User-Agent", "schat-release-signer")
+	for k, v := range headers {
+		req.Header.Set(k, v)
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
+	if err != nil {
+		return nil, resp.StatusCode, err
+	}
+	return body, resp.StatusCode, nil
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// merge — entry key is (line, os, arch, channel).
+//
+// Rules (docs/update_index_refactor_plan.md §2.1 / §4.1):
+//   - a four-tuple this build did NOT produce is kept verbatim (a Build All that
+//     misses a leg must never erase that platform's update info);
+//   - newer or EQUAL version ⇒ replace (equal covers channel promotion / rebuilds);
+//   - OLDER version ⇒ skip + warn, unless force. The index is unsigned, so CI is
+//     its only correctness gate — a stray run off an old branch must not walk
+//     stable backwards.
+// ─────────────────────────────────────────────────────────────────────────────
+
+type entryKey struct{ line, os, arch, channel string }
+
+func mergeIndex(existing []lineManifest, fresh []lineManifest, force bool) []lineManifest {
+	byKey := map[entryKey]lineManifest{}
+	var order []entryKey
+	for _, e := range existing {
+		k := entryKey{e.Line, e.OS, e.Arch, e.Channel}
+		if _, seen := byKey[k]; !seen {
+			order = append(order, k)
+		}
+		byKey[k] = e
+	}
+	for _, e := range fresh {
+		k := entryKey{e.Line, e.OS, e.Arch, e.Channel}
+		if old, ok := byKey[k]; ok {
+			if verLess(e.Version, old.Version) && !force {
+				fmt.Printf("[release-signer] ⚠️  SKIP %s/%s/%s [%s]: incoming v%s is OLDER than indexed v%s (set RELEASE_INDEX_FORCE=1 to override)\n",
+					e.Line, e.OS, e.Arch, e.Channel, e.Version, old.Version)
+				continue
+			}
+		} else {
+			order = append(order, k)
+		}
+		byKey[k] = e
+	}
+	out := make([]lineManifest, 0, len(order))
+	for _, k := range order {
+		out = append(out, byKey[k])
+	}
+	sortManifests(out)
+	return out
+}
+
+func sortManifests(m []lineManifest) {
+	sort.Slice(m, func(i, j int) bool {
+		if m[i].Line != m[j].Line {
+			return m[i].Line < m[j].Line
+		}
+		if m[i].OS != m[j].OS {
+			return m[i].OS < m[j].OS
+		}
+		if m[i].Arch != m[j].Arch {
+			return m[i].Arch < m[j].Arch
+		}
+		return m[i].Channel < m[j].Channel
+	})
+}
+
+// stableOnly is the schema-1 mirror attached NEXT TO the index on the fixed tag.
+// It exists purely so an old client that lands on the `version` release (release
+// list ordering is not something we control) still finds a valid signed manifest —
+// and finds the STABLE one, never a prerelease.
+func stableOnly(entries []lineManifest, generatedAt int64) combinedManifest {
+	var out []lineManifest
+	for _, e := range entries {
+		if e.Channel == "stable" {
+			out = append(out, e)
+		}
+	}
+	return combinedManifest{Schema: 1, Channel: "stable", GeneratedAt: generatedAt, Manifests: out}
+}
+
 func main() {
 	var (
-		dir      = flag.String("dir", "dist", "flattened release-asset directory to walk")
-		version  = flag.String("version", "", "fallback version for a filename lacking an x.y.z token (also the manifest label)")
-		manifest = flag.String("manifest", "schat-update-manifest.json", "output path for the combined signed manifest JSON")
+		dir           = flag.String("dir", "dist", "flattened release-asset directory to walk")
+		version       = flag.String("version", "", "fallback version for a filename lacking an x.y.z token (also the manifest label)")
+		manifest      = flag.String("manifest", "schat-update-manifest.json", "output path for THIS release's combined signed manifest")
+		indexOut      = flag.String("index", "version.json", "output path for the merged version index (fixed `version` tag)")
+		indexMirror   = flag.String("index-manifest", "", "output path for the stable-only schema-1 mirror that ships next to the index (empty = skip)")
+		skipIndexFlag = flag.Bool("no-index", false, "skip fetching/writing the version index (local dry runs)")
 	)
 	flag.Parse()
 
 	channel := envOr("RELEASE_CHANNEL", "stable")
 	sigKey := envOr("RELEASE_SIG_KEY", "official-current")
 	notes := os.Getenv("RELEASE_NOTES")
-	uploadURL := envOr("UPDATE_UPLOAD_URL", "https://jiami.chat/desktop/releases/upload")
-	// TrimSpace: a GitHub Actions secret pasted with a trailing newline would otherwise be sent
-	// as `Bearer <token>\n`. The server trims the received value so this is usually harmless, but
-	// normalize here too so both ends agree regardless of how each secret was entered.
-	token := strings.TrimSpace(os.Getenv("RELEASE_UPLOAD_TOKEN"))
+	repo := envOr("RELEASE_REPO", "integemjack/schat.build")
+	// The GitHub release tag THIS build's assets live under — it is what every
+	// browser_download_url is built from. Empty would silently produce an index
+	// whose download links 404, so refuse to run.
+	buildTag := strings.TrimSpace(os.Getenv("RELEASE_TAG"))
+	force := isTruthy(os.Getenv("RELEASE_INDEX_FORCE"))
 
 	publishedAt := time.Now().UnixMilli()
 	if s := strings.TrimSpace(os.Getenv("RELEASE_PUBLISHED_AT")); s != "" {
@@ -363,12 +490,15 @@ func main() {
 	if err != nil {
 		fatal("cannot load signing key: %v", err)
 	}
+	if buildTag == "" {
+		fatal("RELEASE_TAG is empty — every asset's browser_download_url is derived from it; refusing to emit dead download links")
+	}
 	pub := priv.Public().(ed25519.PublicKey)
 	fmt.Printf("[release-signer] signing pubkey (b64url): %s\n", b64url(pub))
-	fmt.Printf("[release-signer] publishedAt=%d channel=%s sigKey=%s uploadURL=%s\n",
-		publishedAt, channel, sigKey, uploadURL)
+	fmt.Printf("[release-signer] publishedAt=%d channel=%s sigKey=%s repo=%s buildTag=%s\n",
+		publishedAt, channel, sigKey, repo, buildTag)
 
-	// 1. discover + classify assets.
+	// 1. discover + classify + sign assets.
 	var assets []Asset
 	err = filepath.WalkDir(*dir, func(p string, d os.DirEntry, err error) error {
 		if err != nil {
@@ -394,12 +524,15 @@ func main() {
 		if err != nil {
 			return fmt.Errorf("sha256 %s: %w", name, err)
 		}
+		// SIGNED, host-agnostic path. The self-hosted source it was minted for is
+		// retired, but it stays in the canonical bytes verbatim — dropping it would
+		// mean a new signing format across four implementations for zero gain.
 		url := fmt.Sprintf("/media/releases/%s/%s/%s/%s/%s", line, osTok, arch, ver, name)
 		a := Asset{
 			Line: line, OS: osTok, Arch: arch, Version: ver, Channel: channel,
 			Format: format, Size: size, SHA256: sum, URL: url,
 			Mandatory: 0, MinVersion: "", PublishedAt: publishedAt,
-			Name: name, BrowserURL: "https://jiami.chat" + url, SigKey: sigKey,
+			Name: name, BrowserURL: assetDownloadURL(repo, buildTag, name), SigKey: sigKey,
 			path: p,
 		}
 		a.Sig = b64url(ed25519.Sign(priv, canonicalBytes(a)))
@@ -413,76 +546,47 @@ func main() {
 		fmt.Printf("[release-signer] no signable desktop/android assets found under %s — nothing to do\n", *dir)
 	}
 
-	// 2. upload each asset (best-effort; one failure never aborts the run).
-	uploaded, failed, unauthorized, tooLarge := 0, 0, 0, 0
-	if token == "" {
-		fmt.Printf("[release-signer] RELEASE_UPLOAD_TOKEN empty — skipping HTTP upload, writing manifest only\n")
-	} else {
-		// UPDATE_UPLOAD_INSECURE_TLS=1 skips server-cert verification on the upload leg. This is
-		// for a direct-to-origin bypass host (e.g. release.jiami.chat, a DNS-only record that
-		// sidesteps Cloudflare's 100 MiB request-body cap) whose chatserver serves a SELF-SIGNED
-		// identity cert — Go would otherwise reject it. Safe here because upload trust does NOT
-		// rest on this TLS: the endpoint is Bearer-token gated AND every asset is Ed25519-signed
-		// over §3.1 canonical bytes + sha256-bound, and the server re-verifies that sig against a
-		// baked official key before storing. TLS on this leg is only defense-in-depth. Default OFF
-		// (secure); flip it OFF once the bypass host has a publicly-trusted cert.
-		tr := http.DefaultTransport.(*http.Transport).Clone()
-		if v := strings.ToLower(envOr("UPDATE_UPLOAD_INSECURE_TLS", "")); v == "1" || v == "true" {
-			tr.TLSClientConfig = &tls.Config{InsecureSkipVerify: true} // #nosec G402 — see comment above
-			fmt.Printf("[release-signer] ⚠️  UPDATE_UPLOAD_INSECURE_TLS set — TLS cert verification DISABLED for the upload leg (direct-to-origin bypass host; trust is on the token + Ed25519 sig, not this TLS)\n")
-		}
-		client := &http.Client{Timeout: 20 * time.Minute, Transport: tr}
-		for _, a := range assets {
-			if err := uploadAsset(client, uploadURL, token, notes, a); err != nil {
-				failed++
-				msg := err.Error()
-				var hint string
-				switch {
-				case strings.Contains(msg, "HTTP 401"), strings.Contains(msg, "HTTP 403"):
-					unauthorized++
-					// The server rejected the Bearer token. This is NOT a signing problem —
-					// align RELEASE_UPLOAD_TOKEN (this run) with the server's
-					// CHATSERVER_RELEASE_UPLOAD_TOKEN (byte-exact), then redeploy the server.
-					hint = " [hint: token mismatch — CI RELEASE_UPLOAD_TOKEN != server CHATSERVER_RELEASE_UPLOAD_TOKEN (or server token unset); GitHub-manifest fallback still covers this asset]"
-				case strings.Contains(msg, "HTTP 413"):
-					tooLarge++
-					// The body was rejected before reaching the server (an <html> error page,
-					// not the server's JSON too_large) — a CDN/reverse-proxy request-body cap
-					// (Cloudflare Free/Pro = 100 MiB). Assets over the cap can't be POSTed through
-					// it; they stay on the signed GitHub-release mirror, which is still verified.
-					hint = fmt.Sprintf(" [hint: %.1f MiB exceeds the CDN/proxy request-body cap (Cloudflare = 100 MiB); this asset falls back to the signed GitHub mirror]", float64(a.Size)/(1<<20))
-				}
-				fmt.Printf("[release-signer] UPLOAD FAIL %s → %s/%s/%s/%s: %v%s\n", a.Name, a.Line, a.OS, a.Arch, a.Format, err, hint)
-				continue
-			}
-			uploaded++
-			fmt.Printf("[release-signer] uploaded %s → %s/%s/%s/%s v%s\n", a.Name, a.Line, a.OS, a.Arch, a.Format, a.Version)
-		}
-		if unauthorized > 0 {
-			fmt.Printf("[release-signer] ⚠️  %d upload(s) rejected 401/403 — the server's CHATSERVER_RELEASE_UPLOAD_TOKEN does not match this run's RELEASE_UPLOAD_TOKEN (or is unset). Fix the token on the server + redeploy; the signed GitHub manifest below still covers these assets.\n", unauthorized)
-		}
-		if tooLarge > 0 {
-			fmt.Printf("[release-signer] ⚠️  %d upload(s) rejected 413 (too large for the CDN/proxy). Route the upload around the 100 MiB Cloudflare cap or accept the GitHub mirror for oversized assets.\n", tooLarge)
-		}
-	}
-
-	// 3. write the combined signed manifest for the GitHub-release mirror.
-	cm := buildCombined(assets, channel, notes, publishedAt)
-	buf, err := json.MarshalIndent(cm, "", "  ")
-	if err != nil {
-		fatal("marshal manifest: %v", err)
-	}
-	buf = append(buf, '\n')
-	if err := os.WriteFile(*manifest, buf, 0o644); err != nil {
-		fatal("write manifest %s: %v", *manifest, err)
-	}
+	// 2. THIS release's combined manifest (schema 1, this channel) — attached to
+	//    this GitHub release; still the fallback source old clients read.
+	fresh := buildGroups(assets, channel, notes, publishedAt, buildTag)
+	cm := combinedManifest{Schema: 1, Channel: channel, GeneratedAt: publishedAt, Manifests: fresh}
+	writeJSON(*manifest, cm)
 	fmt.Printf("[release-signer] wrote manifest %s (%d asset(s), %d group(s))\n", *manifest, len(assets), len(cm.Manifests))
-	fmt.Printf("[release-signer] done: %d uploaded, %d failed, %d signed\n", uploaded, failed, len(assets))
+
+	// 3. the version index on the fixed tag: fetch → merge → write.
+	if *skipIndexFlag {
+		fmt.Printf("[release-signer] -no-index set — skipping the version index\n")
+		return
+	}
+	client := &http.Client{Timeout: 60 * time.Second}
+	existing := fetchExistingIndex(client, repo, strings.TrimSpace(os.Getenv("GITHUB_TOKEN")))
+	merged := mergeIndex(existing.Releases, fresh, force)
+	writeJSON(*indexOut, versionIndex{Schema: indexSchema, GeneratedAt: publishedAt, Releases: merged})
+	fmt.Printf("[release-signer] wrote index %s (%d entries)\n", *indexOut, len(merged))
+	for _, e := range merged {
+		fmt.Printf("[release-signer]   %-7s %-7s %-9s [%-6s] v%-12s %d asset(s) @ %s\n",
+			e.Line, e.OS, e.Arch, e.Channel, e.Version, len(e.Assets), e.BuildTag)
+	}
+	if *indexMirror != "" {
+		if err := os.MkdirAll(filepath.Dir(*indexMirror), 0o755); err != nil {
+			fatal("mkdir for %s: %v", *indexMirror, err)
+		}
+		mirror := stableOnly(merged, publishedAt)
+		writeJSON(*indexMirror, mirror)
+		fmt.Printf("[release-signer] wrote index mirror %s (%d stable group(s))\n", *indexMirror, len(mirror.Manifests))
+	}
 }
 
-// buildCombined groups signed assets by (line,os,arch), keeps only each group's
-// newest version, and emits a §1-shaped manifest per group.
-func buildCombined(assets []Asset, channel, notes string, publishedAt int64) combinedManifest {
+// assetDownloadURL is the public GitHub release asset direct link — a CDN path,
+// NOT api.github.com, so it is not subject to the 60/hour unauthenticated limit.
+func assetDownloadURL(repo, tag, name string) string {
+	return fmt.Sprintf("https://github.com/%s/releases/download/%s/%s", repo, tag, name)
+}
+
+// buildGroups groups signed assets by (line,os,arch), keeps only each group's
+// newest version, and emits one manifest entry per group. Every asset keeps its
+// signed sha256/sig/url so a client verifies regardless of which host served the bytes.
+func buildGroups(assets []Asset, channel, notes string, publishedAt int64, buildTag string) []lineManifest {
 	type key struct{ line, os, arch string }
 	groups := map[key][]Asset{}
 	for _, a := range assets {
@@ -506,22 +610,33 @@ func buildCombined(assets []Asset, channel, notes string, publishedAt int64) com
 		sort.Slice(at, func(i, j int) bool { return at[i].Format < at[j].Format })
 		out = append(out, lineManifest{
 			Schema: 1, Line: k.line, OS: k.os, Arch: k.arch,
-			Version: newest, TagName: newest, Channel: channel,
+			Version: newest, TagName: newest, BuildTag: buildTag, Channel: channel,
 			Official: true, Mandatory: false, MinVersion: nil,
 			PublishedAt: publishedAt, Notes: notes, Body: notes,
 			Assets: at,
 		})
 	}
-	sort.Slice(out, func(i, j int) bool {
-		if out[i].Line != out[j].Line {
-			return out[i].Line < out[j].Line
-		}
-		if out[i].OS != out[j].OS {
-			return out[i].OS < out[j].OS
-		}
-		return out[i].Arch < out[j].Arch
-	})
-	return combinedManifest{Schema: 1, Channel: channel, GeneratedAt: publishedAt, Manifests: out}
+	sortManifests(out)
+	return out
+}
+
+func writeJSON(path string, v any) {
+	buf, err := json.MarshalIndent(v, "", "  ")
+	if err != nil {
+		fatal("marshal %s: %v", path, err)
+	}
+	buf = append(buf, '\n')
+	if err := os.WriteFile(path, buf, 0o644); err != nil {
+		fatal("write %s: %v", path, err)
+	}
+}
+
+func isTruthy(s string) bool {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "1", "true", "yes", "on":
+		return true
+	}
+	return false
 }
 
 func envOr(k, def string) string {

@@ -240,11 +240,14 @@ jobs:
           prerelease: ${{ env.SRC_REF != 'main' }}
           make_latest: ${{ env.SRC_REF == 'main' }}
 
-      # ── Self-hosted update distribution (Step 2) — sign each desktop/android asset
-      # with the official Ed25519 key, POST it to jiami.chat's release-upload endpoint,
-      # and attach a combined signed manifest to THIS release as a GitHub fallback
-      # mirror (docs/update_distribution_plan.md §6 item 12 + decision #11).
-      # ALWAYS continue-on-error: a signing/upload hiccup must never fail the release.
+      # ── Update distribution — sign each desktop/android asset with the official
+      # Ed25519 key, attach this release's combined signed manifest (老客户端的回退源),
+      # and merge this build into the version index published on the FIXED `version`
+      # tag, which is the only thing new clients read
+      # (docs/update_index_refactor_plan.md §4; signing口径 = update_distribution_plan.md §3).
+      # The self-hosted jiami.chat upload leg is RETIRED — no token, no 100 MiB CDN cap.
+      # continue-on-error so a hiccup never blocks the已发布 release; the gate step
+      # right after turns the JOB red so report-failures opens an issue.
       # The release job checked out the SOURCE repo into the workspace, so the CI repo
       # (schat.build, where the signer lives) is checked out into a subpath.
       - name: Checkout schat.build (release signer)
@@ -260,40 +263,73 @@ jobs:
         with:
           go-version: "1.24"
           cache: false # signer is stdlib-only (no go.sum); nothing to cache
-      - name: Sign + publish desktop/android release assets to jiami.chat + write manifest
+      - name: Sign release assets + merge the version index
+        id: sign
         if: always()
         continue-on-error: true
         env:
           RELEASE_SIGN_ED25519_KEY: ${{ secrets.RELEASE_SIGN_ED25519_KEY }}
-          # 非 main 分支**也上传自建源**,以 channel=beta 落库(chatserver 9.14.x 起
-          # /desktop/releases/latest 支持 ?channel=,正式通道严格只看 stable、beta 取
-          # {beta,stable} 里较新的那个;retention 也按通道各留各的)。
-          # 历史:在服务端支持通道之前,这里把 token 置空来「不上传」—— 因为那时
-          # GetLatestRelease 不分通道,传上去等于把所有正式用户升级到测试包。那个洞已修,
-          # 这里恒传 secret。**若要回退,连同服务端一起回退**,只改这里会重现该事故。
-          RELEASE_UPLOAD_TOKEN: ${{ secrets.RELEASE_UPLOAD_TOKEN }}
+          # 非 main 分支 = 测试版 → 在索引里落一条**独立**的 channel=beta 条目(与 stable 那条
+          # 并列,条目主键是 (line,os,arch,channel))。择道搬到了客户端:开关关 = 只看 stable,
+          # 开 = {beta,stable} 里 publishedAt 较新的那个(超集,不是纯隔离 —— 否则正式版发布后
+          # 没跟新测试版时,beta 用户会比正式用户还旧)。
           RELEASE_CHANNEL: ${{ env.SRC_REF == 'main' && 'stable' || 'beta' }}
-          # The per-line changelog (same body attached to the GitHub release above). The signer
-          # forwards it as the upload's `notes` field so the self-hosted manifest's notes/body is
-          # populated — without this the desktop 更新说明 renders blank on the self-hosted path.
+          # 本次构建的 release tag —— 每个资产的 browser_download_url 都由它拼出来。
+          # 它为空时 signer 直接 fatal:空值会产出一份「下载链接全 404 但 CI 全绿」的索引。
+          RELEASE_TAG: ${{ env.SRC_REF }}-b${{ github.run_number }}
+          RELEASE_REPO: ${{ github.repository }}
+          # 读固定 tag 上的现有索引走 API(权威、绕开 CDN 缓存)。读不到且不是 404 一律 fatal ——
+          # 从空索引重建会抹掉本次没构建的腿(qt-mac 那条腿历史上就时有时无),那些平台会**静默停更**。
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # The per-line changelog (same body attached to the GitHub release above) — lands in the
+          # manifest/index `notes`+`body`. Without it the 更新说明 renders blank on all three ends.
           RELEASE_NOTES: ${{ steps.cl.outputs.body }}
-          # release.jiami.chat is a DNS-only (grey-cloud) record → direct to the origin (nginx),
-          # bypassing Cloudflare's 100 MiB request-body cap so the >100 MiB assets (android APK,
-          # qt-mac universal) can upload too. Verified from a clean host: it resolves to the origin
-          # (server: nginx, no cloudflare edge) AND presents a publicly-trusted cert, so TLS
-          # verification stays ON. (The signer supports UPDATE_UPLOAD_INSECURE_TLS=1 as an escape
-          # hatch if a future bypass host ever serves a self-signed cert; not needed here.)
-          UPDATE_UPLOAD_URL: https://release.jiami.chat/desktop/releases/upload
         run: |
           cd _ci/tools/release-signer
-          go run . -dir "$GITHUB_WORKSPACE/dist" -manifest "$GITHUB_WORKSPACE/schat-update-manifest.json"
-      - name: Attach signed manifest to GitHub release (signed fallback mirror)
+          go run . \
+            -dir "$GITHUB_WORKSPACE/dist" \
+            -manifest "$GITHUB_WORKSPACE/schat-update-manifest.json" \
+            -index "$GITHUB_WORKSPACE/version.json" \
+            -index-manifest "$GITHUB_WORKSPACE/index/schat-update-manifest.json"
+      - name: Attach signed manifest to GitHub release (老客户端的回退源)
         if: always()
         continue-on-error: true
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ env.SRC_REF }}-b${{ github.run_number }}
           files: schat-update-manifest.json
+      # ── 固定 tag `version` —— 三端唯一的更新索引(docs/update_index_refactor_plan.md §3)。
+      # make_latest:false + prerelease:false 两个都是**载荷性**的,不是整洁性的:
+      #   占了 "Latest" ⇒ 老客户端的 releases/latest 回退拿到一个没有构建产物的 release;
+      #   标了 prerelease ⇒ 老客户端的 beta 回退(取 /releases 列表第 0 条)会撞上它。
+      # 两种都把老客户端的更新链打断。同时放一份 stable-only 的 schat-update-manifest.json:
+      # 万一有老客户端因为列表排序落到这个 release 上,它也能拿到合法签名清单,且拿到的是正式版。
+      - name: Publish version index (fixed `version` tag)
+        if: always()
+        continue-on-error: true
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: version
+          name: "版本索引 (version.json)"
+          body: |
+            三端(qt / macOS / Android)更新索引 —— 每次发布由 CI 自动覆盖,**不要手工编辑**。
+
+            - `version.json` — schema 2,数组以 `(line, os, arch, channel)` 为主键,正式版与测试版并列。
+            - `schat-update-manifest.json` — schema 1、仅正式版,给老客户端兜底。
+
+            契约见源仓库 `docs/update_index_refactor_plan.md`。
+          files: |
+            version.json
+            index/schat-update-manifest.json
+          make_latest: false
+          prerelease: false
+      # 索引没更新 = 三端全部收不到本次发布。上面几步 continue-on-error 是为了不拖垮**已经发布**
+      # 的 release,但这种失败绝不能绿着过去 —— 这里把 job 判红,report-failures 会开 issue。
+      - name: Gate — the version index must have been updated
+        if: always() && steps.sign.outcome == 'failure'
+        run: |
+          echo "::error::版本索引未更新 —— qt / macOS / Android 三端都不会看到本次发布"
+          exit 1
 
   # 任何构建腿失败 → 在本仓库(schat.build)开/追评一个 issue;恢复绿 → 自动关闭。
   # 单 job 汇总:列本次 run 的全部 job(含 desktop 复用工作流的子腿 macOS/Windows/Linux),
@@ -301,7 +337,9 @@ jobs:
   # 去重(每条腿至多一个 open issue,后续失败追评论)。issue 开在本仓库,GITHUB_TOKEN 即够,无需 PAT。
   report-failures:
     name: Report build failures
-    needs: [android, desktop, server, docker, m5core2]
+    # `release` 也在 needs 里:它的「索引未更新」闸门判红后必须被报出来。少了它,
+    # report-failures 会与 release 并行跑,看到的 conclusion 还是 null(被下面的过滤跳过)。
+    needs: [android, desktop, server, docker, m5core2, release]
     if: always()
     runs-on: ubuntu-latest
     permissions:

@@ -4,11 +4,14 @@
 //
 // Proves this CI signer's canonicalBytes() reproduces each vector's `canonical`
 // byte-for-byte, and that signing with the fixture seed reproduces each `sig` —
-// i.e. the signer agrees with the chatserver verifier and all client verifiers.
+// i.e. the signer agrees with all client verifiers.
 //
 // In a standalone schat.build checkout the fixtures don't exist (they live in the
-// source repo), so the test SKIPS gracefully; it runs for real in the combined
+// source repo), so that test SKIPS gracefully; it runs for real in the combined
 // working tree (submodule embedded next to docs/).
+//
+// The rest of the file guards the version-index behaviour
+// (docs/update_index_refactor_plan.md §2.1 / §4.1).
 package main
 
 import (
@@ -16,10 +19,8 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
-	"io"
-	"net/http"
-	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -127,60 +128,6 @@ func TestCanonicalAndSigMatchFixtures(t *testing.T) {
 	}
 }
 
-// Regression: the upload multipart MUST carry the `notes` changelog to the self-hosted
-// endpoint. It was omitted for a while, so the self-hosted manifest's notes/body came back
-// empty and clients showed a blank 更新说明 (the GitHub fallback mirror was unaffected — it's
-// built separately via buildCombined). Also asserts notes is NOT folded into the signed
-// canonical bytes (it's an unsigned display mirror, §3.1).
-func TestUploadIncludesNotes(t *testing.T) {
-	const wantNotes = "## 更新内容\n- fix(desktop-qt): 修复自建更新日志空白\n- feat(desktop-macos): x"
-	var gotNotes, gotVersion, gotFile string
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if err := r.ParseMultipartForm(8 << 20); err != nil {
-			t.Errorf("ParseMultipartForm: %v", err)
-			w.WriteHeader(http.StatusBadRequest)
-			return
-		}
-		gotNotes = r.FormValue("notes")
-		gotVersion = r.FormValue("version")
-		if f, _, err := r.FormFile("file"); err == nil {
-			b, _ := io.ReadAll(f)
-			gotFile = string(b)
-			_ = f.Close()
-		}
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte(`{"ok":true}`))
-	}))
-	defer srv.Close()
-
-	dir := t.TempDir()
-	p := filepath.Join(dir, "SChat-windows-9.12.999-x64-setup.exe")
-	if err := os.WriteFile(p, []byte("BYTES"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	a := Asset{
-		Line: "qt", OS: "windows", Arch: "x64", Version: "9.12.999", Channel: "stable",
-		Format: "nsis-exe", Size: 5, SHA256: "abc", URL: "/media/x", Name: filepath.Base(p),
-		Sig: "sig", SigKey: "official-current", PublishedAt: 1700000000000, path: p,
-	}
-	if err := uploadAsset(srv.Client(), srv.URL, "tok", wantNotes, a); err != nil {
-		t.Fatalf("uploadAsset: %v", err)
-	}
-	if gotNotes != wantNotes {
-		t.Errorf("server received notes=%q, want %q", gotNotes, wantNotes)
-	}
-	if gotVersion != a.Version {
-		t.Errorf("server received version=%q, want %q", gotVersion, a.Version)
-	}
-	if gotFile != "BYTES" {
-		t.Errorf("server received file=%q, want BYTES", gotFile)
-	}
-	// notes is an UNSIGNED display mirror — it must never leak into the signed canonical bytes.
-	if strings.Contains(string(canonicalBytes(a)), "更新内容") {
-		t.Error("notes leaked into signed canonical bytes (§3.1)")
-	}
-}
-
 // Guards the §6 filename→(line,os,arch,format) mapping, incl. the "-qt- before
 // SChat-macos-" ordering and the exclusions.
 func TestClassifyMapping(t *testing.T) {
@@ -204,6 +151,7 @@ func TestClassifyMapping(t *testing.T) {
 		"SChat-server-linux-arm64":      {ok: false},
 		"SChat-m5core2-firmware.bin":    {ok: false},
 		"schat-update-manifest.json":    {ok: false},
+		"version.json":                  {ok: false},
 		"SChat-macos-9.12.358-arm64.io": {ok: false}, // unknown ext
 	}
 	for name, w := range cases {
@@ -219,5 +167,224 @@ func TestClassifyMapping(t *testing.T) {
 			t.Errorf("%s: got %s/%s/%s/%s want %s/%s/%s/%s",
 				name, line, osTok, arch, format, w.line, w.os, w.arch, w.format)
 		}
+	}
+}
+
+// The changelog is an UNSIGNED display mirror — it must never leak into the
+// signed canonical bytes. (Regression from the era when `notes` was added to the
+// upload multipart: the field is carried alongside the signature, never inside it.)
+func TestNotesNeverEnterCanonicalBytes(t *testing.T) {
+	a := Asset{
+		Line: "qt", OS: "windows", Arch: "x64", Version: "9.12.999", Channel: "stable",
+		Format: "nsis-exe", Size: 5, SHA256: "abc", URL: "/media/x",
+		Name: "SChat-windows-9.12.999-x64-setup.exe", PublishedAt: 1700000000000,
+	}
+	if strings.Contains(string(canonicalBytes(a)), "更新内容") {
+		t.Error("notes leaked into signed canonical bytes")
+	}
+	// `name` and `browser_download_url` are unsigned too — see the path-traversal
+	// fix in update_distribution_plan.md §3.1 (on-disk name derives from `format`).
+	a.BrowserURL = assetDownloadURL("integemjack/schat.build", "main-b190", a.Name)
+	c := string(canonicalBytes(a))
+	if strings.Contains(c, a.Name) || strings.Contains(c, "github.com") {
+		t.Errorf("unsigned name/browser_download_url leaked into canonical bytes:\n%s", c)
+	}
+}
+
+func TestAssetDownloadURL(t *testing.T) {
+	const want = "https://github.com/integemjack/schat.build/releases/download/main-b190/SChat-windows-9.15.372-x64-setup.exe"
+	got := assetDownloadURL("integemjack/schat.build", "main-b190", "SChat-windows-9.15.372-x64-setup.exe")
+	if got != want {
+		t.Errorf("got %s\nwant %s", got, want)
+	}
+}
+
+func entry(line, osTok, arch, channel, version string) lineManifest {
+	return lineManifest{
+		Schema: 1, Line: line, OS: osTok, Arch: arch, Channel: channel,
+		Version: version, TagName: version, BuildTag: "t-" + version,
+	}
+}
+
+func find(t *testing.T, list []lineManifest, k entryKey) lineManifest {
+	t.Helper()
+	for _, e := range list {
+		if (entryKey{e.Line, e.OS, e.Arch, e.Channel}) == k {
+			return e
+		}
+	}
+	t.Fatalf("entry %v not found in %d entries", k, len(list))
+	return lineManifest{}
+}
+
+// The load-bearing merge property: a (line,os,arch,channel) that THIS build did
+// not produce must survive verbatim. A Build All that misses a leg (the qt-mac
+// universal leg has historically come and gone) would otherwise erase that
+// platform's update info from the index and stop its users updating.
+func TestMergeKeepsAbsentLegs(t *testing.T) {
+	existing := []lineManifest{
+		entry("qt", "mac", "universal", "stable", "9.15.300"),
+		entry("qt", "windows", "x64", "stable", "9.15.300"),
+		entry("android", "android", "universal", "beta", "9.15.29"),
+	}
+	fresh := []lineManifest{entry("qt", "windows", "x64", "stable", "9.15.372")}
+
+	got := mergeIndex(existing, fresh, false)
+	if len(got) != 3 {
+		t.Fatalf("got %d entries, want 3 (absent legs must be preserved): %+v", len(got), got)
+	}
+	if v := find(t, got, entryKey{"qt", "mac", "universal", "stable"}).Version; v != "9.15.300" {
+		t.Errorf("absent qt/mac leg: version %s, want untouched 9.15.300", v)
+	}
+	if v := find(t, got, entryKey{"android", "android", "universal", "beta"}).Version; v != "9.15.29" {
+		t.Errorf("absent android beta leg: version %s, want untouched 9.15.29", v)
+	}
+	if v := find(t, got, entryKey{"qt", "windows", "x64", "stable"}).Version; v != "9.15.372" {
+		t.Errorf("built leg: version %s, want 9.15.372", v)
+	}
+}
+
+// stable and beta are SEPARATE entries — a beta build must never overwrite the
+// stable row (that was the 2026-07/08 self-hosted-source incident in a new shape).
+func TestMergeChannelsAreIndependent(t *testing.T) {
+	existing := []lineManifest{entry("qt", "windows", "x64", "stable", "9.15.372")}
+	fresh := []lineManifest{entry("qt", "windows", "x64", "beta", "9.16.5")}
+
+	got := mergeIndex(existing, fresh, false)
+	if len(got) != 2 {
+		t.Fatalf("got %d entries, want 2 (stable + beta side by side): %+v", len(got), got)
+	}
+	if v := find(t, got, entryKey{"qt", "windows", "x64", "stable"}).Version; v != "9.15.372" {
+		t.Errorf("stable row was clobbered by the beta build: %s", v)
+	}
+	if v := find(t, got, entryKey{"qt", "windows", "x64", "beta"}).Version; v != "9.16.5" {
+		t.Errorf("beta row: %s, want 9.16.5", v)
+	}
+}
+
+// The index is unsigned, so CI is its only correctness gate: a stray Build All off
+// an old branch must not walk a channel backwards. Equal versions DO replace
+// (channel promotion / rebuild is a normal release-flow event).
+func TestMergeVersionMonotonicity(t *testing.T) {
+	existing := []lineManifest{entry("macos", "mac", "arm64", "stable", "9.15.409")}
+
+	older := mergeIndex(existing, []lineManifest{entry("macos", "mac", "arm64", "stable", "9.15.100")}, false)
+	if v := find(t, older, entryKey{"macos", "mac", "arm64", "stable"}).Version; v != "9.15.409" {
+		t.Errorf("older build overwrote the index: %s, want 9.15.409", v)
+	}
+
+	forced := mergeIndex(existing, []lineManifest{entry("macos", "mac", "arm64", "stable", "9.15.100")}, true)
+	if v := find(t, forced, entryKey{"macos", "mac", "arm64", "stable"}).Version; v != "9.15.100" {
+		t.Errorf("RELEASE_INDEX_FORCE did not override: %s, want 9.15.100", v)
+	}
+
+	equal := mergeIndex(existing, []lineManifest{
+		{Schema: 1, Line: "macos", OS: "mac", Arch: "arm64", Channel: "stable",
+			Version: "9.15.409", TagName: "9.15.409", BuildTag: "main-b191"},
+	}, false)
+	if e := find(t, equal, entryKey{"macos", "mac", "arm64", "stable"}); e.BuildTag != "main-b191" {
+		t.Errorf("equal version did not replace (channel promotion / rebuild): buildTag=%s", e.BuildTag)
+	}
+
+	newer := mergeIndex(existing, []lineManifest{entry("macos", "mac", "arm64", "stable", "9.16.1")}, false)
+	if v := find(t, newer, entryKey{"macos", "mac", "arm64", "stable"}).Version; v != "9.16.1" {
+		t.Errorf("newer build did not replace: %s, want 9.16.1", v)
+	}
+}
+
+// Output ordering must be deterministic so a no-op run produces byte-identical JSON.
+func TestMergeOutputIsSorted(t *testing.T) {
+	got := mergeIndex(nil, []lineManifest{
+		entry("qt", "windows", "x64", "stable", "1.0.0"),
+		entry("android", "android", "universal", "stable", "1.0.0"),
+		entry("qt", "linux", "x64", "stable", "1.0.0"),
+		entry("qt", "windows", "x64", "beta", "1.0.1"),
+		entry("macos", "mac", "arm64", "stable", "1.0.0"),
+	}, false)
+	var order []string
+	for _, e := range got {
+		order = append(order, e.Line+"/"+e.OS+"/"+e.Arch+"/"+e.Channel)
+	}
+	want := []string{
+		"android/android/universal/stable",
+		"macos/mac/arm64/stable",
+		"qt/linux/x64/stable",
+		"qt/windows/x64/beta",
+		"qt/windows/x64/stable",
+	}
+	if strings.Join(order, ",") != strings.Join(want, ",") {
+		t.Errorf("order:\n got %v\nwant %v", order, want)
+	}
+}
+
+// The mirror that ships next to the index on the fixed `version` tag must contain
+// ONLY stable — it exists so an old client that lands on that release gets a valid
+// signed manifest, and it must never hand a prerelease to a stable user.
+func TestStableOnlyMirror(t *testing.T) {
+	m := stableOnly([]lineManifest{
+		entry("qt", "windows", "x64", "stable", "9.15.372"),
+		entry("qt", "windows", "x64", "beta", "9.16.5"),
+		entry("android", "android", "universal", "beta", "9.16.1"),
+	}, 1700000000000)
+	if m.Schema != 1 || m.Channel != "stable" {
+		t.Errorf("mirror header: schema=%d channel=%s, want 1/stable", m.Schema, m.Channel)
+	}
+	if len(m.Manifests) != 1 || m.Manifests[0].Channel != "stable" {
+		t.Fatalf("mirror must contain exactly the stable entries, got %+v", m.Manifests)
+	}
+}
+
+// buildGroups stamps the build tag on every group and keeps only the newest
+// version's assets per (line,os,arch).
+func TestBuildGroupsNewestPerGroupAndBuildTag(t *testing.T) {
+	assets := []Asset{
+		{Line: "qt", OS: "linux", Arch: "x64", Version: "9.15.372", Format: "deb", Name: "a.deb"},
+		{Line: "qt", OS: "linux", Arch: "x64", Version: "9.15.372", Format: "appimage", Name: "a.AppImage"},
+		{Line: "qt", OS: "linux", Arch: "x64", Version: "9.15.300", Format: "deb", Name: "old.deb"},
+	}
+	got := buildGroups(assets, "beta", "notes", 1700000000000, "v9.15-b7")
+	if len(got) != 1 {
+		t.Fatalf("want 1 group, got %d", len(got))
+	}
+	g := got[0]
+	if g.Version != "9.15.372" || g.BuildTag != "v9.15-b7" || g.Channel != "beta" {
+		t.Errorf("group: version=%s buildTag=%s channel=%s", g.Version, g.BuildTag, g.Channel)
+	}
+	if g.TagName != g.Version {
+		t.Errorf("tag_name must stay the version alias (old parsers do parseVer(tag_name)): %s", g.TagName)
+	}
+	if len(g.Assets) != 2 {
+		t.Errorf("want the 2 newest-version assets, got %d", len(g.Assets))
+	}
+	for _, a := range g.Assets {
+		if a.Version == "9.15.300" {
+			t.Error("stale-version asset leaked into the group")
+		}
+	}
+}
+
+// RELEASE_TAG is what every browser_download_url is built from. Empty must be a
+// hard stop: an index full of dead download links looks perfectly healthy in CI
+// and 404s for every user who presses 更新.
+func TestMissingReleaseTagIsFatal(t *testing.T) {
+	if testing.Short() {
+		t.Skip("compiles the package; skipped under -short")
+	}
+	if _, err := exec.LookPath("go"); err != nil {
+		t.Skip("no go toolchain on PATH")
+	}
+	tmp := t.TempDir()
+	cmd := exec.Command("go", "run", ".",
+		"-dir", tmp, "-no-index",
+		"-manifest", filepath.Join(tmp, "m.json"))
+	cmd.Env = append(os.Environ(),
+		"RELEASE_SIGN_ED25519_KEY="+base64.RawURLEncoding.EncodeToString(make([]byte, 32)),
+		"RELEASE_TAG=")
+	out, err := cmd.CombinedOutput()
+	if err == nil {
+		t.Fatalf("empty RELEASE_TAG must fail the step; output:\n%s", out)
+	}
+	if !strings.Contains(string(out), "RELEASE_TAG") {
+		t.Errorf("error message should name RELEASE_TAG; got:\n%s", out)
 	}
 }
