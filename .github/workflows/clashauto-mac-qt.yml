@@ -51,7 +51,12 @@ jobs:
     # 只处理 Qt 版的触发提交（Swift 的触发/老式空提交不抢这个 push）。
     if: "github.event_name == 'workflow_dispatch' || contains(github.event.head_commit.message, 'product: coast-qt')"
     runs-on: macos-15
-    timeout-minutes: 90
+    # ★ 350 而不是原来的 90：Qt 现在是**静态**的，而 aqt 从不发静态二进制，所以要自己从源码编。
+    #   缓存是**按仓库隔离**的 —— clashauto 那边编好的那份，本仓库一点也用不上，
+    #   第一次触发必须自己完整编一遍（通用二进制 = 两份架构，两三个小时很正常）。
+    #   之后命中缓存就是秒级。留 90 分钟会在第一次就把它掉死，而失败点落在编译中途，
+    #   看起来像“构建挂了”而不是“超时了”。
+    timeout-minutes: 350
     steps:
       - name: Parse trigger parameters
         id: trig
@@ -110,16 +115,24 @@ jobs:
         run: |
           set -euo pipefail
           brew install ninja
-          python3 -m pip install --user aqtinstall pillow \
-            || python3 -m pip install --user --break-system-packages aqtinstall pillow
+          python3 -m pip install --user pillow \
+            || python3 -m pip install --user --break-system-packages pillow
 
-      - name: Install Qt (universal)
+      - name: Static Qt (universal)
+        id: qt
+        # ★ 复合 action 来自**被检出的 clashauto 仓库**（上面 actions/checkout 把它检出到工作区根），
+        #   所以这里和 clashauto 自己 CI 里的 macos job 用的是同一份配方文件，不会漂移。
+        # ★ Qt 自己也必须是通用二进制：下面 app 那侧 -DCMAKE_OSX_ARCHITECTURES="x86_64;arm64"
+        #   链到单架构静态库会当场失败。extra-cmake 必须与 clashauto 的 release.yml 一字不差。
+        uses: ./.github/actions/qt-static
+        with:
+          qt-version: ${{ env.QT_VERSION }}
+          target: macos-universal
+          extra-cmake: '-DCMAKE_OSX_ARCHITECTURES=x86_64;arm64 -DCMAKE_OSX_DEPLOYMENT_TARGET=13.0'
+
+      - name: Export Qt root
         shell: bash
-        run: |
-          set -euo pipefail
-          # aqt 的 mac 官方构建即 x86_64+arm64 通用二进制
-          python3 -m aqt install-qt mac desktop "$QT_VERSION" clang_64 -O "$HOME/Qt"
-          echo "QT_ROOT=$HOME/Qt/$QT_VERSION/macos" >> "$GITHUB_ENV"
+        run: echo "QT_ROOT=${{ steps.qt.outputs.qt-root }}" >> "$GITHUB_ENV"
 
       - name: Generate icon.icns
         shell: bash
@@ -166,6 +179,20 @@ jobs:
           lipo -archs "$bin"
           lipo -archs "$bin" | grep -q x86_64
           lipo -archs "$bin" | grep -q arm64
+          # ★ 断言「Qt 真的不在依赖里了」。otool -L 看的是实际会被加载的东西，比数文件可靠。
+          echo "-- Coast dylibs --"; otool -L "$bin"
+          if otool -L "$bin" | grep -qE 'Qt[A-Za-z0-9]+\.framework|libQt6'; then
+            echo "::error::静态化没生效 —— Coast 仍动态依赖 Qt"; exit 1
+          fi
+
+      - name: Static plugin self-test
+        shell: bash
+        # 静态构建下 TLS 后端 / QSQLITE / 图片格式 / QML 模块靠链接期导入，漏了不报任何编译或
+        # 链接错误，只是运行时少一块功能。这是**签名发布**这条线唯一能证明它们真被链进来的地方
+        # —— 而这条线出的才是用户装的包。
+        run: |
+          set -euo pipefail
+          QT_QPA_PLATFORM=offscreen COAST_STATICDEPS_SELFTEST=1 "$BUILD_DIR/Coast.app/Contents/MacOS/Coast"
 
       - name: Bundle latest stable core
         shell: bash
@@ -242,24 +269,28 @@ jobs:
           echo "identity=$IDENTITY" >> "$GITHUB_OUTPUT"
           echo "imported identity: $IDENTITY"
 
-      - name: Stage app bundle (macdeployqt + sign)
+      - name: Stage app bundle (sign)
         shell: bash
         env:
           SIGN_IDENTITY: ${{ steps.signcert.outputs.identity }}
         run: |
           set -euo pipefail
           APP="$BUILD_DIR/Coast.app"
-          "$QT_ROOT/bin/macdeployqt" "$APP" -verbose=1
+          # ★ 这里原本有一行 macdeployqt（拷 Qt framework 进 Contents/Frameworks、插件进
+          #   Contents/PlugIns、再 install_name_tool 改写加载路径）。静态 Qt 之后 .app 里
+          #   没有任何 Qt 产物，这一步整个不需要了。**别加回来**：它在一个没有 Qt 依赖的
+          #   可执行文件上会成功退出、什么也不做，但顺手做的 install_name_tool 改写仍会
+          #   破坏更早的签名。
 
-          # 重新嵌入特权 helper 与其 launchd plist（macdeployqt 可能动过 Contents/MacOS）。
+          # 嵌入特权 helper 与其 launchd plist。
           # helper 独立可执行由 CMake 构建在 $BUILD_DIR 根下（OUTPUT_NAME），universal。
           mkdir -p "$APP/Contents/Library/LaunchDaemons"
           cp "$BUILD_DIR/com.yuehongsun.coast.helper" "$APP/Contents/MacOS/com.yuehongsun.coast.helper"
           cp "clashauto-c++/helper/com.yuehongsun.coast.helper.plist" "$APP/Contents/Library/LaunchDaemons/"
           lipo -archs "$APP/Contents/MacOS/com.yuehongsun.coast.helper"
 
-          # 签名（公证必需硬化运行时 + 安全时间戳）。macdeployqt 之后再签：install_name_tool
-          # 改写会破坏更早的签名。
+          # 签名（公证必需硬化运行时 + 安全时间戳）。必须在**所有内容都放进 bundle 之后**再签
+          # ——任何事后往 .app 里塞文件或改写加载路径都会破坏封存。
           # 关键：helper 必须用显式 -i 指定 identifier = com.yuehongsun.coast.helper（= launchd Label）。
           # 否则 codesign 把可执行名末尾的「.helper」当扩展名剥掉，identifier 变成 com.yuehongsun.coast，
           # 与注册 Label 不一致 → SMAppService daemon 启动即被 Launch Constraint Violation SIGKILL，
