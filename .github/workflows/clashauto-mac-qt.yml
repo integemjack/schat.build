@@ -429,3 +429,30 @@ jobs:
           fi
           gh release upload "$RELEASE_TAG" "$DMG" "$DMG.sha256" --clobber -R ClashrAuto/clashauto
           echo "uploaded $DMG → ${RELEASE_TAG} (prerelease=$IS_PRERELEASE)"
+
+          # ★ 传完就回头让 clashauto 重算 version.json。
+          #
+          #   客户端查更新只读那份清单（绕开 GitHub API 的限流），而它是在 clashauto 的
+          #   manifest job 里生成的 —— 那时候 mac 的 DMG 还没到，清单里沿用的是上一版的条目。
+          #   GitHub **不会**为「往已有 release 传资源」发事件，所以只能由知道「我刚传完」的
+          #   这一方主动发起。以前靠对面一个 */30 的定时任务轮询：一天 48 次空转、把
+          #   Actions 历史刷成噪声，还要最多等半小时；现在是秒级且精确。
+          #
+          #   失败就硬失败（单独一步，不会被误认为打包挂了）—— 默不作声的后果是
+          #   清单里 mac 永远停在旧版本，而两边 CI 都是绿的。DMG 此时已经传完，
+          #   手工补一句即可：
+          #       gh workflow run manifest-refresh.yml -R ClashrAuto/clashauto --ref master
+
+      - name: Refresh clashauto version.json
+        if: env.RELEASE_TAG != ''
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.CLASHAUTO_RELEASE_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo "未设置 CLASHAUTO_RELEASE_TOKEN —— 上面就没发布，清单也无需刷新"
+            exit 0
+          fi
+          gh workflow run manifest-refresh.yml -R ClashrAuto/clashauto --ref master
+          echo "已触发 clashauto 的 version.json 重算"
