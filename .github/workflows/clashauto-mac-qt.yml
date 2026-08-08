@@ -42,7 +42,12 @@ on:
         required: false
 
 env:
-  QT_VERSION: 6.8.3
+  # ★ 必须与 clashauto 的 release.yml 里 macOS 用的那个版本一致（那边叫 QT_VERSION；
+  #   Linux 另有 QT_VERSION_LINUX，与本文件无关）。不一致不会报错 —— 只会让**签名发布出去的
+  #   包**和 clashauto CI 验过的那个不是一个东西，而两边都是绿的。
+  #   预编产物按版本命名（qtstatic-<ver>-macos-universal-<配方哈希>.tar.gz），版本对上了
+  #   这一步就是秒级下载；对不上就退回从源码编通用二进制，两三个小时。
+  QT_VERSION: 6.11.1
   BUILD_DIR: build-release
 
 jobs:
