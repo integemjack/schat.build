@@ -351,12 +351,81 @@ jobs:
           NOTARY_ISSUER: ${{ secrets.MACOS_NOTARY_ISSUER }}
         run: |
           set -euo pipefail
-          mkdir -p dist/dmgroot
-          ditto "$BUILD_DIR/Coast.app" "dist/dmgroot/Coast.app"
-          ln -s /Applications dist/dmgroot/Applications
           # ★ 名字里的 -qt 是刚性契约，见文件头。去掉它，两条产品线的一键更新会互相串包。
           DMG="dist/Coast-${APP_VERSION}-macos-universal-qt.dmg"
-          hdiutil create -volname "Coast" -srcfolder dist/dmgroot -ov -format UDZO "$DMG"
+          mkdir -p dist
+
+          # ── 自定义 Finder 布局的 dmg（「双击运行」）─────────────────────────────────
+          # 与 Swift 线（clashauto-mac.yml）**同一套布局、同一张背景图** —— 用户不该从
+          # 「打开的是哪个 dmg」上看出两条产品线的差别。改这里必须同步改那边。
+          #
+          # ⚠️ 窗口 bounds {200,120,740,500} = 540x380 点，与背景图
+          #   clashauto-c++/scripts/dmg-background.png（1080x760 @2x，144 DPI）一一对应；
+          #   图标位置 {270,150} 就是背景图里那个凹槽的圆心。生成脚本
+          #   clashauto-c++/scripts/make_dmg_background.py。
+          #
+          # ⚠️ 布局里**没有** /Applications 软链（刻意做成「双击运行」）。从 dmg 直接运行时
+          #   App Translocation 会把 bundle 映射到随机只读路径、特权 helper 装不上（TUN/系统代理
+          #   起不来）—— 这条由**应用自己**兜底：不在 /Applications 就搬进去再重启
+          #   （clashauto-c++/src/MacRelocate.mm；Swift 线是 Sources/Coast/Relocate.swift）。
+          #   两件事是配套的，去掉任何一个都会让另一个变成 bug。
+          #   要改回「拖到 Applications」见 Swift 线同处注释。
+          DMGSTAGE="$RUNNER_TEMP/dmg-stage"
+          rm -rf "$DMGSTAGE"; mkdir -p "$DMGSTAGE/.background"
+          ditto "$BUILD_DIR/Coast.app" "$DMGSTAGE/Coast.app"
+          if [ -f clashauto-c++/scripts/dmg-background.png ]; then
+            cp clashauto-c++/scripts/dmg-background.png "$DMGSTAGE/.background/bg.png"
+          else
+            echo "::warning::没有 dmg 背景图资产（源仓库版本太旧？）—— 退化成朴素窗口"
+          fi
+          layout_dmg() {
+            set -e
+            RW="$RUNNER_TEMP/coast-rw.dmg"
+            rm -f "$RW"
+            hdiutil detach "/Volumes/Coast" -force >/dev/null 2>&1 || true
+            hdiutil create -volname "Coast" -srcfolder "$DMGSTAGE" -ov -format UDRW "$RW"
+            hdiutil attach "$RW" -noautoopen
+            sleep 2
+            osascript <<'OSA'
+          tell application "Finder"
+            tell disk "Coast"
+              open
+              set current view of container window to icon view
+              set toolbar visible of container window to false
+              set statusbar visible of container window to false
+              set the bounds of container window to {200, 120, 740, 500}
+              set vo to the icon view options of container window
+              set arrangement of vo to not arranged
+              set icon size of vo to 128
+              set text size of vo to 13
+              try
+                set background picture of vo to file ".background:bg.png"
+              end try
+              set position of item "Coast.app" of container window to {270, 150}
+              update without registering applications
+              delay 1
+              close
+            end tell
+          end tell
+          OSA
+            sync
+            hdiutil detach "/Volumes/Coast" -force
+            hdiutil convert "$RW" -format UDZO -o "$DMG" -ov
+            rm -f "$RW"
+          }
+          rm -f "$DMG"
+          if ! ( layout_dmg ); then
+            echo "::warning::自定义 dmg 布局失败 —— 回退朴素 dmg"
+            rm -f "$DMG"
+            for attempt in 1 2 3 4; do
+              hdiutil detach "/Volumes/Coast" -force >/dev/null 2>&1 || true
+              if hdiutil create -volname "Coast" -srcfolder "$DMGSTAGE" -ov -format UDZO "$DMG"; then
+                break
+              fi
+              echo "hdiutil create 第 $attempt/4 次失败 —— 8 秒后重试"; sleep 8
+            done
+          fi
+          [ -f "$DMG" ] || { echo "::error::dmg 没生成"; exit 1; }
           if [ -z "${NOTARY_KEY:-}" ]; then
             echo "缺 notary 凭据，无法公证"; exit 1
           fi
