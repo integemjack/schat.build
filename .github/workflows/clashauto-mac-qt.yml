@@ -1,5 +1,10 @@
 # 在 schat.build（已配好 Developer ID 签名/公证 secret）里构建 ClashrAuto/clashauto 的
-# **Qt 版 macOS 包**，签名+公证后发布到 clashauto 仓库的 Release。
+# **Qt 版 macOS 包**，签名+公证后发布到 **ClashrAuto/Coast** 的 Release。
+#
+# ★ 2026-08-10 起，【检出的仓库】与【发布的仓库】是两个：源码仍在
+#   ClashrAuto/clashauto（那边即将转私有），而**发布/下载入口已迁到 ClashrAuto/Coast** ——
+#   Coast 里住着一份由 release.yml 生成的 build.yml，六个平台的包都发在它自己名下。
+#   本文件只改**发布落点**，`actions/checkout` 仍指向源仓库。
 #
 # 与同目录的 clashauto-mac.yml（Swift 版）是**并存的两条产品线**，同一个 release 上各占一个
 # 资源，靠文件名里的 -qt 区分：
@@ -25,7 +30,10 @@
 #
 # 需要的 secret（本仓库 integemjack/schat.build）：
 #   MACOS_CERT_P12 / MACOS_CERT_PW / MACOS_NOTARY_KEY / MACOS_NOTARY_KEY_ID / MACOS_NOTARY_ISSUER
-#   CLASHAUTO_RELEASE_TOKEN —— 对 ClashrAuto/clashauto 有 contents:write 的 PAT
+#   CLASHAUTO_RELEASE_TOKEN —— 对 **ClashrAuto/Coast** 有 contents:write 的 PAT
+#     （名字沿用旧的：改名得在仓库设置里重新添一遍，漏加时上面那句
+#     「未设置…跳过发布」会让 mac 包**静默消失**。若它是细粒度 PAT，
+#     要先把 Coast 加进可访问仓库，否则 gh release create 会 404。）
 name: clashauto macOS Qt (signed)
 
 on:
@@ -459,7 +467,7 @@ jobs:
           name: Coast-macos-universal-qt-signed
           path: dist/Coast-*-macos-universal-qt.dmg
 
-      - name: Publish to clashauto release
+      - name: Publish to Coast release
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.CLASHAUTO_RELEASE_TOKEN }}
@@ -481,27 +489,27 @@ jobs:
           # ★ prerelease 绝不能碰 latest：/releases/latest 是正式版通道。
           # ★ 与 Swift 那条线传的是**不同文件名**（-qt），所以两边的 --clobber 各管各的，
           #   不会互相覆盖 —— 这正是当初 Qt 版 mac 包被整个停掉的原因，别再让名字撞上。
-          if gh release view "$RELEASE_TAG" -R ClashrAuto/clashauto >/dev/null 2>&1; then
+          if gh release view "$RELEASE_TAG" -R ClashrAuto/Coast >/dev/null 2>&1; then
             if [ "$IS_PRERELEASE" != "true" ]; then
-              gh release edit "$RELEASE_TAG" -R ClashrAuto/clashauto --latest >/dev/null 2>&1 || true
+              gh release edit "$RELEASE_TAG" -R ClashrAuto/Coast --latest >/dev/null 2>&1 || true
             fi
           else
             if [ "$IS_PRERELEASE" = "true" ]; then
-              gh release create "$RELEASE_TAG" -R ClashrAuto/clashauto \
+              gh release create "$RELEASE_TAG" -R ClashrAuto/Coast \
                 --title "Coast ${APP_VERSION} (beta · ${SRC_REF:-unknown})" --prerelease \
                 --notes "signed + notarized macOS build (built by schat.build)"
             else
-              gh release create "$RELEASE_TAG" -R ClashrAuto/clashauto \
+              gh release create "$RELEASE_TAG" -R ClashrAuto/Coast \
                 --title "Coast ${APP_VERSION}" --latest \
                 --notes "signed + notarized macOS build (built by schat.build)"
             fi
           fi
-          gh release upload "$RELEASE_TAG" "$DMG" "$DMG.sha256" --clobber -R ClashrAuto/clashauto
+          gh release upload "$RELEASE_TAG" "$DMG" "$DMG.sha256" --clobber -R ClashrAuto/Coast
           echo "uploaded $DMG → ${RELEASE_TAG} (prerelease=$IS_PRERELEASE)"
 
-          # ★ 传完就回头让 clashauto 重算 version.json。
+          # ★ 传完就回头让 Coast 重算 version.json。
           #
-          #   客户端查更新只读那份清单（绕开 GitHub API 的限流），而它是在 clashauto 的
+          #   客户端查更新只读那份清单（绕开 GitHub API 的限流），而它是在 Coast 的
           #   manifest job 里生成的 —— 那时候 mac 的 DMG 还没到，清单里沿用的是上一版的条目。
           #   GitHub **不会**为「往已有 release 传资源」发事件，所以只能由知道「我刚传完」的
           #   这一方主动发起。以前靠对面一个 */30 的定时任务轮询：一天 48 次空转、把
@@ -510,9 +518,9 @@ jobs:
           #   失败就硬失败（单独一步，不会被误认为打包挂了）—— 默不作声的后果是
           #   清单里 mac 永远停在旧版本，而两边 CI 都是绿的。DMG 此时已经传完，
           #   手工补一句即可：
-          #       gh workflow run manifest-refresh.yml -R ClashrAuto/clashauto --ref master
+          #       gh workflow run manifest-refresh.yml -R ClashrAuto/Coast --ref main
 
-      - name: Refresh clashauto version.json
+      - name: Refresh Coast version.json
         if: env.RELEASE_TAG != ''
         shell: bash
         env:
@@ -523,5 +531,14 @@ jobs:
             echo "未设置 CLASHAUTO_RELEASE_TOKEN —— 上面就没发布，清单也无需刷新"
             exit 0
           fi
-          gh workflow run manifest-refresh.yml -R ClashrAuto/clashauto --ref master
-          echo "已触发 clashauto 的 version.json 重算"
+          # ⚠️ manifest-refresh.yml **还没搬到 Coast**（那边目前只有生成出来的 build.yml，
+          #    而这个工作流还需要 .github/scripts/build_version_manifest.py 一起过去）。
+          #    缺它时 `gh workflow run` 报 404，会把一次**包已经传完**的 run 弄成红的。
+          #    所以先探一次：不在就打醒目的 warning（注解在日志之外也看得见），
+          #    在就照旧硬失败 —— 这一条搬过去之后本分支就恢复成原来的行为。
+          if ! gh workflow view manifest-refresh.yml -R ClashrAuto/Coast >/dev/null 2>&1; then
+            echo "::warning::ClashrAuto/Coast 上没有 manifest-refresh.yml —— DMG 已传完，但 version.json 里的 mac 条目仍停在上一版。把 clashauto 的 .github/workflows/manifest-refresh.yml 与 .github/scripts/build_version_manifest.py 一起放到 Coast 的 main 分支即可。"
+            exit 0
+          fi
+          gh workflow run manifest-refresh.yml -R ClashrAuto/Coast --ref main
+          echo "已触发 Coast 的 version.json 重算"
