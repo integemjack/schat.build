@@ -423,6 +423,34 @@ jobs:
           fi
           echo "OK: 无动态 Qt 依赖"
 
+      # 「编出来了」也不等于「老系统跑得起来」。这条腿的存在理由就是 minos 12.0,
+      # 而在 2026-08-11 之前**没有任何一处验证过它** —— 那个数只活在 CI 的环境变量和
+      # Info.plist 的一句声明里。两者叠起来的后果是最坏的那种:
+      #   plist 说「12.0 能跑」→ 老系统照常启动 → 二进制其实要更高 → dyld 当场失败,
+      #   用户看到「打不开 / 闪退」,而不是那句「需要更新的 macOS」。
+      # ⚠️ **两个 slice 都要查**:universal2 是 lipo 出来的,两半的 minos 可以不一样,
+      #    而只查瘦身前的那份正好会漏掉这种。
+      - name: Assert 最低系统版本 = 12.0(两个 slice + plist 一致)
+        working-directory: desktop/desktop-qt
+        run: |
+          set -euo pipefail
+          BIN=build/app-qt/SChat.app/Contents/MacOS/SChat
+          WANT=12.0
+          bad=0
+          for A in arm64 x86_64; do
+            lipo -thin "$A" "$BIN" -output "/tmp/slice-$A"
+            GOT="$(vtool -show-build "/tmp/slice-$A" | awk '/minos/{print $2; exit}')"
+            echo "$A minos=$GOT"
+            [ "$GOT" = "$WANT" ] || { echo "FATAL: $A 的 minos 是 $GOT,不是 $WANT"; bad=1; }
+          done
+          PL="$(/usr/libexec/PlistBuddy -c 'Print :LSMinimumSystemVersion' \
+                build/app-qt/SChat.app/Contents/Info.plist)"
+          echo "plist LSMinimumSystemVersion=$PL"
+          # plist **低于**真实需求比不写还坏(见上)。要求逐字相等,不是「不高于」。
+          [ "$PL" = "$WANT" ] || { echo "FATAL: plist 声称 $PL,二进制要 $WANT"; bad=1; }
+          [ "$bad" = 0 ] || exit 1
+          echo "OK: 两个 slice 与 plist 都是 $WANT"
+
       # Import the Developer ID cert into a throwaway keychain (only if the secret is set —
       # otherwise the package step falls back to ad-hoc signing so forks still build).
       - name: Import Developer ID signing cert
