@@ -96,7 +96,7 @@ jobs:
           echo "::endgroup::"
 
           echo "::group::libsodium 1.0.20 (configure per-arch in SEPARATE trees + lipo)"
-          cd "$SRC"; curl -fsSL https://download.libsodium.org/libsodium/releases/libsodium-1.0.20-stable.tar.gz -o sodium.tgz
+          cd "$SRC"; curl -fsSL --retry 6 --retry-delay 3 --retry-all-errors "${SCHAT_GH_MIRROR:-https://github.com}/jedisct1/libsodium/releases/download/1.0.20-RELEASE/libsodium-1.0.20.tar.gz" -o sodium.tgz   # ← 不用 download.libsodium.org:它在 runner 上反复挂(DNS / 自签证书劫持),两次都掐掉整轮构建
           mkdir -p sodium-src && tar -C sodium-src --strip-components=1 -xf sodium.tgz
           for A in arm64 x86_64; do
             H=$([ "$A" = arm64 ] && echo aarch64-apple-darwin || echo x86_64-apple-darwin)
