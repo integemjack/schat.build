@@ -76,12 +76,36 @@ jobs:
           } >> "$GITHUB_OUTPUT"
           echo "构建 ref=${sha:-${DISPATCH_REF:-master}}  目标 release=${tag:-（未指定，只出 artifact）}"
 
+      # ★ 源仓库 ClashrAuto/clashauto 2026-08 转私有了。默认的 github.token 只对
+      #   **本仓库**有效，checkout 私有的源仓库会失败 —— 而 GitHub 对没有权限的私有仓库
+      #   一律回 **404 而不是 403**，于是日志里只有一句
+      #       remote: Repository not found.
+      #       fatal: repository 'https://github.com/ClashrAuto/clashauto/' not found
+      #   看着像仓库被删了或者名字写错了，完全指不到「缺一个 token」。实测代价：
+      #   2026-08-12 起两条 mac 线**每一轮都在 checkout 就死**，一个包都没出过，而源仓库
+      #   自己的 CI 一直是绿的（它 checkout 自己，不需要跨仓库权限）。
+      #   所以这里先把「没配 token」翻译成一句能照着做的话，再去 checkout。
+      - name: Check source token
+        shell: bash
+        env:
+          SRC_TOKEN: ${{ secrets.SOURCE_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${SRC_TOKEN:-}" ]; then
+            echo "::error::未设置 SOURCE_TOKEN —— ClashrAuto/clashauto 是私有仓库，默认的 github.token 读不到它，checkout 会以 'Repository not found' 收场（GitHub 对无权限的私有仓库回 404 而不是 403，所以那句话并不代表仓库不存在）。请在 integemjack/schat.build 的 Actions secrets 里加一个对 ClashrAuto/clashauto 有 contents:read 的 PAT，命名 SOURCE_TOKEN。"
+            exit 1
+          fi
+          echo "SOURCE_TOKEN 已配置"
+
       - name: Checkout clashauto
         uses: actions/checkout@v4
         with:
           repository: ClashrAuto/clashauto
           ref: ${{ steps.trig.outputs.ref }}
           fetch-depth: 0
+          # 私有源仓库要显式给 token（见上一步的说明）。本仓库另有一个 SRC_REPO_TOKEN，
+          # 那是 SChat 自己那条线的源仓库用的 —— 别混用，两个指向不同的仓库。
+          token: ${{ secrets.SOURCE_TOKEN }}
 
       - name: Resolve version/tag
         shell: bash
