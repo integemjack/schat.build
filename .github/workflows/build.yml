@@ -91,7 +91,20 @@ jobs:
 
       - name: Android (unit tests)
         working-directory: android
-        run: ./gradlew :app:testDebugUnitTest --console=plain
+        run: |
+          chmod +x gradlew
+          # gradle wrapper 会去 services.gradle.org 取发行包,那一步**自己没有任何重试** ——
+          # Build All #281 的 Android 腿就是被一次 `SocketException: Unexpected end of file
+          # from server` 打红的(和同一次里 Qt aarch64 腿的 503 是同一个病根:外部下载零重试)。
+          # 先带重试地预热一次 wrapper,再跑真正的构建。
+          for i in 1 2 3 4 5; do
+            ./gradlew --version --no-daemon >/dev/null 2>&1 && break
+            echo "::warning::gradle wrapper 没下下来(第 $i 次),5 秒后重试"
+            sleep 5
+          done
+          ./gradlew --version --no-daemon >/dev/null 2>&1 || {
+            echo "::error::gradle wrapper 连试五次都没下下来 —— services.gradle.org 不可达"; exit 1; }
+          ./gradlew :app:testDebugUnitTest --console=plain
 
   # iOS 不在 CI 构建——本地 archive 后直传 TestFlight（见项目根 CLAUDE.md / 记忆）。
   android:
@@ -122,6 +135,17 @@ jobs:
           ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
         run: |
           chmod +x gradlew
+          # gradle wrapper 会去 services.gradle.org 取发行包,那一步**自己没有任何重试** ——
+          # Build All #281 的 Android 腿就是被一次 `SocketException: Unexpected end of file
+          # from server` 打红的(和同一次里 Qt aarch64 腿的 503 是同一个病根:外部下载零重试)。
+          # 先带重试地预热一次 wrapper,再跑真正的构建。
+          for i in 1 2 3 4 5; do
+            ./gradlew --version --no-daemon >/dev/null 2>&1 && break
+            echo "::warning::gradle wrapper 没下下来(第 $i 次),5 秒后重试"
+            sleep 5
+          done
+          ./gradlew --version --no-daemon >/dev/null 2>&1 || {
+            echo "::error::gradle wrapper 连试五次都没下下来 —— services.gradle.org 不可达"; exit 1; }
           ./gradlew assembleDebug assembleRelease --no-daemon --stacktrace
       - name: Collect APKs
         run: |
