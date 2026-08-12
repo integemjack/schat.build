@@ -999,6 +999,10 @@ jobs:
           repository: Ireoo/Secret-Chat
           ref: ${{ env.SRC_REF }}
           token: ${{ secrets.SRC_REPO_TOKEN }}
+          # convkey_wire_test 的「QML import vs 打包 Qt 模块」守卫从 schat.build 子模块里的
+          # qt-static.yml 读 QT_SUBMODULES(唯一权威,刻意不手抄)。子模块不 checkout 时
+          # 清单为空 → 该守卫大声失败,整条腿红。子模块是公开仓,任何 token 都拉得动。
+          submodules: true
 
       - name: Build + package (.deb + AppImage) in Debian trixie (${{ matrix.arch }})
         run: |
