@@ -147,27 +147,26 @@ jobs:
         shell: bash
         run: echo "QT_ROOT=${{ steps.qt.outputs.qt-root }}" >> "$GITHUB_ENV"
 
-      - name: Generate icon.icns
-        shell: bash
-        run: |
-          set -euo pipefail
-          # 从 assets/icon.ico 取最大帧生成 iconset → icns；CMake 检测到该文件即打进 Resources
-          python3 - <<'PY'
-          from PIL import Image
-          import pathlib
-
-          ico = Image.open("clashauto-c++/assets/icon.ico")
-          sizes = sorted(ico.info.get("sizes") or {ico.size})
-          ico.size = sizes[-1]
-          ico.load()
-          base = ico.convert("RGBA")
-          out = pathlib.Path("icon.iconset")
-          out.mkdir(exist_ok=True)
-          for s in (16, 32, 128, 256, 512):
-              base.resize((s, s), Image.LANCZOS).save(out / f"icon_{s}x{s}.png")
-              base.resize((s * 2, s * 2), Image.LANCZOS).save(out / f"icon_{s}x{s}@2x.png")
-          PY
-          iconutil -c icns -o clashauto-c++/assets/icon.icns icon.iconset
+      # ★ 这里**不要**生成 icon.icns（2026-08-12 删掉了原先那一步）。
+      #   `clashauto-c++/assets/icon.icns` 是**入库的成品**，CMake 用 `if(EXISTS)` 直接
+      #   打进 Resources —— 什么都不做就是对的。
+      #
+      #   删掉的那一步是「从 assets/icon.ico 取最大帧 → iconutil 生成 icns」**覆盖**入库的那份，
+      #   两个后果都只在 Dock 里看得出来、任何构建/打包/签名/公证检查都不会红：
+      #   ① `icon.ico` 是**全出血**方图（Windows 任务栏就该是全出血），拿它生成的 icns 在
+      #      macOS 的图标网格里**填满整格** —— 比左右邻居大一圈，而且是方角。macOS 的网格
+      #      要求圆角贴片只占画布的 824/1024 ≈ 80.5%（每边 100px 透明留白）再加一层轻投影，
+      #      所有原生 app 才会「看起来一样大」。
+      #   ② `.ico` 最大帧只有 256，升采样到 1024 还糊。
+      #
+      #   ⚠️ **用户拿到的签名包出自本工作流** —— 源仓库 release.yml 里那一份同样的步骤已经删了，
+      #      但只删那边不删这边，出货的图标依旧是坏的。它藏得久正是因为覆盖发生在 checkout
+      #      **之后**：只查源文件的门禁看不见，只有产物里有痕迹。下面「macOS 图标合网格」
+      #      那一步就是补上这个唯一能观测到的位置（同时量入库的那份和 .app 里的那份）。
+      #
+      #   要改图标：换掉全出血的 `assets/icon-source-1024.png`，跑
+      #   `python3 clashauto-c++/scripts/make_macos_icns.py`，把产物提交进源仓库。
+      #   `icon.ico`（Windows）/ `icon-256.png`（Linux + 应用内托盘）保持全出血别动。
 
       - name: Configure
         shell: bash
@@ -197,6 +196,26 @@ jobs:
           if otool -L "$bin" | grep -qE 'Qt[A-Za-z0-9]+\.framework|libQt6'; then
             echo "::error::静态化没生效 —— Coast 仍动态依赖 Qt"; exit 1
           fi
+
+      # ★ 量 **.app 里那一份**图标，不是只量入库的源文件 —— 上面那段注释里的事故正是这个差别：
+      #   入库的 icon.icns 是对的，而本工作流曾有一步在 checkout **之后**用全出血的 icon.ico
+      #   现生成 icns 覆盖它。出货的图标是 100% 满格方图，在 Dock 里比邻居大一圈，而构建、
+      #   打包、签名、公证没有任何一环会红。这一步是唯一能观测到它的位置。
+      #   两个都查：入库的那份 + 打进 bundle 的那份，任何一个被弄坏都红。
+      #   （pillow 由上面 Install build dependencies 装好。）
+      - name: macOS 图标合网格（量 .app 里的那一份）
+        shell: bash
+        run: |
+          set -euo pipefail
+          # 脚本来自被检出的源仓库。缺它 = 触发方给的 source-sha 早于 2026-08-12，
+          # 那个版本的图标本来就是坏的 —— 明说，别静默跳过。
+          if [ ! -f clashauto-c++/scripts/check_macos_icon.py ]; then
+            echo "::error::源仓库里没有 scripts/check_macos_icon.py —— 检出的 source-sha 太旧（早于 2026-08-12），该版本出货的 macOS 图标是全出血满格图。请构建更新的 sha。"
+            exit 1
+          fi
+          python3 clashauto-c++/scripts/check_macos_icon.py \
+            clashauto-c++/assets/icon.icns \
+            "$BUILD_DIR/Coast.app/Contents/Resources/icon.icns"
 
       - name: Static plugin self-test
         shell: bash
@@ -365,19 +384,13 @@ jobs:
 
           # ── 自定义 Finder 布局的 dmg（「双击运行」）─────────────────────────────────
           # 与 Swift 线（clashauto-mac.yml）**同一套布局、同一张背景图** —— 用户不该从
-          # 「打开的是哪个 dmg」上看出两条产品线的差别。改这里必须同步改那边。
-          #
-          # ⚠️ 窗口 bounds {200,120,740,500} = 540x380 点，与背景图
-          #   clashauto-c++/scripts/dmg-background.png（1080x760 @2x，144 DPI）一一对应；
-          #   图标位置 {270,150} 就是背景图里那个凹槽的圆心。生成脚本
-          #   clashauto-c++/scripts/make_dmg_background.py。
+          # 「打开的是哪个 dmg」上看出两条产品线的差别。
           #
           # ⚠️ 布局里**没有** /Applications 软链（刻意做成「双击运行」）。从 dmg 直接运行时
           #   App Translocation 会把 bundle 映射到随机只读路径、特权 helper 装不上（TUN/系统代理
           #   起不来）—— 这条由**应用自己**兜底：不在 /Applications 就搬进去再重启
           #   （clashauto-c++/src/MacRelocate.mm；Swift 线是 Sources/Coast/Relocate.swift）。
           #   两件事是配套的，去掉任何一个都会让另一个变成 bug。
-          #   要改回「拖到 Applications」见 Swift 线同处注释。
           DMGSTAGE="$RUNNER_TEMP/dmg-stage"
           rm -rf "$DMGSTAGE"; mkdir -p "$DMGSTAGE/.background"
           ditto "$BUILD_DIR/Coast.app" "$DMGSTAGE/Coast.app"
@@ -386,54 +399,25 @@ jobs:
           else
             echo "::warning::没有 dmg 背景图资产（源仓库版本太旧？）—— 退化成朴素窗口"
           fi
-          layout_dmg() {
-            set -e
-            RW="$RUNNER_TEMP/coast-rw.dmg"
-            rm -f "$RW"
-            hdiutil detach "/Volumes/Coast" -force >/dev/null 2>&1 || true
-            hdiutil create -volname "Coast" -srcfolder "$DMGSTAGE" -ov -format UDRW "$RW"
-            hdiutil attach "$RW" -noautoopen
-            sleep 2
-            osascript <<'OSA'
-          tell application "Finder"
-            tell disk "Coast"
-              open
-              set current view of container window to icon view
-              set toolbar visible of container window to false
-              set statusbar visible of container window to false
-              set the bounds of container window to {200, 120, 740, 500}
-              set vo to the icon view options of container window
-              set arrangement of vo to not arranged
-              set icon size of vo to 128
-              set text size of vo to 13
-              try
-                set background picture of vo to file ".background:bg.png"
-              end try
-              set position of item "Coast.app" of container window to {270, 150}
-              update without registering applications
-              delay 1
-              close
-            end tell
-          end tell
-          OSA
-            sync
-            hdiutil detach "/Volumes/Coast" -force
-            hdiutil convert "$RW" -format UDZO -o "$DMG" -ov
-            rm -f "$RW"
-          }
-          rm -f "$DMG"
-          if ! ( layout_dmg ); then
-            echo "::warning::自定义 dmg 布局失败 —— 回退朴素 dmg"
-            rm -f "$DMG"
-            for attempt in 1 2 3 4; do
-              hdiutil detach "/Volumes/Coast" -force >/dev/null 2>&1 || true
-              if hdiutil create -volname "Coast" -srcfolder "$DMGSTAGE" -ov -format UDZO "$DMG"; then
-                break
-              fi
-              echo "hdiutil create 第 $attempt/4 次失败 —— 8 秒后重试"; sleep 8
-            done
+          # ★ 布局 + 兜底整段收在源仓库的 clashauto-c++/scripts/make_dmg.sh 里（2026-08-12），
+          #   **四个使用方共用一份**：clashauto 的 macos / macos-swift 两个 job，以及本仓库的
+          #   clashauto-mac-qt.yml / clashauto-mac.yml。本仓库检出的就是那份源码，直接调即可。
+          #
+          #   收敛的直接原因是这两份**真的漂了，而且漂的正是那次事故的修复**：源仓库两份带着
+          #   8 处 `|| return 1`、10 次 detach 重试、convert 失败诊断、末尾 `[ -f "$DMG" ]`，
+          #   而这里一处都没有 —— 还停在 2026-08-10 事故前的写法（函数体里写 `set -e` 就以为够了）。
+          #   `set -e` 对被当作条件求值的命令是**失效**的（`if ! ( layout_dmg )` 递归作用到函数体内），
+          #   于是中途失败会一路走到末尾必然成功的 `rm -f "$RW"`，函数返回 0，**兜底根本不触发**，
+          #   最后以一句光秃秃的「dmg 没生成」收尾。也就是说「release 静默少一个平台的包」这个
+          #   缺陷，在**用户实际拿到包的这条流水线上一直是活的**。
+          if [ ! -f "$GITHUB_WORKSPACE/clashauto-c++/scripts/make_dmg.sh" ]; then
+            echo "::error::源仓库里没有 scripts/make_dmg.sh —— 检出的 source-sha 早于 2026-08-12。请构建更新的 sha（别把布局逻辑抄回本文件，那正是这次收敛要消灭的漂移）。"
+            exit 1
           fi
-          [ -f "$DMG" ] || { echo "::error::dmg 没生成"; exit 1; }
+          # ⚠️ 用 $GITHUB_WORKSPACE 而不是相对路径：相对路径在带 working-directory 的步骤里
+          #    解析不到，表现是 exit 127（command not found）—— 127 看着像"脚本内部出错"，
+          #    其实是根本没找到脚本。
+          bash "$GITHUB_WORKSPACE/clashauto-c++/scripts/make_dmg.sh" "$DMGSTAGE" "$DMG" Coast Coast.app
           if [ -z "${NOTARY_KEY:-}" ]; then
             echo "缺 notary 凭据，无法公证"; exit 1
           fi
@@ -450,7 +434,13 @@ jobs:
           sub_id="$(printf '%s' "$out" | python3 -c 'import json,sys;print(json.load(sys.stdin).get("id",""))')"
           status="$(printf '%s' "$out" | python3 -c 'import json,sys;print(json.load(sys.stdin).get("status",""))')"
           if [ "$status" != "Accepted" ]; then
-            echo "::error::公证被拒（status=$status）。以下是苹果给出的逐条原因："
+            # ⚠️ `${status}` 的大括号不是风格 —— mac 自带 bash 3.2 在 **UTF-8 locale** 下会把紧跟在
+            #    `$var` 后面的多字节字符吞进变量名，`set -u` 当场杀掉。2026-08-12 在真 Mac
+            #    （bash 3.2.57）实测：LANG=en_US.UTF-8 时这一行报 `status<乱码>: unbound variable`，
+            #    于是**苹果的拒绝原因一条都打不出来**，下面那句 notarytool log 也根本不执行 ——
+            #    正是这段守卫要防的症状。而 ssh 进 Mac 时 LANG 通常是空的（实测不挂），
+            #    所以「在真 Mac 上验过」挡不住它；GitHub 的 mac runner 恰好设了 en_US.UTF-8。
+            echo "::error::公证被拒（status=${status}）。以下是苹果给出的逐条原因："
             xcrun notarytool log "$sub_id" \
               --key "$RUNNER_TEMP/nkey.p8" --key-id "$NOTARY_KEY_ID" --issuer "$NOTARY_ISSUER" || true
             rm -f "$RUNNER_TEMP/nkey.p8"
