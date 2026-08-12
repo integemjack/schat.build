@@ -76,6 +76,19 @@ jobs:
             echo "::error::只通过 $n 个包(期望 ≥5)—— 判据失配,不是「都通过了」"
             exit 1
           fi
+      # ★ ShieldCode 的 golden 夹具(bin/ photo/)是**生成物且被 gitignore**(26 MB) ——
+      #   本机流程是「先跑参考实现生成,再跑测试」,而 CI 从没做过这一步:
+      #   于是 `ShieldCodeCodecTest` 在干净检出上必然 FileNotFoundException。
+      #   这正是这道门禁第一次跑就逮到的东西 —— 那几条测试**在本机绿了很久,却从来跑不起来**。
+      - name: 生成 ShieldCode 夹具(gitignore 的生成物)
+        run: |
+          python3 -m pip install --quiet pillow numpy
+          python3 docs/fixtures/shieldcode/tools/shieldcode_ref.py gen
+          # vectors.json 是**已跟踪**的冻结向量:重生成后必须一字不差。
+          # 变了 = 参考实现与冻结向量漂开了,那是真问题,不能默默拿新值继续测。
+          git diff --quiet -- docs/fixtures/shieldcode/vectors.json || {
+            echo "::error::重新生成后 vectors.json 变了 —— 参考实现与冻结向量已漂开"; exit 1; }
+
       - name: Android (unit tests)
         working-directory: android
         run: ./gradlew :app:testDebugUnitTest --console=plain
