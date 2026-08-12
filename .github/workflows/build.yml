@@ -67,10 +67,16 @@ jobs:
         with:
           distribution: temurin
           java-version: "21"
-      - name: 跨端一致性守卫(SAS 闸门 / 共用固定向量)
+      - name: 跨端一致性守卫(SAS 闸门 / 共用固定向量 / 本地存储验证器自检)
         run: |
           python3 scripts/check-sas-gate.py
           python3 scripts/check-shared-fixtures.py
+          # sync_probe 的 16 组内置自检 —— 零依赖、不碰任何真实数据、1 秒跑完。
+          # 它此前**只在有人手动跑时有效**:16 组守卫一个门禁都没接,
+          # 正是本仓「测试写了没人跑」那条老毛病的又一例。
+          # 钉的是登记册 docs/local_storage_contract.md 的可执行部分:四端表名列名映射、
+          # 账号身份归一的五种口径、判空/删除的边界、密文库摘要比对的固定向量。
+          python3 scripts/sync_probe.py --selftest
       - name: chatserver (go test)
         working-directory: chatserver
         # ⚠️ 判据是**通过的包数**,不是「输出里没有 FAIL」——
