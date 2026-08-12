@@ -443,6 +443,20 @@ jobs:
             -DOPENSSL_ROOT_DIR=/tmp/uni -DOPENSSL_USE_STATIC_LIBS=TRUE
           cmake --build build -j"$(sysctl -n hw.ncpu)"
 
+      # macOS-only 的那个测试:qt 的测试门禁挂在 **Linux** 两条腿上,而
+      # `qrimage_roundtrip_test` 带 `AND APPLE`(CIDetector 解 QR)→ Linux 根本不编它,
+      # 于是它此前的**唯一覆盖是有人在 mac 上手动跑 run-all-tests.sh**,CI 一次没跑过。
+      # 这里只跑它一个(不跑全套 —— 这条腿已经是整轮的瓶颈,Universal2 要编两个架构)。
+      # ⚠️ 判据是「二进制在 + 退出码 0」:文件不在就**大声失败**,而不是当作「没测试可跑」——
+      #    那正是本仓反复踩的假绿(测试没编出来时同样「没有失败」)。
+      - name: qrimage_roundtrip_test(macOS-only,Linux 腿覆盖不到)
+        working-directory: desktop/desktop-qt
+        run: |
+          set -euo pipefail
+          BIN=build/qrimage_roundtrip_test
+          [ -x "$BIN" ] || { echo "::error::$BIN 不存在 —— 它是 macOS-only target,本该在这条腿编出来"; exit 1; }
+          "$BIN"
+
       # 「编出来了」不等于「静态成了」——CMake 找错 kit(机器上还有 brew 的动态 Qt)照样编得过,
       # 产物却在用户机上找不到 Qt。直接查 Mach-O 的加载命令。
       - name: Assert 二进制不依赖任何 Qt 框架/动态库
