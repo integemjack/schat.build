@@ -26,6 +26,60 @@ env:
   SCHAT_RAW_MIRROR: https://raw.githubusercontent.com
 
 jobs:
+  # ── 发布门禁(2026-08-12 新增)────────────────────────────────────────────────
+  #
+  # 此前**整条流水线一个测试都不跑**(7 个 job 里没有 go test / swift test /
+  # gradlew test / qt 测试二进制),`qt-desktop.yml` 里也只跑一个安装器回归。
+  # 也就是说仓库里全部单测、以及那十几套跨端差集守卫,只在有人本机手动跑时才有效 ——
+  # 流水线会照常构建、签名、发布一个测试全红的版本。
+  #
+  # 这个 job 只放**确定性高、不需要显示环境**的三样:跨端守卫 + chatserver + Android 单测。
+  # **刻意不放**的与理由:
+  #   - qt 的 65 个测试二进制:其中一部分要 QGuiApplication / 显示环境,
+  #     放进发布门禁的 flaky 风险 > 收益(门禁一 flaky 就会挡住发版);
+  #   - macOS / iOS:要 macOS runner,而那些 runner 已被构建腿占满;
+  #   - 这三样在本机由 `scripts/run-all-tests.sh` 覆盖(它会跑全部五端)。
+  # 覆盖边界写在这里,免得有人以为「CI 绿 = 全端都验过」。
+  tests:
+    name: Tests (gate)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          repository: Ireoo/Secret-Chat
+          ref: ${{ env.SRC_REF }}
+          token: ${{ secrets.SRC_REPO_TOKEN }}
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+          cache-dependency-path: chatserver/go.sum
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+      - name: 跨端一致性守卫(SAS 闸门 / 共用固定向量)
+        run: |
+          python3 scripts/check-sas-gate.py
+          python3 scripts/check-shared-fixtures.py
+      - name: chatserver (go test)
+        working-directory: chatserver
+        # ⚠️ 判据是**通过的包数**,不是「输出里没有 FAIL」——
+        #    一个包都没跑到时同样没有 FAIL,那是这个仓库反复踩过的假绿。
+        run: |
+          set -o pipefail
+          out=$(go test ./... 2>&1) || { echo "$out"; exit 1; }
+          echo "$out"
+          n=$(echo "$out" | grep -cE '^ok ') || true
+          if [ "$n" -lt 5 ]; then
+            echo "::error::只通过 $n 个包(期望 ≥5)—— 判据失配,不是「都通过了」"
+            exit 1
+          fi
+      - name: Android (unit tests)
+        working-directory: android
+        run: ./gradlew :app:testDebugUnitTest --console=plain
+
   # iOS 不在 CI 构建——本地 archive 后直传 TestFlight（见项目根 CLAUDE.md / 记忆）。
   android:
     name: Android (APK)
@@ -184,8 +238,10 @@ jobs:
 
   release:
     name: Publish Release
-    needs: [android, desktop, server, docker, m5core2]
-    if: always()
+    needs: [tests, android, desktop, server, docker, m5core2]
+    # `always()` 保留 —— 某条构建腿失败时仍发布已经成功的那些产物(既有行为)。
+    # **但测试没过就不发布**:门禁的意义就在这一行。
+    if: always() && needs.tests.result == 'success' 
     runs-on: ubuntu-latest
     steps:
       - name: Checkout source (changelog 用)
@@ -339,7 +395,8 @@ jobs:
     name: Report build failures
     # `release` 也在 needs 里:它的「索引未更新」闸门判红后必须被报出来。少了它,
     # report-failures 会与 release 并行跑,看到的 conclusion 还是 null(被下面的过滤跳过)。
-    needs: [android, desktop, server, docker, m5core2, release]
+    # `tests` 也在里面:门禁判红时必须被报出来(否则测试挂了只表现为「没发布」,没人知道为什么)。
+    needs: [tests, android, desktop, server, docker, m5core2, release]
     if: always()
     runs-on: ubuntu-latest
     permissions:
