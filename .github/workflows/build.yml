@@ -55,6 +55,14 @@ jobs:
         with:
           go-version: "1.24"
           cache-dependency-path: chatserver/go.sum
+      # ★ 根治 wrapper 下载失败:把 gradle 发行包缓存起来,命中就完全不碰
+      #   services.gradle.org。#289 的 Tests(gate)就是被那台主机打红的 —— 重试只是
+      #   降低概率,不下载才是真正不会失败。key 跟着 wrapper properties 走:
+      #   换 gradle 版本自动失效,不会喂旧发行包。
+      - uses: actions/cache@v4
+        with:
+          path: ~/.gradle/wrapper/dists
+          key: gradle-dist-${{ runner.os }}-${{ hashFiles('android/gradle/wrapper/gradle-wrapper.properties') }}
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
@@ -97,10 +105,11 @@ jobs:
           # Build All #281 的 Android 腿就是被一次 `SocketException: Unexpected end of file
           # from server` 打红的(和同一次里 Qt aarch64 腿的 503 是同一个病根:外部下载零重试)。
           # 先带重试地预热一次 wrapper,再跑真正的构建。
-          for i in 1 2 3 4 5; do
+          d=2
+          for i in 1 2 3 4 5 6; do
             ./gradlew --version --no-daemon >/dev/null 2>&1 && break
-            echo "::warning::gradle wrapper 没下下来(第 $i 次),5 秒后重试"
-            sleep 5
+            echo "::warning::gradle wrapper 没下下来(第 $i 次),${d}s 后重试"
+            sleep "$d"; d=$((d * 2))
           done
           ./gradlew --version --no-daemon >/dev/null 2>&1 || {
             echo "::error::gradle wrapper 连试五次都没下下来 —— services.gradle.org 不可达"; exit 1; }
@@ -118,6 +127,14 @@ jobs:
           repository: Ireoo/Secret-Chat
           ref: ${{ env.SRC_REF }}
           token: ${{ secrets.SRC_REPO_TOKEN }}
+      # ★ 根治 wrapper 下载失败:把 gradle 发行包缓存起来,命中就完全不碰
+      #   services.gradle.org。#289 的 Tests(gate)就是被那台主机打红的 —— 重试只是
+      #   降低概率,不下载才是真正不会失败。key 跟着 wrapper properties 走:
+      #   换 gradle 版本自动失效,不会喂旧发行包。
+      - uses: actions/cache@v4
+        with:
+          path: ~/.gradle/wrapper/dists
+          key: gradle-dist-${{ runner.os }}-${{ hashFiles('android/gradle/wrapper/gradle-wrapper.properties') }}
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
@@ -139,10 +156,11 @@ jobs:
           # Build All #281 的 Android 腿就是被一次 `SocketException: Unexpected end of file
           # from server` 打红的(和同一次里 Qt aarch64 腿的 503 是同一个病根:外部下载零重试)。
           # 先带重试地预热一次 wrapper,再跑真正的构建。
-          for i in 1 2 3 4 5; do
+          d=2
+          for i in 1 2 3 4 5 6; do
             ./gradlew --version --no-daemon >/dev/null 2>&1 && break
-            echo "::warning::gradle wrapper 没下下来(第 $i 次),5 秒后重试"
-            sleep 5
+            echo "::warning::gradle wrapper 没下下来(第 $i 次),${d}s 后重试"
+            sleep "$d"; d=$((d * 2))
           done
           ./gradlew --version --no-daemon >/dev/null 2>&1 || {
             echo "::error::gradle wrapper 连试五次都没下下来 —— services.gradle.org 不可达"; exit 1; }
