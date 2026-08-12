@@ -263,6 +263,39 @@ jobs:
           name: macos-swiftui
           path: desktop/macos/out/*
 
+      # mac 端 555 条单测。**刻意排在产物上传之后**:测试红只让这条腿红(report-failures
+      # 会开 issue),DMG 已经传上去了,release 也照发 —— 与 Linux Qt 腿同一条策略:
+      # 「判红要看得见,但不拿发版当人质」。
+      #
+      # 为什么值得加:这一批(2026-08)补的守卫里,mac 独占的有 —— 本机控制通道的
+      # 「禁止登记方法」差集、通道 socket 权限 + umask 顺序、隐私闸门、开库真值表、
+      # 共用 E2E 固定向量、迁移 SAS 闸门。它们此前**只在有人本机跑 swift test 时才有效**。
+      # 工具链是现成的(上面 package-app.sh 已经 swift build -c release),几乎不加时长。
+      - name: macOS 单测 (swift test)
+        if: always()
+        working-directory: desktop/macos
+        shell: bash
+        run: |
+          set -o pipefail
+          rc=0
+          swift test 2>&1 | tee /tmp/swift-test.log || rc=$?
+          # ⚠️ 这个包里跑着**两套**框架:XCTest(555 条,汇总行 "Executed N tests")
+          #    和 swift-testing(11 条,汇总行 "Test run with N tests")。
+          #    只解析 XCTest 的失败数 = swift-testing 红了会被漏掉。
+          #    所以**判红以退出码为准**(它覆盖两套),条数只当「跑到没有」的哨兵。
+          nx=$(grep -oE "Executed [0-9]+ tests" /tmp/swift-test.log | tail -1 | grep -oE "[0-9]+" || echo 0)
+          ns=$(grep -oE "Test run with [0-9]+ tests" /tmp/swift-test.log | tail -1 | grep -oE "[0-9]+" || echo 0)
+          echo "swift test: XCTest ${nx:-0} 条 + swift-testing ${ns:-0} 条,退出码 $rc"
+          if [ "$rc" -ne 0 ]; then
+            grep -E "error:|XCTAssert.*failed|✘|failed after" /tmp/swift-test.log | head -40
+            echo "::error::mac 单测红了(exit $rc)"; exit 1
+          fi
+          if [ "${nx:-0}" -lt 300 ] || [ "${ns:-0}" -lt 5 ]; then
+            tail -40 /tmp/swift-test.log
+            echo "::error::只跑到 XCTest ${nx:-0} / swift-testing ${ns:-0} 条(期望 ≥300 / ≥5)—— 判据失配,不是「都通过了」"
+            exit 1
+          fi
+
   # ── macOS(第二条 mac 腿):Qt/QML 通用兼容版(arm64 + x86_64)。与上面的 SwiftUI 腿并存,
   # 用户在 release 里二选一 —— Swift = 苹果特效版(液态玻璃,macOS 14+);Qt = 兼容版,
   # minos 12.0 跑 macOS 12/13+ 与 Intel(Qt 不碰系统新 API)。这条解决「macOS 13 装不上」。
