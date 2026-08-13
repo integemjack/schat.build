@@ -455,7 +455,13 @@ jobs:
           set -euo pipefail
           BIN=build/qrimage_roundtrip_test
           [ -x "$BIN" ] || { echo "::error::$BIN 不存在 —— 它是 macOS-only target,本该在这条腿编出来"; exit 1; }
-          "$BIN"
+          # ⚠️ **QT_QPA_PLATFORM 必须显式给**(#293 就是栽在这):这个测试用 QGuiApplication,
+          #    默认想要 `offscreen` 平台插件,而**静态 Qt 只链了 cocoa** ——
+          #    `Could not find the Qt platform plugin "offscreen"` → Abort trap: 6(exit 134)。
+          #    本机动态 Qt 带 offscreen,所以本机跑得好好的,一上 CI 就炸。
+          #    Linux 腿早就为同一个坑显式设了 `QT_QPA_PLATFORM=xcb`(见 ci-linux-pkg.sh 那段注释)
+          #    —— 静态 kit 的平台插件是**链进去的那一个**,不是系统里有的那些。
+          QT_QPA_PLATFORM=cocoa "$BIN"
 
       # 「编出来了」不等于「静态成了」——CMake 找错 kit(机器上还有 brew 的动态 Qt)照样编得过,
       # 产物却在用户机上找不到 Qt。直接查 Mach-O 的加载命令。
