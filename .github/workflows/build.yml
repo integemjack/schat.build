@@ -315,9 +315,32 @@ jobs:
   release:
     name: Publish Release
     needs: [tests, android, desktop, server, docker, m5core2]
-    # `always()` 保留 —— 某条构建腿失败时仍发布已经成功的那些产物(既有行为)。
-    # **但测试没过就不发布**:门禁的意义就在这一行。
-    if: always() && needs.tests.result == 'success' 
+    # `always()` 保留 —— 某条构建腿**失败**时仍发布已经成功的那些产物(既有行为,刻意如此:
+    # 一次 Docker Hub 超时不该把桌面包一起扣住)。**但测试没过就不发布**。
+    #
+    # ★ 2026-08-24 补上「被取消」这一档。**失败与被取消要分开看**:
+    #
+    #   · 失败 = 那条腿真的编不出来 → 发布其余产物是有意义的取舍(上面那句);
+    #   · **被取消** = 多半是**下一次推送把这一轮顶掉了**(qt-desktop 是 reusable
+    #     workflow,自带并发组,只掐桌面那几条腿,而 `Publish Release` 照常跑完)——
+    #     这时发出去的是一个**残缺 tag**,而顶掉它的那一轮马上会发一个完整的。
+    #     纯噪音,还会在 main 上抢走 "Latest"。
+    #
+    #   实证(2026-08-24 拉 releases 数出来的):
+    #     b585 / b588 / b590 = **6~8 个资产**(桌面产物只剩 2~4)—— 全是被取消;
+    #     b586 = 12 个(Linux 腿 docker pull 超时)—— 真失败,按既有取舍照发;
+    #     b584 / b587 = 14 个**齐的**,尽管 mac 腿是红的 ——
+    #       因为 mac 的单测步骤**刻意排在 upload-artifact 之后**(见 qt-desktop.yml),
+    #       测试红不影响产物。这也说明「腿红」与「产物缺」根本不是一回事。
+    #
+    # 只列**往 release 里放产物**的四条腿;docker 推的是 GHCR,不产 release 资产
+    # (而且它真被取消时,整轮也已经被取消了)。
+    if: >-
+      always() && needs.tests.result == 'success'
+      && needs.android.result != 'cancelled'
+      && needs.desktop.result != 'cancelled'
+      && needs.server.result != 'cancelled'
+      && needs.m5core2.result != 'cancelled'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout source (changelog 用)
