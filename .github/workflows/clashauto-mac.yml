@@ -175,6 +175,78 @@ jobs:
           echo "identity=$IDENTITY" >> "$GITHUB_OUTPUT"
           echo "imported identity: $IDENTITY"
 
+      - name: Decode provisioning profiles
+        id: profiles
+        shell: bash
+        env:
+          PROF_APP: ${{ secrets.COAST_PROFILE_APP_BASE64 }}
+          PROF_TUN: ${{ secrets.COAST_PROFILE_TUNNEL_BASE64 }}
+        run: |
+          set -euo pipefail
+          # ★★★ **NetworkExtension 与 App Group 都是「需要 provisioning 的 entitlement」。**
+          #   光在 entitlements 里声明不算数：签名时系统会拿 bundle 里的
+          #   embedded.provisionprofile 去核对，profile 里没有的 entitlement 即使签进去了，
+          #   运行时也会被 AMFI 拒。
+          #   ⚠️ 两种错法的表现都极具误导性（2026-08-25 在真机上都实测过）：
+          #     · 签了 system-extension.install 而 profile 里没有 → 主程序**一启动就被
+          #       SIGKILL（rc=137），零日志零输出**，看着像程序自己崩了；
+          #     · 不签它 → OSSystemExtensionError 2，扩展装不上。
+          #   ⇒ profile 与 entitlements 是**一对**，缺一不可。
+          #
+          # ★ 两份**各自对应一个 App ID**（主程序 / 扩展），它们是两个独立 bundle、
+          #   各自签名。只给主程序那份的话，扩展签得上但装不进系统。
+          #
+          # ★ 描述文件在 developer.apple.com 上生成时，App ID 必须已经勾了
+          #   **Network Extensions** 与 **System Extension** 两个 capability
+          #   —— 只勾前者生成出来的 profile 里没有 system-extension.install。
+          if [ -z "${PROF_APP:-}" ] || [ -z "${PROF_TUN:-}" ]; then
+            echo "::error::缺 secrets COAST_PROFILE_APP_BASE64 / COAST_PROFILE_TUNNEL_BASE64 —— 没有描述文件就打不出带系统扩展的包"
+            exit 1
+          fi
+          mkdir -p "$RUNNER_TEMP/profiles"
+          printf '%s' "$PROF_APP" | base64 --decode > "$RUNNER_TEMP/profiles/app.provisionprofile"
+          printf '%s' "$PROF_TUN" | base64 --decode > "$RUNNER_TEMP/profiles/tunnel.provisionprofile"
+          # ★ 判「解出来的确实是 profile」而不是只判非空：base64 里少一个字符
+          #   解出来也是一堆字节，而那种坏文件要到 codesign 那一步才炸，报错还读不懂。
+          for f in app tunnel; do
+            pf="$RUNNER_TEMP/profiles/$f.provisionprofile"
+            security cms -D -i "$pf" > "$RUNNER_TEMP/profiles/$f.plist" 2>/dev/null || {
+              echo "::error::$f.provisionprofile 解不开 —— secret 里的 base64 多半是坏的"; exit 1; }
+            /usr/libexec/PlistBuddy -c "Print :Entitlements:com.apple.developer.networking.networkextension" \
+              "$RUNNER_TEMP/profiles/$f.plist" >/dev/null 2>&1 || {
+              echo "::error::$f 的描述文件里没有 networkextension entitlement —— App ID 上没勾 Network Extensions？"; exit 1; }
+          done
+          # 主程序那份还必须带装扩展的权限
+          /usr/libexec/PlistBuddy -c "Print :Entitlements:com.apple.developer.system-extension.install" \
+            "$RUNNER_TEMP/profiles/app.plist" >/dev/null 2>&1 || {
+            echo "::error::主程序的描述文件里没有 system-extension.install —— App ID 上要勾 System Extension 再重新生成"; exit 1; }
+          echo "app=$RUNNER_TEMP/profiles/app.provisionprofile" >> "$GITHUB_OUTPUT"
+          echo "tunnel=$RUNNER_TEMP/profiles/tunnel.provisionprofile" >> "$GITHUB_OUTPUT"
+          echo "两份描述文件就绪，entitlement 都在"
+
+      - name: Build libcoast (core as a static library)
+        id: libcoast
+        shell: bash
+        run: |
+          set -euo pipefail
+          # ★★★ **这条线的核心跑在系统扩展进程里，是编进去的静态库，不是外部二进制。**
+          #   扩展进程不能 fork/exec，所以 mihomo 必须以 c-archive 的形式链进去。
+          #   源码与 iOS 线**完全共用**（clashauto 仓库的 ios/core/*.go）——
+          #   `//go:build darwin` 覆盖 macOS，两边只有内存参数不同。
+          #
+          # ⚠️ 外部内核（Resources/core）**仍然要**，别以为可以省：
+          #   增强模式关着时核心跑在主进程里，提供 mixed-port（系统代理）与 REST（界面数据）。
+          #   两个核心各管一段，不是二选一。
+          if [ ! -f "$GITHUB_WORKSPACE/macos/scripts/build_libcoast_macos.sh" ]; then
+            echo "::error::源仓库里没有 macos/scripts/build_libcoast_macos.sh —— 检出的 source-sha 早于系统扩展那一轮。请构建更新的 sha。"
+            exit 1
+          fi
+          bash "$GITHUB_WORKSPACE/macos/scripts/build_libcoast_macos.sh" "$RUNNER_TEMP/libcoast"
+          LIB="$RUNNER_TEMP/libcoast/libcoast-macos.a"
+          [ -s "$LIB" ] || { echo "::error::libcoast 没编出来"; exit 1; }
+          echo "path=$LIB" >> "$GITHUB_OUTPUT"
+          ls -lh "$LIB" | awk '{print "libcoast: "$5}'
+
       - name: Package Coast.app (make_app.sh)
         working-directory: macos
         shell: bash
@@ -183,6 +255,13 @@ jobs:
           # Actions 共享出口 IP，匿名限流（60 次/时）几乎必中 —— 必须带 token。
           GITHUB_TOKEN: ${{ github.token }}
           SIGN_IDENTITY: ${{ steps.signcert.outputs.identity }}
+          # ★★ 这三个决定「包里有没有系统扩展」。三个缺任何一个，make_app.sh 都会
+          #   **静默打出一个没有扩展的包** —— 它对此是宽容的（本地开发常常不需要扩展），
+          #   而那种包装到用户机上的表现是「增强模式点了没反应」。
+          #   所以下面的结构断言必须跟着一起改，光传变量不够。
+          COAST_LIBCOAST: ${{ steps.libcoast.outputs.path }}
+          COAST_PROFILE_APP: ${{ steps.profiles.outputs.app }}
+          COAST_PROFILE_TUNNEL: ${{ steps.profiles.outputs.tunnel }}
         run: |
           set -euo pipefail
           # 打包（arm64 + 集成内核 + helper/内核/app 先内层后外层签名 + entitlements）
@@ -205,6 +284,36 @@ jobs:
           test -f Coast.app/Contents/Resources/bundle/config/config.yaml
           # helper identifier 必须 = launchd Label，错了 daemon 会被 Launch Constraint SIGKILL
           codesign -dvv Coast.app/Contents/MacOS/com.yuehongsun.coast.helper 2>&1 | grep -E 'Identifier|TeamIdentifier'
+
+          # ── 系统扩展：这条线的增强模式全靠它 ──────────────────────────────
+          #
+          # ★★★ 这几条断言**必须有**：make_app.sh 在 COAST_LIBCOAST 缺失时会打出一个
+          #   没有扩展的包而**不报错**（本地开发常常不需要扩展，那是它的正常行为）。
+          #   于是 secret 配错、libcoast 那步悄悄失败之类的问题，会一路绿灯走到发布，
+          #   用户拿到手才发现「增强模式点了没反应」。
+          SYSEX="Coast.app/Contents/Library/SystemExtensions/com.yuehongsun.coast.tunnel.systemextension"
+          test -d "$SYSEX" || { echo "::error::包里没有系统扩展 —— COAST_LIBCOAST/描述文件多半没传进去"; exit 1; }
+          test -x "$SYSEX/Contents/MacOS/CoastTunnel"
+          lipo -archs "$SYSEX/Contents/MacOS/CoastTunnel" | grep -q arm64
+          ! lipo -archs "$SYSEX/Contents/MacOS/CoastTunnel" | grep -q x86_64
+          # ★ 内核真的链进去了没有。**只判文件在不在是不够的** —— 没链内核时
+          #   CoastTunnel 照样编得出来（CoreBridge 走的是显式失败的桩），
+          #   体积差 100 倍但结构一模一样。判 Go 运行时的符号才是真判据。
+          nm "$SYSEX/Contents/MacOS/CoastTunnel" 2>/dev/null | grep -q "CoastStart" \
+            || { echo "::error::扩展里没有 CoastStart 符号 —— 内核没链进去，隧道起不来"; exit 1; }
+          # 两份描述文件都得在（主程序 + 扩展各一份）
+          test -f Coast.app/Contents/embedded.provisionprofile
+          test -f "$SYSEX/Contents/embedded.provisionprofile"
+          # 扩展的签名与 entitlement
+          codesign --verify --strict "$SYSEX"
+          codesign -d --entitlements - --xml "$SYSEX" 2>/dev/null \
+            | plutil -p - | grep -q "packet-tunnel-provider-systemextension" \
+            || { echo "::error::扩展的 entitlement 里没有 packet-tunnel-provider-systemextension"; exit 1; }
+          # 主程序要能装扩展
+          codesign -d --entitlements - --xml Coast.app 2>/dev/null \
+            | plutil -p - | grep -q "system-extension.install" \
+            || { echo "::error::主程序的 entitlement 里没有 system-extension.install —— 装不了扩展"; exit 1; }
+          echo "系统扩展就位：$(du -h "$SYSEX/Contents/MacOS/CoastTunnel" | cut -f1)"
 
       - name: Create DMG + notarize + staple
         shell: bash
