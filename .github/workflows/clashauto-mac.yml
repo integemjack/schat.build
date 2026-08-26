@@ -287,6 +287,19 @@ jobs:
           #   整套 UI 建在 Liquid Glass 上，给 Intel 再编一半只是把包撑大一倍。装不了 26 的
           #   机器走 Qt 线（-qt.dmg，13.0+、universal），那才是兼容腿。
           #   与 clashauto 仓库 release.yml 的 macos-swift job **必须保持一致**。
+          # ★★★ 诊断 + 预构建（2026-08-26 加）。
+          #   现象：libcoast 编出来了、COAST_LIBCOAST 也传进来了，但产出的 CoastTunnel
+          #   里没有 CoastStart —— 内核没链进去。同一份脚本在真 Mac 上、同样干净的目录、
+          #   同样只跑 make_app.sh，出来是 43M 且符号在。所以差异只可能在这台 runner 上，
+          #   得先把每一环打出来才判得了。
+          echo "COAST_LIBCOAST=[${COAST_LIBCOAST:-<空>}]"
+          ls -lh "${COAST_LIBCOAST:-/nonexistent}" || echo "!! 归档文件不在"
+          # ★ Package.swift 是**读环境变量**决定链不链的，而 SwiftPM 会缓存 manifest 的
+          #   求值结果。显式禁掉缓存单独构建一次，把这个变量从嫌疑名单里排掉。
+          swift build -c release --manifest-cache none
+          TUNBIN=".build/release/CoastTunnel"
+          echo "预构建后 CoastTunnel: $(du -m "$TUNBIN" 2>/dev/null | cut -f1) MB, CoastStart 符号 $(nm "$TUNBIN" 2>/dev/null | grep -c CoastStart) 处"
+
           bash scripts/make_app.sh --version "$APP_VERSION" --sign "$SIGN_IDENTITY"
           # 结构自查：架构、封存、内核/种子在位（缺了要等用户首启才炸）
           lipo -archs Coast.app/Contents/MacOS/Coast | grep -q arm64
@@ -315,6 +328,10 @@ jobs:
           # ★ 内核真的链进去了没有。**只判文件在不在是不够的** —— 没链内核时
           #   CoastTunnel 照样编得出来（CoreBridge 走的是显式失败的桩），
           #   体积差 100 倍但结构一模一样。判 Go 运行时的符号才是真判据。
+          # ★ 断言之前先把两个数打出来：体积能一锤定音 —— 链了内核是 40 MB 量级，
+          #   没链是 2~3 MB，而两者结构一模一样。只报「符号没找到」的话，
+          #   分不清是真没链还是这台机器上 nm 读不出来。
+          echo "包内 CoastTunnel: $(du -m "$SYSEX/Contents/MacOS/CoastTunnel" | cut -f1) MB, CoastStart 符号 $(nm "$SYSEX/Contents/MacOS/CoastTunnel" 2>/dev/null | grep -c CoastStart) 处"
           nm "$SYSEX/Contents/MacOS/CoastTunnel" 2>/dev/null | grep -q "CoastStart" \
             || { echo "::error::扩展里没有 CoastStart 符号 —— 内核没链进去，隧道起不来"; exit 1; }
           # 两份描述文件都得在（主程序 + 扩展各一份）
