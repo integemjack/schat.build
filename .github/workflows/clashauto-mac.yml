@@ -103,6 +103,10 @@ jobs:
           repository: ClashrAuto/clashauto
           ref: ${{ steps.trig.outputs.ref }}
           fetch-depth: 0
+          # ★★ 内核源码在 `clash` 子模块里 —— `build_libcoast_macos.sh` 把它解析成
+          #   `$REPO/clash`，不检出的话它在找不到 go 之后**紧接着**再挂一次
+          #   （`❌ 找不到内核源码`）。所以这一行与下面那个 setup-go 是一对，缺一不可。
+          submodules: recursive
           # 私有源仓库要显式给 token（见上一步的说明）。本仓库另有一个 SRC_REPO_TOKEN，
           # 那是 SChat 自己那条线的源仓库用的 —— 别混用，两个指向不同的仓库。
           token: ${{ secrets.SOURCE_TOKEN }}
@@ -223,6 +227,18 @@ jobs:
           echo "app=$RUNNER_TEMP/profiles/app.provisionprofile" >> "$GITHUB_OUTPUT"
           echo "tunnel=$RUNNER_TEMP/profiles/tunnel.provisionprofile" >> "$GITHUB_OUTPUT"
           echo "两份描述文件就绪，entitlement 都在"
+
+      - name: Set up Go
+        # ★★★ **这一步以前没有，于是 Swift 线的签名包从系统扩展那一轮起就没成功过一次。**
+        #   `build_libcoast_macos.sh` 第一件事就是找 go，找不到 exit 2，
+        #   报出来只有一行 `❌ 找不到 go` —— 而 Qt 线不需要它，所以同一个 tag 上
+        #   Qt 的 DMG 正常产出、Swift 的没有，release 看着只是「少一个包」。
+        # ★ 用 `stable` 而不是钉某个版本：内核的 go.mod 声明 `go 1.26`，
+        #   而 GOTOOLCHAIN 默认 auto —— 真机上实测 go1.24.6 也能编出来，
+        #   工具链会自己按 go.mod 升上去。钉版本只会多一处要跟着改的地方。
+        uses: actions/setup-go@v5
+        with:
+          go-version: stable
 
       - name: Build libcoast (core as a static library)
         id: libcoast
