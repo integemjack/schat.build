@@ -111,6 +111,24 @@ jobs:
           # 那是 SChat 自己那条线的源仓库用的 —— 别混用，两个指向不同的仓库。
           token: ${{ secrets.SOURCE_TOKEN }}
 
+      # ★★ 把四条线共用的 GeoIP 种子换成**最新**那份。**必须在构建之前** ——
+      #   Qt 走 qrc、Swift 走 Resources，都是**构建时**把种子读进去的。
+      #   ⚠️ 入库那份是 2022-09-08 的：它是个二进制，谁也不会想起来去更新它，
+      #   而全新安装的用户拿到的就是它。拿它和 2026-08-20 那份对 6 万个随机公网
+      #   IPv4 逐个查，7.44% 判定不同，其中 1.6% 是「旧库判 CN、实际已不是 CN」——
+      #   那一档会被错误直连，是断网方向。
+      #   ★ 下载失败**当场判红**，与「Bundle latest stable core」同一个理由：
+      #   「包里带一份四年前的 GeoIP」是静默劣化，出货之后没有任何人看得见。
+      # ★★★ 这一步与 clashauto 的 `release.yml` / Coast 的 `build.yml` 是**同一件事**，
+      #   但**必须在这里另写一份**：这条流水线检出 clashauto 的源码后**自己重建**，
+      #   不走 Coast 的 build.yml —— 少了它，用户实际拿到的**签名** DMG 里就还是旧种子，
+      #   而两边 CI 全绿、没有任何一条日志会提到这件事。
+      - name: Bundle latest GeoIP
+        shell: bash
+        run: |
+          PY=python3; command -v $PY >/dev/null 2>&1 || PY=python
+          "$PY" clashauto-c++/scripts/fetch_geoip.py
+
       - name: Resolve version/tag
         shell: bash
         env:
