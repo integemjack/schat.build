@@ -196,15 +196,28 @@ jobs:
           else
             echo "no dmg background asset — plain window"
           fi
+          # ⚠️ layout_dmg 在 `if ! ( … )` 的条件位里被调用 —— bash 在条件上下文中**整体忽略
+          # set -e**(函数体内再 set -e 也无效),任何一步失败都会继续往下跑,最后一条 `rm -f`
+          # 成功 → 函数返回 0 → plain-dmg 兜底不触发,整步只剩「ERROR: dmg was not created」。
+          # run 33583386581 实证:Spotlight 索引新挂的卷 → eject "Resource busy" → convert
+          # "Resource temporarily unavailable" → 整腿红。所以:关键命令逐条 `|| return 1`,
+          # 且 eject/convert 与下面兜底里的 create 同款重试 —— 瞬态 busy 是 CI 常态。
+          detach_retry() {   # hdiutil detach -force + 重试;Spotlight 松手需要时间
+            for i in 1 2 3 4; do
+              hdiutil detach "$1" -force && return 0
+              [ -d "$1" ] || return 0   # 报了错但挂载点已消失 = 实际已卸载
+              echo "hdiutil detach $1 failed (attempt $i/4) — retrying in 8s"; sleep 8
+            done
+            return 1
+          }
           layout_dmg() {
-            set -e
             RW="$RUNNER_TEMP/schat-rw.dmg"
             rm -f "$RW"
             hdiutil detach "/Volumes/SChat" -force >/dev/null 2>&1 || true
-            hdiutil create -volname "SChat" -srcfolder "$DMGSTAGE" -ov -format UDRW "$RW"
-            hdiutil attach "$RW" -noautoopen
+            hdiutil create -volname "SChat" -srcfolder "$DMGSTAGE" -ov -format UDRW "$RW" || return 1
+            hdiutil attach "$RW" -noautoopen || return 1
             sleep 2
-            osascript <<'OSA'
+            osascript <<'OSA' || return 1
           tell application "Finder"
             tell disk "SChat"
               open
@@ -227,9 +240,12 @@ jobs:
           end tell
           OSA
             sync
-            hdiutil detach "/Volumes/SChat" -force
-            hdiutil convert "$RW" -format UDZO -o "$DMG" -ov
-            rm -f "$RW"
+            detach_retry "/Volumes/SChat" || return 1
+            for i in 1 2 3 4; do
+              hdiutil convert "$RW" -format UDZO -o "$DMG" -ov && { rm -f "$RW"; return 0; }
+              echo "hdiutil convert failed (attempt $i/4) — retrying in 8s"; sleep 8
+            done
+            return 1
           }
           if ! ( layout_dmg ); then
             echo "custom dmg layout failed — falling back to plain dmg"
@@ -628,15 +644,28 @@ jobs:
           else
             echo "no dmg background asset (old source checkout) — plain window"
           fi
+          # ⚠️ layout_dmg 在 `if ! ( … )` 的条件位里被调用 —— bash 在条件上下文中**整体忽略
+          # set -e**(函数体内再 set -e 也无效),任何一步失败都会继续往下跑,最后一条 `rm -f`
+          # 成功 → 函数返回 0 → plain-dmg 兜底不触发,整步只剩「ERROR: dmg was not created」。
+          # run 33583386581 实证:Spotlight 索引新挂的卷 → eject "Resource busy" → convert
+          # "Resource temporarily unavailable" → 整腿红。所以:关键命令逐条 `|| return 1`,
+          # 且 eject/convert 与下面兜底里的 create 同款重试 —— 瞬态 busy 是 CI 常态。
+          detach_retry() {   # hdiutil detach -force + 重试;Spotlight 松手需要时间
+            for i in 1 2 3 4; do
+              hdiutil detach "$1" -force && return 0
+              [ -d "$1" ] || return 0   # 报了错但挂载点已消失 = 实际已卸载
+              echo "hdiutil detach $1 failed (attempt $i/4) — retrying in 8s"; sleep 8
+            done
+            return 1
+          }
           layout_dmg() {
-            set -e
             RW="$RUNNER_TEMP/schat-rw.dmg"
             rm -f "$RW"
             hdiutil detach "/Volumes/SChat" -force >/dev/null 2>&1 || true
-            hdiutil create -volname "SChat" -srcfolder "$DMGSTAGE" -ov -format UDRW "$RW"
-            hdiutil attach "$RW" -noautoopen
+            hdiutil create -volname "SChat" -srcfolder "$DMGSTAGE" -ov -format UDRW "$RW" || return 1
+            hdiutil attach "$RW" -noautoopen || return 1
             sleep 2
-            osascript <<'OSA'
+            osascript <<'OSA' || return 1
           tell application "Finder"
             tell disk "SChat"
               open
@@ -659,9 +688,12 @@ jobs:
           end tell
           OSA
             sync
-            hdiutil detach "/Volumes/SChat" -force
-            hdiutil convert "$RW" -format UDZO -o "$DMG" -ov
-            rm -f "$RW"
+            detach_retry "/Volumes/SChat" || return 1
+            for i in 1 2 3 4; do
+              hdiutil convert "$RW" -format UDZO -o "$DMG" -ov && { rm -f "$RW"; return 0; }
+              echo "hdiutil convert failed (attempt $i/4) — retrying in 8s"; sleep 8
+            done
+            return 1
           }
           if ! ( layout_dmg ); then
             echo "custom dmg layout failed — falling back to plain dmg"
