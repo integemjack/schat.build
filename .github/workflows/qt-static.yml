@@ -58,9 +58,15 @@ env:
   #   qtimageformats 头像等非 png/jpg 格式
   #   qtwebsockets  QtTransport 的 bare-WS
   #   qt5compat     Main.qml 的 Qt5Compat.GraphicalEffects(模糊)
-  # **刻意不含 qtsvg / qtmultimedia**:全仓没有一处 import 或链接(图标是 QtQuick.Shapes 画的
-  # 路径不是 .svg 文件;语音走 miniaudio + MF/ffmpeg)。动态时代 CI 顺手装了它俩,是历史包袱。
-  QT_SUBMODULES: "qtbase,qtshadertools,qtdeclarative,qtimageformats,qtwebsockets,qt5compat"
+  #   qtmultimedia  朋友圈封面的**视频背景**(2026-09-08 起):`MomentsVideoBackground.qml` 的
+  #                 MediaPlayer/VideoOutput,以及 app-qt/CMakeLists.txt 里那段
+  #                 `find_package(Qt6 QUIET COMPONENTS Multimedia)` → `SCHAT_HAVE_MULTIMEDIA=1`。
+  #                 ⚠️ 它是**可选依赖**:编不进去时源仓照常构建,只是封面退回首帧静图
+  #                 (`chat.videoBackgroundSupported` 为假,Loader 不加载那份 qml)——
+  #                 所以「构建绿」不代表视频能放,判据在下面 verify 那步。
+  # **刻意不含 qtsvg**:全仓没有一处 import 或链接它(图标是 QtQuick.Shapes 画的路径,不是 .svg
+  # 文件)。语音仍走 miniaudio + MF/ffmpeg,不经 QtMultimedia。
+  QT_SUBMODULES: "qtbase,qtshadertools,qtdeclarative,qtimageformats,qtwebsockets,qt5compat,qtmultimedia"
 
 jobs:
   # 单腿重跑用(某个平台编挂了、修完只想重编它):release 按 tag **追加**资产,已经成功的
@@ -268,6 +274,24 @@ jobs:
             grep -q x86_64 /tmp/lipo.txt || { echo "FATAL: 缺 x86_64 slice"; exit 1; }
             grep -q arm64  /tmp/lipo.txt || { echo "FATAL: 缺 arm64 slice"; exit 1; }
           fi
+
+          # ── qtmultimedia 真的编进来了吗(2026-09-08)────────────────────────────────
+          # 「构建绿」不等于「视频能放」:源仓那边是 `find_package(Qt6 QUIET COMPONENTS Multimedia)`,
+          # **找不到就静静跳过**,朋友圈封面退回首帧静图,没有任何报错。少了这条断言,
+          # 一次配置漂移会安静地把视频背景从整条发布线上撤掉,而没人会发现。
+          [ -f "$P/lib/cmake/Qt6Multimedia/Qt6MultimediaConfig.cmake" ] \
+            || { echo "FATAL: kit 里没有 Qt6Multimedia —— QT_SUBMODULES 漂了,朋友圈视频封面会静默退回静图"; exit 1; }
+          # 后端也要在:一个没有后端的 QtMultimedia 编得过、跑起来一放就失败,
+          # 那比「没编进去」更糟(没编进去至少会走静图那条已知回退路径)。
+          find "$P" -name '*ffmpegmediaplugin*' -o -name '*FFmpegMediaPlugin*' > /tmp/mmbackend.txt || true
+          if [ "${{ matrix.plat }}" != "macos-universal" ]; then
+            [ -s /tmp/mmbackend.txt ] \
+              || { echo "FATAL: 没有 FFmpeg 媒体后端插件 —— 装 Qt 依赖那步漏了 libav*-dev"; \
+                   find "$P" -name '*mediaplugin*' -o -name '*MediaPlugin*'; exit 1; }
+          fi
+          cat /tmp/mmbackend.txt
+          echo "OK: qtmultimedia 在 kit 里"
+
           echo "OK: 静态 kit"
 
       - name: Pack tarball
@@ -296,7 +320,7 @@ jobs:
             由 `desktop/desktop-qt/scripts/fetch-static-qt.sh` 下载校验。
 
             submodules: `${{ env.QT_SUBMODULES }}`
-            (不含 qtsvg / qtmultimedia —— 源仓没有任何一处 import 或链接它们)
+            (不含 qtsvg —— 源仓没有任何一处 import 或链接它)
 
             Windows 不在这里:那条腿用 MSYS2 的 `mingw-w64-x86_64-qt6-static` 包。
           files: |
