@@ -349,8 +349,21 @@ jobs:
           # ★ 断言之前先把两个数打出来：体积能一锤定音 —— 链了内核是 40 MB 量级，
           #   没链是 2~3 MB，而两者结构一模一样。只报「符号没找到」的话，
           #   分不清是真没链还是这台机器上 nm 读不出来。
-          echo "包内 CoastTunnel: $(du -m "$SYSEX/Contents/MacOS/CoastTunnel" | cut -f1) MB, CoastStart 符号 $(nm "$SYSEX/Contents/MacOS/CoastTunnel" 2>/dev/null | grep -c CoastStart) 处"
-          nm "$SYSEX/Contents/MacOS/CoastTunnel" 2>/dev/null | grep -q "CoastStart" \
+          # ★★ 数只算一次，而且必须用 `grep -c` 不能用 `grep -q`。
+          #   `-q` 一命中就退出并关掉管道 —— nm 在 40 MB 量级的二进制上还远没写完
+          #   （输出几十万行，远超管道缓冲区），于是吃 SIGPIPE 退 141；而 GitHub 的
+          #   `shell: bash` 是 `-e -o pipefail`，整条管线因此判失败。
+          #   表现极具误导性：上一行刚打印「CoastStart 符号 2 处」，下一行就报
+          #   「没有 CoastStart 符号」—— 同一个 nm、同一个二进制，只因 -c 读到底、
+          #   -q 提前关管道。2026-08-26 的「加诊断」那一版撞见过这个现象并记下
+          #   「同一份脚本在真机上是对的」，但没发现诊断与守卫的差别正好就是病因。
+          #   它是竞态（nm 写得快就不触发），所以 08-29～09-05 一直是绿的。
+          #   ⚠️ `grep -c` 在计数为 0 时退出码是 1，`set -e` 会当场杀掉这一步，
+          #   所以要 `|| true` —— 判断交给下面那行，否则「没链内核」会退化成
+          #   一条没有任何说明的失败。
+          syms=$(nm "$SYSEX/Contents/MacOS/CoastTunnel" 2>/dev/null | grep -c CoastStart || true)
+          echo "包内 CoastTunnel: $(du -m "$SYSEX/Contents/MacOS/CoastTunnel" | cut -f1) MB, CoastStart 符号 ${syms:-0} 处"
+          [ "${syms:-0}" -gt 0 ] \
             || { echo "::error::扩展里没有 CoastStart 符号 —— 内核没链进去，隧道起不来"; exit 1; }
           # 两份描述文件都得在（主程序 + 扩展各一份）
           test -f Coast.app/Contents/embedded.provisionprofile
