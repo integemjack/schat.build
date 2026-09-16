@@ -19,6 +19,10 @@
 //  4. fetches the existing version index from the fixed `version` tag, merges this
 //     build's entries in by (line,os,arch,channel), and writes it back (`-index`)
 //     + a stable-only schema-1 mirror (`-index-manifest`) for the same fixed tag.
+//  5. asserts every (line/os/arch) named in RELEASE_REQUIRE_LINES actually came out
+//     of THIS run — 索引写完之后才判,少一条就 exit 1(索引照发,红的是信号)。
+//     没有这一条的话,某条腿没打出包 = 那一端在索引里**原样不动**而流水线全绿,
+//     对外就是「打了包但 version.json 没更新那一端」。见文件下半部那段长注释。
 //
 // The self-hosted upload leg (jiami.chat) is RETIRED — clients now read the index
 // off GitHub directly and pull bytes from the release assets.
@@ -458,6 +462,87 @@ func stableOnly(entries []lineManifest, generatedAt int64) combinedManifest {
 	return combinedManifest{Schema: 1, Channel: "stable", GeneratedAt: generatedAt, Manifests: out}
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// 「这次该产出的腿,一条都不许少」闸门(2026-09-16)
+//
+// mergeIndex 对**本次没产出**的 (line,os,arch,channel) 是**原样保留**的 —— 那是刻意的
+// (见它上面那段:一次网络抖动不该让没构建的平台静默停更)。但这条保留有影子面:
+// 某条腿真的没打出包时,索引里它那条**不动**,而 release 照发、tag 照跳、更新说明照写
+// 新版本 —— 而且**没有任何一处会说话**。对外的表现正是「在 schat.build 上打了包,
+// version.json 却没更新那一端」。
+//
+// 最容易踩到的是 **mac(SwiftUI)腿**:它的 upload-artifact 排在**公证之后**
+// (政策:release 里绝不放未公证 dmg),而公证是 `notarytool submit --wait --timeout 45m`
+// —— Apple 那边排一次队超时,这条腿就没有产物;而 release job 是 `always()`,
+// 照样把其余产物发出去、把其余各条索引刷新。历史上这条路真的走过:2026-08-24 之前
+// 有 26 个 release **一个 mac 包都没有**(那批是被下一轮顶掉的「取消」,已由
+// build.yml 的 `!= 'cancelled'` 堵上);而「腿失败」这一支至今是敞着的。
+//
+// 于是这里加一条**显式清单**:调用方用 RELEASE_REQUIRE_LINES 声明「本次构建必须产出
+// 哪几组」,少一组就把这一步判红。⚠️ 索引**仍然照写照发** —— 保留旧条目是安全方向
+// (那些平台还能装旧包),红的是**信号**,由 build.yml 的 Gate + report-failures 接手。
+//
+// 留空 = 不判(独立 dispatch / 本地 dry run 的既有用法一律不受影响)。
+// ─────────────────────────────────────────────────────────────────────────────
+
+type groupKey struct{ line, os, arch string }
+
+func (g groupKey) String() string { return g.line + "/" + g.os + "/" + g.arch }
+
+// parseRequired 解析 "line/os/arch" 的逗号/空白分隔清单。写错一处(少一段、多一段、
+// 空段)一律报错而不是静默跳过 —— 一条**永远不会命中**的必需项 = 这道闸门等于没有,
+// 而它看起来还是配好了的。
+func parseRequired(s string) ([]groupKey, error) {
+	var out []groupKey
+	for _, tok := range strings.FieldsFunc(s, func(r rune) bool {
+		return r == ',' || r == ' ' || r == '\t' || r == '\n' || r == '\r'
+	}) {
+		parts := strings.Split(tok, "/")
+		if len(parts) != 3 || parts[0] == "" || parts[1] == "" || parts[2] == "" {
+			return nil, fmt.Errorf("%q 不是一个 line/os/arch 三段式", tok)
+		}
+		out = append(out, groupKey{parts[0], parts[1], parts[2]})
+	}
+	return out, nil
+}
+
+// missingRequired 返回**本次构建没有产出**的必需组,保持清单里的顺序。
+// 判的是 fresh(这一轮真的签出了包的那些组),**不是** merged —— merged 里有上一轮
+// 留下的旧条目,拿它判等于永远绿。
+func missingRequired(fresh []lineManifest, required []groupKey) []groupKey {
+	have := map[groupKey]bool{}
+	for _, m := range fresh {
+		have[groupKey{m.Line, m.OS, m.Arch}] = true
+	}
+	var missing []groupKey
+	for _, k := range required {
+		if !have[k] {
+			missing = append(missing, k)
+		}
+	}
+	return missing
+}
+
+// reportMissing 把「少了哪条腿」和「索引里那条现在还是什么」一起打出来 —— 只说
+// 「少了 mac」的话,看日志的人还得再拉一次索引才知道用户手上会拿到什么版本。
+func reportMissing(missing []groupKey, merged []lineManifest, channel, buildTag string) {
+	fmt.Printf("\n[release-signer] ❌ 本次构建没有产出下面这些腿的包,version.json 里它们**原样没动**:\n")
+	for _, k := range missing {
+		stale := "索引里也没有这一条(这条腿从来没进过索引)"
+		for _, m := range merged {
+			if m.Line == k.line && m.OS == k.os && m.Arch == k.arch && m.Channel == channel {
+				stale = fmt.Sprintf("索引里仍是 v%s @ %s", m.Version, m.BuildTag)
+				break
+			}
+		}
+		fmt.Printf("[release-signer]    %-24s [%s] %s\n", k.String(), channel, stale)
+	}
+	fmt.Printf("[release-signer]    本次 release = %s;更新说明写的是新版本,而上面这些端拿到的仍是旧包。\n", buildTag)
+	fmt.Printf("[release-signer]    去看对应那条构建腿 —— mac(SwiftUI)的产物排在**公证之后**才上传,\n")
+	fmt.Printf("[release-signer]    `notarytool submit --wait` 超时是最常见的一种「腿红但 release 照发」。\n")
+	fmt.Printf("[release-signer]    确属本次刻意不构建的,把它从 RELEASE_REQUIRE_LINES 里删掉(别拿 FORCE 绕)。\n\n")
+}
+
 func main() {
 	var (
 		dir           = flag.String("dir", "dist", "flattened release-asset directory to walk")
@@ -478,6 +563,12 @@ func main() {
 	// whose download links 404, so refuse to run.
 	buildTag := strings.TrimSpace(os.Getenv("RELEASE_TAG"))
 	force := isTruthy(os.Getenv("RELEASE_INDEX_FORCE"))
+	// 本次构建**必须**产出的 (line/os/arch) 清单 —— 少一条就把这一步判红(索引照写)。
+	// 空 = 不判。见上面「这次该产出的腿,一条都不许少」那段。
+	required, err := parseRequired(os.Getenv("RELEASE_REQUIRE_LINES"))
+	if err != nil {
+		fatal("RELEASE_REQUIRE_LINES: %v", err)
+	}
 
 	publishedAt := time.Now().UnixMilli()
 	if s := strings.TrimSpace(os.Getenv("RELEASE_PUBLISHED_AT")); s != "" {
@@ -554,26 +645,39 @@ func main() {
 	fmt.Printf("[release-signer] wrote manifest %s (%d asset(s), %d group(s))\n", *manifest, len(assets), len(cm.Manifests))
 
 	// 3. the version index on the fixed tag: fetch → merge → write.
+	//    ⚠️ 这里**不能**提前 return —— 第 4 步那道「该产出的腿一条都不许少」的闸门
+	//    在 -no-index 下同样要判(它判的是本次产出,与索引写不写无关)。
+	var merged []lineManifest
 	if *skipIndexFlag {
 		fmt.Printf("[release-signer] -no-index set — skipping the version index\n")
-		return
-	}
-	client := &http.Client{Timeout: 60 * time.Second}
-	existing := fetchExistingIndex(client, repo, strings.TrimSpace(os.Getenv("GITHUB_TOKEN")))
-	merged := mergeIndex(existing.Releases, fresh, force)
-	writeJSON(*indexOut, versionIndex{Schema: indexSchema, GeneratedAt: publishedAt, Releases: merged})
-	fmt.Printf("[release-signer] wrote index %s (%d entries)\n", *indexOut, len(merged))
-	for _, e := range merged {
-		fmt.Printf("[release-signer]   %-7s %-7s %-9s [%-6s] v%-12s %d asset(s) @ %s\n",
-			e.Line, e.OS, e.Arch, e.Channel, e.Version, len(e.Assets), e.BuildTag)
-	}
-	if *indexMirror != "" {
-		if err := os.MkdirAll(filepath.Dir(*indexMirror), 0o755); err != nil {
-			fatal("mkdir for %s: %v", *indexMirror, err)
+	} else {
+		client := &http.Client{Timeout: 60 * time.Second}
+		existing := fetchExistingIndex(client, repo, strings.TrimSpace(os.Getenv("GITHUB_TOKEN")))
+		merged = mergeIndex(existing.Releases, fresh, force)
+		writeJSON(*indexOut, versionIndex{Schema: indexSchema, GeneratedAt: publishedAt, Releases: merged})
+		fmt.Printf("[release-signer] wrote index %s (%d entries)\n", *indexOut, len(merged))
+		for _, e := range merged {
+			fmt.Printf("[release-signer]   %-7s %-7s %-9s [%-6s] v%-12s %d asset(s) @ %s\n",
+				e.Line, e.OS, e.Arch, e.Channel, e.Version, len(e.Assets), e.BuildTag)
 		}
-		mirror := stableOnly(merged, publishedAt)
-		writeJSON(*indexMirror, mirror)
-		fmt.Printf("[release-signer] wrote index mirror %s (%d stable group(s))\n", *indexMirror, len(mirror.Manifests))
+		if *indexMirror != "" {
+			if err := os.MkdirAll(filepath.Dir(*indexMirror), 0o755); err != nil {
+				fatal("mkdir for %s: %v", *indexMirror, err)
+			}
+			mirror := stableOnly(merged, publishedAt)
+			writeJSON(*indexMirror, mirror)
+			fmt.Printf("[release-signer] wrote index mirror %s (%d stable group(s))\n", *indexMirror, len(mirror.Manifests))
+		}
+	}
+
+	// 4. 「该产出的腿,一条都不许少」—— 放在最后,索引已经写完(且由后面那步照常发布),
+	//    这样「保留旧条目」这个安全方向不变,变的只是**它不再悄无声息**。
+	if len(required) > 0 {
+		if missing := missingRequired(fresh, required); len(missing) > 0 {
+			reportMissing(missing, merged, channel, buildTag)
+			os.Exit(1)
+		}
+		fmt.Printf("[release-signer] required lines all present this run (%d/%d)\n", len(required), len(required))
 	}
 }
 

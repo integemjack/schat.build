@@ -388,3 +388,81 @@ func TestMissingReleaseTagIsFatal(t *testing.T) {
 		t.Errorf("error message should name RELEASE_TAG; got:\n%s", out)
 	}
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 「该产出的腿一条都不许少」闸门(2026-09-16)
+//
+// mergeIndex 保留缺席腿是**刻意**的(TestMergeKeepsAbsentLegs 钉着它),而这一组
+// 钉的是它的影子面:保留下来的那条**必须被喊出来**,否则「打了包 / 索引没动」
+// 这件事在流水线上没有任何一处会说话。
+// ─────────────────────────────────────────────────────────────────────────────
+
+func TestParseRequiredTriples(t *testing.T) {
+	got, err := parseRequired("macos/mac/arm64, qt/windows/x64\nandroid/android/universal")
+	if err != nil {
+		t.Fatalf("parseRequired: %v", err)
+	}
+	want := []groupKey{
+		{"macos", "mac", "arm64"},
+		{"qt", "windows", "x64"},
+		{"android", "android", "universal"},
+	}
+	if len(got) != len(want) {
+		t.Fatalf("got %d triples, want %d: %+v", len(got), len(want), got)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("triple %d = %v, want %v", i, got[i], want[i])
+		}
+	}
+	if empty, err := parseRequired("   "); err != nil || len(empty) != 0 {
+		t.Errorf("empty list must parse to no requirement, got %+v / %v", empty, err)
+	}
+	// 写坏的清单必须**报错**,不能静默跳过 —— 一条永远不会命中的必需项 =
+	// 闸门等于没有,而配置看上去还是配好了的。
+	for _, bad := range []string{"macos/mac", "macos/mac/arm64/extra", "macos//arm64", "/mac/arm64"} {
+		if _, err := parseRequired(bad); err == nil {
+			t.Errorf("parseRequired(%q) must fail — a never-matching requirement silently disables the gate", bad)
+		}
+	}
+}
+
+func TestMissingRequiredNamesTheAbsentLeg(t *testing.T) {
+	required, err := parseRequired("macos/mac/arm64,qt/mac/universal,qt/windows/x64")
+	if err != nil {
+		t.Fatalf("parseRequired: %v", err)
+	}
+	// 这一轮 mac(SwiftUI)没产出 —— 公证超时那种。
+	fresh := []lineManifest{
+		entry("qt", "mac", "universal", "beta", "9.16.41"),
+		entry("qt", "windows", "x64", "beta", "9.16.41"),
+	}
+	missing := missingRequired(fresh, required)
+	if len(missing) != 1 || missing[0] != (groupKey{"macos", "mac", "arm64"}) {
+		t.Fatalf("missing = %+v, want exactly [macos/mac/arm64]", missing)
+	}
+	// 全都产出了就必须是空 —— 否则这道闸门会把正常的发布也判红。
+	full := append(append([]lineManifest{}, fresh...), entry("macos", "mac", "arm64", "beta", "9.16.39"))
+	if m := missingRequired(full, required); len(m) != 0 {
+		t.Fatalf("all legs present but missing = %+v", m)
+	}
+}
+
+// 判的必须是**本次产出**(fresh),不是合并后的索引(merged)—— 拿 merged 判的话,
+// 上一轮留下的旧 mac 条目会让闸门永远绿,而那正是它要抓的那个状态。
+func TestMissingRequiredIgnoresTheStaleIndexEntry(t *testing.T) {
+	required, _ := parseRequired("macos/mac/arm64")
+	existing := []lineManifest{entry("macos", "mac", "arm64", "beta", "9.16.36")}
+	fresh := []lineManifest{entry("qt", "windows", "x64", "beta", "9.16.41")}
+
+	merged := mergeIndex(existing, fresh, false)
+	if v := find(t, merged, entryKey{"macos", "mac", "arm64", "beta"}).Version; v != "9.16.36" {
+		t.Fatalf("merged kept mac at %s, want the stale 9.16.36 (that is the preserved-leg behaviour)", v)
+	}
+	if m := missingRequired(merged, required); len(m) != 0 {
+		t.Fatalf("sanity: merged DOES contain mac — %+v", m)
+	}
+	if m := missingRequired(fresh, required); len(m) != 1 {
+		t.Fatalf("the gate must judge THIS run's output: missing = %+v, want [macos/mac/arm64]", m)
+	}
+}

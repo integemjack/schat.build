@@ -439,6 +439,28 @@ jobs:
           # The per-line changelog (same body attached to the GitHub release above) — lands in the
           # manifest/index `notes`+`body`. Without it the 更新说明 renders blank on all three ends.
           RELEASE_NOTES: ${{ steps.cl.outputs.body }}
+          # ★ 2026-09-16 —— Build All **必须**产出的六组;少一组就把本步判红(索引照写照发)。
+          #
+          # 为什么要有这一行:signer 的 mergeIndex 对本次没产出的 (line,os,arch,channel)
+          # 是**原样保留**的(刻意:一次网络抖动不该让没构建的平台静默停更)。可它的影子面是
+          # ——某条腿真没打出包时,索引里那一端**不动**,而 release 照发、tag 照跳、更新说明照写
+          # 新版本,**整条流水线不响一声**。对外就是「在 schat.build 上打了包,version.json
+          # 却没更新那一端」。上面那个 `always()` 正是为了「一条腿红不扣住其余产物」而写的,
+          # 所以这种状态是**设计内**会发生的,只是此前没有任何一处把它说出来。
+          #
+          # mac(SwiftUI)最容易踩:它的 upload-artifact 排在**公证之后**(政策:release 里
+          # 绝不放未公证 dmg),而公证是 `notarytool submit --wait --timeout 45m` —— Apple
+          # 侧排一次队超时,这条腿就没有产物。
+          #
+          # ⚠️ 这张表是**手写**的,加一条发布腿(比如哪天 macos 线也出 universal)要回来加一行;
+          #    源仓的 `scripts/check-release-index-requires-all-lines.py` 钉住「表和 signer 都还在」。
+          RELEASE_REQUIRE_LINES: >-
+            macos/mac/arm64,
+            qt/mac/universal,
+            qt/windows/x64,
+            qt/linux/x64,
+            qt/linux/arm64,
+            android/android/universal
         run: |
           cd _ci/tools/release-signer
           go run . \
@@ -483,7 +505,9 @@ jobs:
       - name: Gate — the version index must have been updated
         if: always() && steps.sign.outcome == 'failure'
         run: |
-          echo "::error::版本索引未更新 —— qt / macOS / Android 三端都不会看到本次发布"
+          echo "::error::版本索引未更新,或本次该产出的某条腿没进索引 —— 看上一步 release-signer 的输出:"
+          echo "::error::  · signer 整个失败 ⇒ qt / macOS / Android 三端都不会看到本次发布;"
+          echo "::error::  · RELEASE_REQUIRE_LINES 少了某组 ⇒ 索引里那一端**原样是旧版本**(release 照发了)。"
           exit 1
 
   # 任何构建腿失败 → 在本仓库(schat.build)开/追评一个 issue;恢复绿 → 自动关闭。
