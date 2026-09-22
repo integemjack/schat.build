@@ -1068,7 +1068,58 @@ jobs:
           name: qt-linux-${{ matrix.arch }}
           path: desktop/desktop-qt/out/*
 
-  # NOTE: no release job here on purpose — the three build jobs above only upload artifacts.
+  # ── QML 接收者判据(qt 9.17.6 起)──────────────────────────────────────────────
+  #
+  # 治的病:QML 把**自家的成员挂到错的接收者上** —— `caRoot.startOfWeek(...)`,而
+  # `startOfWeek` 声明在消息列表那个 ListView 上。运行时的表现只有「这个功能没反应」:
+  # 调方法抛 TypeError(那条语句整段死掉)、读属性恒 undefined、写属性抛错,
+  # **三种都不崩、不弹、日志之外看不见**。2026-09-22 一天之内在同一个文件里抓出四处,
+  # 其中「时间分隔条」那一处已经坏了整整一个月(qt 9.15.713 起),而当时**所有测试、
+  # 全部 291 条守卫、三端格式判据全是绿的** —— 那些判据比的是源码文本,
+  # 「格式串对得上」不等于「那段代码跑得通」。
+  #
+  # 判据 = qmllint(类型知识)∩ 源码结构(意图):qmllint 说「X 不是类型 T 的成员」,
+  # 且 X 在同一个 .qml 里被**另一个对象**声明过,且接收者是这个文件里的一个 id ⇒ 判红。
+  # 全量 qmllint 警告(2000+)**刻意不判** —— 详见源仓 scripts/qmllint-gate.py 的抬头。
+  #
+  # ⚠️ 为什么不塞进上面那三条打包腿:
+  #   ① 打包用的**静态 Qt kit 里根本没有 qmllint**(实测 6.8.4 的 kit:libexec 只有
+  #      qmlcachegen / qmlimportscanner / qmltyperegistrar,连 bin/ 都没打进去);
+  #   ② **打包腿一红就没有包**。本仓吃过这口:mac 单测挂在打包腿上连红四轮没人接,
+  #      桌面包跟着几轮没出;后来才把 mac 单测挪到 upload-artifact 之后。判据该有自己的腿。
+  # 这条腿 ~2 分钟(apt 装 Qt6 工具包,不编 Qt、不编本项目),它红**不会扣住产物** ——
+  # build.yml 的 release job 只在「被取消」时才不发布。
+  qmllint:
+    name: QML lint (接收者判据)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          repository: Ireoo/Secret-Chat
+          ref: ${{ env.SRC_REF }}
+          token: ${{ secrets.SRC_REPO_TOKEN }}
+
+      # ⚠️ **不要改成 `apt-get install qt6-declarative-dev-tools`**(2026-09-22 查过):
+      #    Ubuntu 24.04 那份是 **Qt 6.4.2**,而 qmllint 的输出在 6.4 与 6.8 之间变过两处 ——
+      #    措辞 `Property "x" not found` → `Member "x" not found`,分类 `[property]` →
+      #    `[missing-property]`。用 6.4 去 lint 一个按 6.8.4 写的工程,判据自检会当场红。
+      #    这里**跟着打包用的 kit 版本走**(SCHAT_QT_STATIC_VER),lint 与真正编出来的
+      #    那份 Qt 同版本,免得两边各说各话。
+      - name: 装 qmllint(Qt ${{ env.SCHAT_QT_STATIC_VER }},与打包 kit 同版本)
+        run: |
+          python3 -m pip install --quiet aqtinstall
+          python3 -m aqt install-qt linux desktop "$SCHAT_QT_STATIC_VER" linux_gcc_64 --outputdir /opt/qt
+          echo "QMLLINT=/opt/qt/$SCHAT_QT_STATIC_VER/gcc_64/bin/qmllint" >> "$GITHUB_ENV"
+          "/opt/qt/$SCHAT_QT_STATIC_VER/gcc_64/bin/qmllint" --version
+
+      # 判据自己先自检:拿一段**故意写错接收者**的 QML 喂给这台机器上的 qmllint,
+      # 抓不住就当场红 —— 「qmllint 换了个版本不报这一类了」必须表现成失败,不是「干净」。
+      - name: 判据(自检 + 全量 QML)
+        run: python3 desktop/desktop-qt/scripts/qmllint-gate.py
+
+  # NOTE: no release job here on purpose — the build jobs above only upload artifacts.
   # build.yml ("Build All") calls this workflow and its own release job bundles the Qt desktop
   # artifacts into the single combined release. A standalone workflow_dispatch just produces the
   # artifacts (downloadable from the run) for desktop-only test builds.
