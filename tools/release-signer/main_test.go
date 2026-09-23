@@ -19,6 +19,9 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -464,5 +467,48 @@ func TestMissingRequiredIgnoresTheStaleIndexEntry(t *testing.T) {
 	}
 	if m := missingRequired(fresh, required); len(m) != 1 {
 		t.Fatalf("the gate must judge THIS run's output: missing = %+v, want [macos/mac/arm64]", m)
+	}
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 读现有索引:按 tag 查到的 release 里嵌的附件列表**可能过期**(2026-09-23 #681 Publish 判红)
+//
+// 真机现场:`GET /releases/tags/version` 45 分钟以上仍列着已被 #679 替换掉的旧 version.json
+// (旧 id、旧大小),按它的 URL 下载 → 404 → FATAL → 整个索引没更新;同一时刻
+// `GET /releases/{id}/assets` 是新的。这里用假服务器把那个现场原样摆出来:
+// tag 端点嵌一个**会 404** 的旧附件,assets 端点给新附件 —— 必须读到新的那份。
+// 退回「用 tag 端点里嵌的列表」的写法会走到 FATAL(os.Exit),这条用例当场红。
+// ─────────────────────────────────────────────────────────────────────────────
+
+func TestFetchExistingIndexIgnoresStaleTagAssetList(t *testing.T) {
+	const fresh = `{"schema":2,"releases":[{"line":"qt","os":"mac","arch":"universal","channel":"stable","version":"9.17.12"}]}`
+	var srv *httptest.Server
+	srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/repos/o/r/releases/tags/version":
+			// 过期的内嵌列表:指向一个已经不存在的附件
+			fmt.Fprintf(w, `{"id":42,"assets":[{"name":"version.json","url":"%s/repos/o/r/releases/assets/1"}]}`, srv.URL)
+		case "/repos/o/r/releases/42/assets":
+			fmt.Fprintf(w, `[{"name":"version.json","url":"%s/repos/o/r/releases/assets/2"}]`, srv.URL)
+		case "/repos/o/r/releases/assets/1":
+			http.NotFound(w, r) // 旧附件早被替换掉了
+		case "/repos/o/r/releases/assets/2":
+			if r.Header.Get("Accept") != "application/octet-stream" {
+				t.Errorf("asset download must ask for octet-stream, got %q", r.Header.Get("Accept"))
+			}
+			fmt.Fprint(w, fresh)
+		default:
+			t.Errorf("unexpected request %s", r.URL.Path)
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+	old := githubAPI
+	githubAPI = srv.URL
+	defer func() { githubAPI = old }()
+
+	idx := fetchExistingIndex(srv.Client(), "o/r", "tok")
+	if len(idx.Releases) != 1 || idx.Releases[0].Version != "9.17.12" {
+		t.Fatalf("expected the FRESH index from /releases/{id}/assets, got %+v", idx)
 	}
 }

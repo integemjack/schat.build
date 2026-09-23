@@ -305,12 +305,21 @@ const (
 // is the safe direction.
 // ─────────────────────────────────────────────────────────────────────────────
 
+// githubAPI is a var only so the tests can point fetchExistingIndex at an httptest server.
+var githubAPI = "https://api.github.com"
+
+// ★ 2026-09-23 (#681 Publish 判红): the asset list EMBEDDED in `GET /releases/tags/{tag}`
+// can be stale for a long time — observed >45 min still listing the asset that #679 had
+// already replaced (old id, old size). Downloading that asset's URL → 404 → the FATAL below
+// → the whole index update skipped, i.e. none of the three ends saw that build. Meanwhile
+// `GET /releases/{id}/assets` was fresh. So the tag endpoint is used ONLY to resolve the
+// release id; the asset list always comes from /releases/{id}/assets.
 func fetchExistingIndex(client *http.Client, repo, token string) versionIndex {
 	empty := versionIndex{Schema: indexSchema, Releases: nil}
 
 	if token != "" {
-		body, status, err := httpGet(client, fmt.Sprintf("https://api.github.com/repos/%s/releases/tags/%s", repo, indexTag),
-			map[string]string{"Accept": "application/vnd.github+json", "Authorization": "Bearer " + token})
+		apiHdr := map[string]string{"Accept": "application/vnd.github+json", "Authorization": "Bearer " + token}
+		body, status, err := httpGet(client, fmt.Sprintf("%s/repos/%s/releases/tags/%s", githubAPI, repo, indexTag), apiHdr)
 		switch {
 		case err != nil:
 			fatal("fetch index release (api): %v — refusing to publish an index built from nothing", err)
@@ -321,15 +330,24 @@ func fetchExistingIndex(client *http.Client, repo, token string) versionIndex {
 			fatal("fetch index release (api): HTTP %d — refusing to publish an index built from nothing", status)
 		}
 		var rel struct {
-			Assets []struct {
-				Name string `json:"name"`
-				URL  string `json:"url"` // API asset URL (octet-stream), not CDN
-			} `json:"assets"`
+			ID int64 `json:"id"`
 		}
-		if err := json.Unmarshal(body, &rel); err != nil {
-			fatal("parse index release json: %v", err)
+		if err := json.Unmarshal(body, &rel); err != nil || rel.ID == 0 {
+			fatal("parse index release json: %v (id=%d)", err, rel.ID)
 		}
-		for _, a := range rel.Assets {
+		abody, ast, aerr := httpGet(client,
+			fmt.Sprintf("%s/repos/%s/releases/%d/assets?per_page=100", githubAPI, repo, rel.ID), apiHdr)
+		if aerr != nil || ast != http.StatusOK {
+			fatal("list index release assets: err=%v status=%d — refusing to publish an index built from nothing", aerr, ast)
+		}
+		var assets []struct {
+			Name string `json:"name"`
+			URL  string `json:"url"` // API asset URL (octet-stream), not CDN
+		}
+		if err := json.Unmarshal(abody, &assets); err != nil {
+			fatal("parse index release assets json: %v", err)
+		}
+		for _, a := range assets {
 			if a.Name != indexAssetName {
 				continue
 			}
