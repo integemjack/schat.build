@@ -23,7 +23,7 @@ on:
   workflow_dispatch:
     inputs:
       ref:
-        description: "Ireoo/Secret-Chat 的分支或标签"
+        description: "integemjack/SChat 的分支或标签"
         required: false
         default: "main"
 
@@ -35,7 +35,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  SRC_REPO: Ireoo/Secret-Chat
+  SRC_REPO: integemjack/SChat
   SRC_REF: ${{ inputs.ref || 'main' }}
   SCHAT_GH_MIRROR: https://github.com
   SCHAT_RAW_MIRROR: https://raw.githubusercontent.com
@@ -51,7 +51,7 @@ jobs:
       - name: Checkout source
         uses: actions/checkout@v4
         with:
-          repository: Ireoo/Secret-Chat
+          repository: integemjack/SChat
           ref: ${{ env.SRC_REF }}
           token: ${{ secrets.SRC_REPO_TOKEN }}
 

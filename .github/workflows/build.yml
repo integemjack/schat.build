@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       ref:
-        description: "Ireoo/Secret-Chat 的分支或标签"
+        description: "integemjack/SChat 的分支或标签"
         required: false
         # 打包只用 `main`:版本分支(v9.12 / v9.13 …)开发完成后 fast-forward 合并进 main,
         # 发布一律从 main 打(main 已含 desktop/desktop-qt 与 chatserver)。要临时打某个版本分支,
@@ -18,7 +18,7 @@ permissions:
   packages: write
 
 env:
-  SRC_REPO: Ireoo/Secret-Chat
+  SRC_REPO: integemjack/SChat
   SRC_REF: ${{ github.event.inputs.ref || 'main' }}
   # GitHub-hosted runners reach github.com directly — skip the gh-proxy.com mirror (China-only)
   # that third_party/fetch_deps.sh defaults to (it's slow/blocked from the runners).
@@ -48,7 +48,7 @@ jobs:
       - name: Checkout source
         uses: actions/checkout@v4
         with:
-          repository: Ireoo/Secret-Chat
+          repository: integemjack/SChat
           ref: ${{ env.SRC_REF }}
           token: ${{ secrets.SRC_REPO_TOKEN }}
       - uses: actions/setup-go@v5
@@ -145,7 +145,7 @@ jobs:
       - name: Checkout source
         uses: actions/checkout@v4
         with:
-          repository: Ireoo/Secret-Chat
+          repository: integemjack/SChat
           ref: ${{ env.SRC_REF }}
           token: ${{ secrets.SRC_REPO_TOKEN }}
       # ★ 根治 wrapper 下载失败:把 gradle 发行包缓存起来,命中就完全不碰
@@ -223,7 +223,7 @@ jobs:
       - name: Checkout source
         uses: actions/checkout@v4
         with:
-          repository: Ireoo/Secret-Chat
+          repository: integemjack/SChat
           ref: ${{ env.SRC_REF }}
           token: ${{ secrets.SRC_REPO_TOKEN }}
       - uses: actions/setup-go@v5
@@ -251,7 +251,7 @@ jobs:
       - name: Checkout source
         uses: actions/checkout@v4
         with:
-          repository: Ireoo/Secret-Chat
+          repository: integemjack/SChat
           ref: ${{ env.SRC_REF }}
           token: ${{ secrets.SRC_REPO_TOKEN }}
       # chatserver's multi-stage Dockerfile compiles Go in-container and does NOT COPY
@@ -283,7 +283,7 @@ jobs:
       - name: Checkout source
         uses: actions/checkout@v4
         with:
-          repository: Ireoo/Secret-Chat
+          repository: integemjack/SChat
           ref: ${{ env.SRC_REF }}
           token: ${{ secrets.SRC_REPO_TOKEN }}
       - uses: actions/setup-python@v5
@@ -346,7 +346,7 @@ jobs:
       - name: Checkout source (changelog 用)
         uses: actions/checkout@v4
         with:
-          repository: Ireoo/Secret-Chat
+          repository: integemjack/SChat
           ref: ${{ env.SRC_REF }}
           token: ${{ secrets.SRC_REPO_TOKEN }}
           fetch-depth: 0

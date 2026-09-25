@@ -1,7 +1,7 @@
 // release-signer — signs each release asset and maintains the **version index**.
 //
 // Contract: docs/update_index_refactor_plan.md (定稿 2026-08-07) in the source repo
-// Ireoo/Secret-Chat, which supersedes the *取包链路* of docs/update_distribution_plan.md.
+// integemjack/SChat, which supersedes the *取包链路* of docs/update_distribution_plan.md.
 // The SIGNING contract (§3 of the old plan) is unchanged and still authoritative;
 // byte anchor: docs/fixtures/update_distribution/vectors.json (generator
 // tools/gen_vectors.go). This program's canonicalBytes() is a VERBATIM port of

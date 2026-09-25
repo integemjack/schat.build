@@ -31,7 +31,7 @@ on:
         required: false
         default: "6.8.4"
       ref:
-        description: "Ireoo/Secret-Chat 的分支或标签(只用来取依赖清单脚本)"
+        description: "integemjack/SChat 的分支或标签(只用来取依赖清单脚本)"
         required: false
         default: "main"
       platforms:
@@ -48,7 +48,7 @@ concurrency:
 
 env:
   QT_VER: ${{ inputs.qt_version || '6.8.4' }}
-  SRC_REPO: Ireoo/Secret-Chat
+  SRC_REPO: integemjack/SChat
   SRC_REF: ${{ inputs.ref || 'main' }}
   # 这一批 submodule 就是源仓真正用到的全部(逐条对应):
   #   qtbase        Core/Gui/Widgets/Network/Sql/**Test**(presence_test / auth_expired_test 链 Qt6::Test,
@@ -120,7 +120,7 @@ jobs:
       - name: Checkout source (依赖清单脚本)
         uses: actions/checkout@v4
         with:
-          repository: Ireoo/Secret-Chat
+          repository: integemjack/SChat
           ref: ${{ env.SRC_REF }}
           token: ${{ secrets.SRC_REPO_TOKEN }}
 

@@ -28,7 +28,7 @@ on:
   workflow_dispatch:
     inputs:
       ref:
-        description: "Ireoo/Secret-Chat 的分支或标签"
+        description: "integemjack/SChat 的分支或标签"
         required: false
         # 打包只用 `main`(版本分支开发完成后合并进 main);要临时打某版本分支就显式传 ref 覆盖。
         default: "main"
@@ -52,7 +52,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  SRC_REPO: Ireoo/Secret-Chat
+  SRC_REPO: integemjack/SChat
   # `inputs` context is populated for BOTH workflow_dispatch and workflow_call.
   SRC_REF: ${{ inputs.ref || 'main' }}
   # GitHub-hosted runners reach github.com directly — skip the gh-proxy.com mirror (China-only)
@@ -83,7 +83,7 @@ jobs:
       - name: Checkout source
         uses: actions/checkout@v4
         with:
-          repository: Ireoo/Secret-Chat
+          repository: integemjack/SChat
           ref: ${{ env.SRC_REF }}
           token: ${{ secrets.SRC_REPO_TOKEN }}
 
@@ -330,7 +330,7 @@ jobs:
       - name: Checkout source
         uses: actions/checkout@v4
         with:
-          repository: Ireoo/Secret-Chat
+          repository: integemjack/SChat
           ref: ${{ env.SRC_REF }}
           token: ${{ secrets.SRC_REPO_TOKEN }}
 
@@ -749,7 +749,7 @@ jobs:
       - name: Checkout source
         uses: actions/checkout@v4
         with:
-          repository: Ireoo/Secret-Chat
+          repository: integemjack/SChat
           ref: ${{ env.SRC_REF }}
           token: ${{ secrets.SRC_REPO_TOKEN }}
 
@@ -1048,7 +1048,7 @@ jobs:
       - name: Checkout source
         uses: actions/checkout@v4
         with:
-          repository: Ireoo/Secret-Chat
+          repository: integemjack/SChat
           ref: ${{ env.SRC_REF }}
           token: ${{ secrets.SRC_REPO_TOKEN }}
           # convkey_wire_test 的「QML import vs 打包 Qt 模块」守卫从 schat.build 子模块里的

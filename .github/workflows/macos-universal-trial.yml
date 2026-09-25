@@ -65,7 +65,7 @@ on:
   workflow_dispatch:
     inputs:
       ref:
-        description: "Ireoo/Secret-Chat 的分支或标签"
+        description: "integemjack/SChat 的分支或标签"
         required: false
         default: "main"
       bottle_tag:
@@ -82,7 +82,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  SRC_REPO: Ireoo/Secret-Chat
+  SRC_REPO: integemjack/SChat
   SRC_REF: ${{ inputs.ref || 'main' }}
   BOTTLE_TAG: ${{ inputs.bottle_tag || 'sonoma' }}
   # GitHub runner 直连 github.com — 跳过 fetch_deps.sh 默认的 gh-proxy 国内镜像。
@@ -101,7 +101,7 @@ jobs:
       - name: Checkout source
         uses: actions/checkout@v4
         with:
-          repository: Ireoo/Secret-Chat
+          repository: integemjack/SChat
           ref: ${{ env.SRC_REF }}
           token: ${{ secrets.SRC_REPO_TOKEN }}
 

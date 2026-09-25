@@ -1,6 +1,6 @@
 # schat.build
 
-[Ireoo/Secret-Chat](https://github.com/Ireoo/Secret-Chat) 的独立 CI 仓库：GitHub Actions 在这里 clone 源仓库，把四个端各编译成独立应用包，并构建 Docker 镜像，产物统一发布到本仓库的 Releases。
+[integemjack/SChat](https://github.com/integemjack/SChat) 的独立 CI 仓库：GitHub Actions 在这里 clone 源仓库，把四个端各编译成独立应用包，并构建 Docker 镜像，产物统一发布到本仓库的 Releases。
 
 ## 产物
 
@@ -31,7 +31,7 @@
 
 | 名称 | 用途 |
 |---|---|
-| `SRC_REPO_TOKEN` | 有 Ireoo/Secret-Chat 读权限的 PAT，供 actions/checkout clone 私有源仓库 |
+| `SRC_REPO_TOKEN` | 有 integemjack/SChat 读权限的 PAT，供 actions/checkout clone 私有源仓库 |
 | `RELEASE_SIGN_ED25519_KEY` | **官方更新分发签名私钥**（自建更新通道 Step 2）。base64url 无填充，32 字节 seed 或 64 字节完整 Ed25519 私钥均可。`release` job 用它对每个桌面/安卓资产按 `schat-release/1` 规范字节 Ed25519 签名。仅作 Actions secret 冷存，绝不入库；对应公钥 baked 进三端客户端 + chatserver 做上传时再验。 |
 | `RELEASE_UPLOAD_TOKEN` | jiami.chat `POST /desktop/releases/upload` 的上传 Bearer 令牌，**必须等于** chatserver 的 `CHATSERVER_RELEASE_UPLOAD_TOKEN`。空 = 签名器只写 manifest 不上传。 |
 

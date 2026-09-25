@@ -1,6 +1,6 @@
 // Byte-exactness regression against the LOCKED byte anchor:
 //
-//	docs/fixtures/update_distribution/vectors.json (Ireoo/Secret-Chat).
+//	docs/fixtures/update_distribution/vectors.json (integemjack/SChat).
 //
 // Proves this CI signer's canonicalBytes() reproduces each vector's `canonical`
 // byte-for-byte, and that signing with the fixture seed reproduces each `sig` —
