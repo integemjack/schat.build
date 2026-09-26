@@ -322,7 +322,15 @@ jobs:
   # 两条线的自动更新永不互相串包 —— **改名必须保留该标记**。版本走 Version.h kVersion。
   macos-qt:
     name: macOS Qt (Universal2)
-    runs-on: macos-14
+    # ★ macos-26 + Xcode 26(2026-09-26,源仓 qt 9.18.10 之后)。此前是 macos-14(Xcode 15.4 → SDK 14.5),
+    #   而 **AppKit 按「链接时的 SDK」决定窗口外观**:SDK < 26 的 App 在 macOS 26+ 上拿到的是
+    #   **旧版窗口 chrome** —— 红绿灯 12×14、间距 20(新系统原生是 16×16、间距 23),用户实报
+    #   「系统关闭/最大化/最小化不是系统原生的」。本机(Xcode 26)编的包一直正常,所以只有 CI 包有。
+    #   本机复现:同一个二进制只用 `vtool -set-build-version macos 12.0 14.5` 改 sdk 字段,红绿灯立刻变旧版。
+    #   minos 仍是 12.0(部署目标与 SDK 是两回事,下面有断言钉住两者)。
+    # ⚠️ 静态 Qt kit(qt-static.yml)**仍在 macos-14 编**:旧 SDK 编的 .a 链进新 SDK 的产物没问题
+    #   (新 SDK 是旧 SDK 的超集);反过来才会 undefined symbol(那条约束的实证方向,见 qt-static.yml)。
+    runs-on: macos-26
     timeout-minutes: 120
     env:
       MACOSX_DEPLOYMENT_TARGET: "12.0"   # Qt 6.8 requires macOS 12+; deps built to match.
@@ -333,6 +341,16 @@ jobs:
           repository: integemjack/SChat
           ref: ${{ env.SRC_REF }}
           token: ${{ secrets.SRC_REPO_TOKEN }}
+
+      - name: Select Xcode 26(决定产物的链接 SDK = 窗口外观,见本腿 runs-on 注释)
+        shell: bash
+        run: |
+          set -euo pipefail
+          XC=$(ls -d /Applications/Xcode_26*.app 2>/dev/null | sort -V | tail -1 || true)
+          [ -n "$XC" ] || { echo "::error::runner 上没有 Xcode 26 —— 产物会链旧 SDK,红绿灯变旧版"; exit 1; }
+          sudo xcode-select -s "$XC"
+          xcodebuild -version
+          xcrun --sdk macosx --show-sdk-version
 
       - name: Install build tools (Homebrew)
         run: brew install cmake ninja pkg-config nasm autoconf automake libtool
@@ -499,7 +517,7 @@ jobs:
       #   用户看到「打不开 / 闪退」,而不是那句「需要更新的 macOS」。
       # ⚠️ **两个 slice 都要查**:universal2 是 lipo 出来的,两半的 minos 可以不一样,
       #    而只查瘦身前的那份正好会漏掉这种。
-      - name: Assert 最低系统版本 = 12.0(两个 slice + plist 一致)
+      - name: Assert 最低系统版本 = 12.0 + 链接 SDK ≥ 26(两个 slice + plist 一致)
         working-directory: desktop/desktop-qt
         run: |
           set -euo pipefail
@@ -511,6 +529,10 @@ jobs:
             GOT="$(vtool -show-build "/tmp/slice-$A" | awk '/minos/{print $2; exit}')"
             echo "$A minos=$GOT"
             [ "$GOT" = "$WANT" ] || { echo "FATAL: $A 的 minos 是 $GOT,不是 $WANT"; bad=1; }
+            # 链接 SDK 决定 macOS 26+ 上的窗口外观(旧 SDK = 旧版红绿灯,见 runs-on 注释)。
+            SDK="$(vtool -show-build "/tmp/slice-$A" | awk '/sdk/{print $2; exit}')"
+            echo "$A sdk=$SDK"
+            [ "${SDK%%.*}" -ge 26 ] 2>/dev/null || { echo "FATAL: $A 链接的 SDK 是 $SDK(< 26)—— macOS 26+ 上红绿灯会是旧版"; bad=1; }
           done
           PL="$(/usr/libexec/PlistBuddy -c 'Print :LSMinimumSystemVersion' \
                 build/app-qt/SChat.app/Contents/Info.plist)"
