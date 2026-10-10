@@ -9,14 +9,14 @@ name: Qt Desktop
 #     · macos-qt = Qt/QML 通用兼容版 (desktop/desktop-qt, arm64 + x86_64) — minos 12.0,跑
 #                  macOS 12/13+ 与 Intel(Qt 不碰系统新 API,解决「macOS 13 装不上」)。资产名带
 #                  `qt` 标记,Swift 更新器 pickAsset 按 -qt/qt- 排除它 → 两条线自动更新永不串包。
-#   Windows : x64 (MSYS2/MINGW64) Qt6/QML          — 自制安装器 (installer/mkpkg)
+#   Windows : x64 (MSYS2/UCRT64) Qt6/QML           — 自制安装器 (installer/mkpkg)
 #             (arm64 needs an MSVC port of the vendored MinGW deps — not covered yet)
 #   Linux   : x86_64 + aarch64 (Debian trixie containers) Qt6/QML — .deb (both arches)
 #             + a self-contained AppImage on x86_64 (linuxdeploy)
 #
 # ⚠️ **Qt 三条腿全部静态链接**(源仓 qt 9.14.344)。来源不同,判据相同 —— 每条腿都有一条
 # 「产物里不许出现 Qt 动态库」的断言,别为了让某条腿变绿把断言放松:
-#   · Windows = MSYS2 `mingw-w64-x86_64-qt6-static`(现成的整包静态 Qt)
+#   · Windows = MSYS2 `mingw-w64-ucrt-x86_64-qt6-static`(现成的整包静态 Qt,UCRT64 环境)
 #   · mac / Linux = qt-static.yml 预编译的 tarball(官方不提供静态二进制,只能自编)
 # 随之整段消失的:windeployqt / macdeployqt / linuxdeploy-plugin-qt / ~90 个 DLL 的递归闭包 /
 # deb 的 qml6-module-* 依赖串。**这些都不是「顺手删的」,而是静态之后它们的工作对象不存在了。**
@@ -755,7 +755,7 @@ jobs:
           name: qt-macos-universal
           path: desktop/desktop-qt/out/*
 
-  # ── Windows: x64 via MSYS2/MINGW64. pacman provides gcc + **静态 Qt6**(qt6-static)+ OpenSSL
+  # ── Windows: x64 via MSYS2/UCRT64. pacman provides gcc + **静态 Qt6**(qt6-static)+ OpenSSL
   # + opus/libsodium/openh264/libsrtp (all with pkg-config), so libdatachannel's DTLS finds
   # OpenSSL and the core links the codecs via pkg-config (the CMake MSYS2 branch). Qt 编进 exe,
   # 不再有 windeployqt / DLL 闭包;源仓 desktop/desktop-qt/installer/ 的自制安装器把它压成一个自解压 setup.exe
@@ -775,22 +775,31 @@ jobs:
           ref: ${{ env.SRC_REF }}
           token: ${{ secrets.SRC_REPO_TOKEN }}
 
+      # ── 为什么是 UCRT64 而不是 MINGW64(2026-10-10)────────────────────────────────────
+      # MSYS2 把 qt6-static 升到 6.12.0 时**不再为 MINGW64(msvcrt)出包**,只剩 ucrt64 /
+      # clang64 / clangarm64 —— 这条腿从 Build All #713 起每轮都死在
+      # `error: target not found: mingw-w64-x86_64-qt6-static`,发布闸随之失败,三端都收不到新版。
+      # UCRT64 是 MSYS2 的默认环境,其余依赖在两个环境里版本一致;UCRT 是 Windows 10+ 自带的
+      # 系统 CRT(Qt 6 本来就要求 Windows 10+),所以导入表里多出的 api-ms-win-crt-*.dll 是系统 DLL,
+      # 下面「不许有 lib*/qt6* DLL」那两条断言原样适用。**别为了回到 MINGW64 去钉历史包**:
+      # 停在已下架的包上只是把同一个坑往后推(MSYS2 的旧包保留期有限,依赖还会继续滚动)。
+      # 路径一律走 /ucrt64(= 该环境的 MINGW_PREFIX),改环境时下面几处一起改。
       - uses: msys2/setup-msys2@v2
         with:
-          msystem: MINGW64
+          msystem: UCRT64
           update: true
           install: >-
             git curl
-            mingw-w64-x86_64-gcc mingw-w64-x86_64-cmake mingw-w64-x86_64-ninja
-            mingw-w64-x86_64-pkgconf
-            mingw-w64-x86_64-qt6-static
-            mingw-w64-x86_64-qt6-base mingw-w64-x86_64-qt6-imageformats
-            mingw-w64-x86_64-opus mingw-w64-x86_64-libsodium mingw-w64-x86_64-openh264
-            mingw-w64-x86_64-openssl mingw-w64-x86_64-libsrtp
+            mingw-w64-ucrt-x86_64-gcc mingw-w64-ucrt-x86_64-cmake mingw-w64-ucrt-x86_64-ninja
+            mingw-w64-ucrt-x86_64-pkgconf
+            mingw-w64-ucrt-x86_64-qt6-static
+            mingw-w64-ucrt-x86_64-qt6-base mingw-w64-ucrt-x86_64-qt6-imageformats
+            mingw-w64-ucrt-x86_64-opus mingw-w64-ucrt-x86_64-libsodium mingw-w64-ucrt-x86_64-openh264
+            mingw-w64-ucrt-x86_64-openssl mingw-w64-ucrt-x86_64-libsrtp
 
       # ── Windows 的 Qt 是**静态**的(源仓 qt 9.14.344)────────────────────────────────
-      # `mingw-w64-x86_64-qt6-static` 是 MSYS2 打好的整包静态 Qt(单包含 base/declarative/
-      # 5compat/shadertools/websockets/imageformats/tools,前缀 /mingw64/qt6-static,约 2.7GB
+      # `mingw-w64-ucrt-x86_64-qt6-static` 是 MSYS2 打好的整包静态 Qt(单包含 base/declarative/
+      # 5compat/shadertools/websockets/imageformats/tools,前缀 /ucrt64/qt6-static,约 2.7GB
       # 装完)。三条腿里只有这条能直接装现成的 —— mac / Linux 得走 qt-static.yml 自编。
       #
       # ⚠️ **动态的 qt6-base / qt6-imageformats 也必须装,装的不是 Qt 而是它们的第三方依赖闭包。**
@@ -807,7 +816,7 @@ jobs:
       # 用依赖闭包而不是手抄一份 Wrap*/lib* 清单:手抄的那种每次 Qt 升级都会悄悄过期。
       #
       # 两套 Qt 同时在机器上的风险(find_package 命中哪一套)由两道闸挡住:
-      #   ① configure 显式 `-DQt6_DIR=/mingw64/qt6-static/lib/cmake/Qt6` —— Qt6Config 找组件时
+      #   ① configure 显式 `-DQt6_DIR=/ucrt64/qt6-static/lib/cmake/Qt6` —— Qt6Config 找组件时
       #      是 `NO_DEFAULT_PATH` 地在自己那棵树里找,Qt6 本体定死了,组件就不可能跨树;
       #   ② 构建后那条「SChat.exe 导入表里不许有 qt6*.dll」的断言,真串了也发不出去。
 
@@ -820,8 +829,8 @@ jobs:
         run: |
           set -e
           cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_PREFIX_PATH=/mingw64/qt6-static \
-            -DQt6_DIR=/mingw64/qt6-static/lib/cmake/Qt6 \
+            -DCMAKE_PREFIX_PATH=/ucrt64/qt6-static \
+            -DQt6_DIR=/ucrt64/qt6-static/lib/cmake/Qt6 \
             -DOPENSSL_USE_STATIC_LIBS=TRUE \
             -DSCHAT_PREFER_STATIC_DEPS=ON
           cmake --build build -j"$(nproc)"
@@ -865,7 +874,7 @@ jobs:
           bad=$(grep -E '^(lib|qt6)' /tmp/imports.txt | grep -vE '^lib(ssl|crypto)-' || true)
           if [ -n "$bad" ]; then
             echo "FATAL: SChat.exe 仍动态依赖: $bad"
-            echo "       qt6*.dll         = CMAKE_PREFIX_PATH 没指到 /mingw64/qt6-static"
+            echo "       qt6*.dll         = CMAKE_PREFIX_PATH 没指到 /ucrt64/qt6-static"
             echo "       libgcc/stdc++/winpthread = app-qt/CMakeLists.txt 的 SCHAT_QT_STATIC 分支没生效"
             echo "       其它 lib*.dll    = SCHAT_PREFER_STATIC_DEPS 没生效,或该库在 MSYS2 里没有 .a"
             exit 1
@@ -928,7 +937,7 @@ jobs:
           # **运行期 dlopen** libssl/libcrypto 的 —— 这部分不因为 Qt 静态而改变,缺了就是所有
           # https/wss 在登录前静默失败(与 macOS 那条同源)。
           for d in libssl-3-x64 libcrypto-3-x64 libssl-3 libcrypto-3; do
-            [ -f "/mingw64/bin/$d.dll" ] && cp "/mingw64/bin/$d.dll" "$STAGE/" || true
+            [ -f "/ucrt64/bin/$d.dll" ] && cp "/ucrt64/bin/$d.dll" "$STAGE/" || true
           done
           ls "$STAGE"/libssl* "$STAGE"/libcrypto* 2>/dev/null || echo "WARN: no openssl DLLs staged"
           # 语音转文字引擎运行库(sherpa-onnx C API + onnxruntime,官方 MSVC 预编译,MT=静态
@@ -957,7 +966,7 @@ jobs:
             while :; do
               before=$(find "$d" -maxdepth 1 -iname '*.dll' | wc -l)
               while IFS= read -r bin; do
-                ldd "$bin" 2>/dev/null | awk '/=> \/mingw64\// { print $3 }'
+                ldd "$bin" 2>/dev/null | awk '/=> \/ucrt64\// { print $3 }'
               done < <(find "$d" -type f \( -iname '*.dll' -o -iname '*.exe' \)) \
                 | sort -u | while IFS= read -r dep; do
                     base=$(basename "$dep")

@@ -5,7 +5,7 @@ name: Qt Static (prebuild)
 #
 # 为什么要有这条独立工作流(2026-08-04,源仓 qt 9.14.344「Qt 全静态化」):
 #   官方**不提供**静态 Qt 二进制(aqt 装的是动态 kit),Debian 也没有静态 Qt 包。三条腿里只有
-#   Windows 能直接 `pacman -S mingw-w64-x86_64-qt6-static` 拿到现成的,mac / Linux 只能自编,
+#   Windows 能直接 `pacman -S mingw-w64-ucrt-x86_64-qt6-static`(UCRT64 环境) 拿到现成的,mac / Linux 只能自编,
 #   单份 40~90 分钟。挂进每条打包腿 = 每次发版多等一两个小时,所以拆出来**手动触发一次**、
 #   产物复用,Qt 升版时才重跑。
 #
@@ -325,7 +325,7 @@ jobs:
             submodules: `${{ env.QT_SUBMODULES }}`
             (不含 qtsvg —— 源仓没有任何一处 import 或链接它)
 
-            Windows 不在这里:那条腿用 MSYS2 的 `mingw-w64-x86_64-qt6-static` 包。
+            Windows 不在这里:那条腿用 MSYS2 的 `mingw-w64-ucrt-x86_64-qt6-static` 包(UCRT64 环境)。
           files: |
             /tmp/assets/*
         env:
